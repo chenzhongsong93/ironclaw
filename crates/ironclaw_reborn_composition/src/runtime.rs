@@ -76,7 +76,7 @@ use ironclaw_runner::subagent::await_edge::{
     boot_recovery::ScopeRecoveryDriver, resolver::AwaitEdgeResolver,
     store::FilesystemAwaitEdgeStore,
 };
-use ironclaw_runner::subagent::flavors::StaticSubagentDefinitionResolver;
+use tianquan_subagents::TianquanSubagentDefinitionResolver;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_runner::subagent::goal_store::FilesystemSubagentGoalStore;
 #[cfg(not(any(feature = "libsql", feature = "postgres")))]
@@ -3714,6 +3714,9 @@ pub async fn build_reborn_runtime(
             reason: format!("await-edge resolver result writer bind failed: {error}"),
         })?;
 
+    // 天权 16 SOUL prompt material source 注入(在 parts move goal_store 前 clone)
+    let tianquan_prompt_goal_store = Arc::clone(&subagent_goal_store);
+    let tianquan_prompt_thread_service = Arc::clone(&thread_service);
     let planned_runtime_parts = DefaultPlannedRuntimeParts {
         turn_state: Arc::clone(&turn_state_store),
         thread_service: Arc::clone(&thread_service),
@@ -3740,7 +3743,13 @@ pub async fn build_reborn_runtime(
         subagent_await_edge_writer,
         subagent_await_edge_settler,
         subagent_await_edge_evidence,
-        subagent_definition_resolver: Arc::new(StaticSubagentDefinitionResolver),
+        subagent_definition_resolver: Arc::new(TianquanSubagentDefinitionResolver::new()),
+        subagent_prompt_source: Some(Arc::new(
+            tianquan_subagents::TianquanSubagentPromptMaterialSource::new(
+                tianquan_prompt_goal_store,
+                tianquan_prompt_thread_service,
+            ),
+        )),
         subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(
             capability_input_resolver,
         )),

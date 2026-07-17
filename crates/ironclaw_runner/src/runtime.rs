@@ -303,6 +303,9 @@ where
     pub subagent_await_edge_settler: Arc<dyn AwaitEdgeSettler>,
     pub subagent_await_edge_evidence: Arc<dyn AwaitDependentRunEvidenceStore>,
     pub subagent_definition_resolver: Arc<dyn SubagentDefinitionResolver>,
+    /// 子 agent prompt material source(注入点)。None 时 fallback GateBackedSubagentPromptMaterialSource
+    /// (ironclaw 内置 4 flavor)。天权注入 TianquanSubagentPromptMaterialSource(16 SOUL)。
+    pub subagent_prompt_source: Option<Arc<dyn SubagentPromptMaterialSource>>,
     pub subagent_spawn_input_codec: Arc<dyn SpawnSubagentInputCodec>,
     pub subagent_spawn_limits: SubagentSpawnLimits,
     pub loop_exit_evidence: Arc<dyn LoopExitEvidencePort>,
@@ -662,10 +665,12 @@ where
 
     let turn_state_store: Arc<dyn TurnStateStore> = turn_state.clone();
     let subagent_prompt_source: Arc<dyn SubagentPromptMaterialSource> =
-        Arc::new(GateBackedSubagentPromptMaterialSource::new(
-            Arc::clone(&parts.subagent_goal_store),
-            Arc::clone(&parts.thread_service),
-        ));
+        parts.subagent_prompt_source.clone().unwrap_or_else(|| {
+            Arc::new(GateBackedSubagentPromptMaterialSource::new(
+                Arc::clone(&parts.subagent_goal_store),
+                Arc::clone(&parts.thread_service),
+            ))
+        });
     let subagent_prompt_composer = SubagentPromptComposer::new(Arc::clone(&subagent_prompt_source));
     let spawn_decorator = Arc::new(SubagentSpawnCapabilityDecorator::new(
         SubagentSpawnDeps {

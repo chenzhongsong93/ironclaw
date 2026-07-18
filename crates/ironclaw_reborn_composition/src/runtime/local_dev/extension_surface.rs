@@ -230,7 +230,6 @@ fn extension_network_policy(capability: &ActiveExtensionCapability) -> NetworkPo
     // single-operator dev profile (not multi-tenant SaaS), so we disable the
     // private-IP guard here — production keeps the guard via its own
     // `extension_surface` module.
-    let has_egress_targets = !targets.is_empty();
     NetworkPolicy {
         allowed_targets: targets,
         deny_private_ip_ranges: false,

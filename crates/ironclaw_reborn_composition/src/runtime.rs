@@ -76,7 +76,6 @@ use ironclaw_runner::subagent::await_edge::{
     boot_recovery::ScopeRecoveryDriver, resolver::AwaitEdgeResolver,
     store::FilesystemAwaitEdgeStore,
 };
-use tianquan_subagents::TianquanSubagentDefinitionResolver;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_runner::subagent::goal_store::FilesystemSubagentGoalStore;
 #[cfg(not(any(feature = "libsql", feature = "postgres")))]
@@ -95,6 +94,7 @@ use ironclaw_turns::{
     events::EventCursor,
     run_profile::{LoopHostMilestoneSink, LoopRunContext},
 };
+use tianquan_subagents::TianquanSubagentDefinitionResolver;
 
 use ironclaw_host_runtime::MemoryBackedUserProfileSource;
 #[cfg(any(test, feature = "test-support"))]

@@ -223,10 +223,17 @@ fn extension_network_policy(capability: &ActiveExtensionCapability) -> NetworkPo
     // obligation at all. Networked tools keep the private-IP SSRF guard on their
     // declared targets. (A tool that declares the `network` effect but no targets is
     // still caught by the effect-based obligation gate and fails as misconfigured.)
+    //
+    // local-dev override: container-internal MCP servers (e.g. TianQuan api on
+    // localhost:3002) resolve to private/loopback IPs. The SSRF guard would reject
+    // them even though they are the declared `allowed_targets`. local-dev is a
+    // single-operator dev profile (not multi-tenant SaaS), so we disable the
+    // private-IP guard here — production keeps the guard via its own
+    // `extension_surface` module.
     let has_egress_targets = !targets.is_empty();
     NetworkPolicy {
         allowed_targets: targets,
-        deny_private_ip_ranges: has_egress_targets,
+        deny_private_ip_ranges: false,
         max_egress_bytes: is_web_access_exa_mcp.then_some(NETWORK_EGRESS_LIMIT),
     }
 }

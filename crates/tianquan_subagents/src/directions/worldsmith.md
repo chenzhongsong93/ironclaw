@@ -240,6 +240,78 @@ L3 不是凭直觉堆角色,而是据检索到的上游本体/同类资产 fact 
 - 检查 AppearanceProfile 的特征数量符合 tier_limit 约束
 - 检查所有档案的 ID 字段均已填充
 
+### APPROVE Phase
+
+VERIFY 通过后,世界构建资产(Character/AppearanceProfile/RenderableFeature/Location/Object/RelationshipClaim/LongRangeInfluence)进入提交审批阶段。worldsmith 本身不直接提交(提交是 committer 的职责),但需配合主 agent 推进 stage:
+
+1. **确认 auditor 已通过**:VERIFY 阶段 run_auditor 返 `decision=approve_for_commit_candidate` 后,才进入 APPROVE
+2. **不直接调 run_committer**:world:static layer 的 APPROVE 阶段允许调 run_committer,但通常由主 agent(父 agent)在子 agent(worldsmith)完成 resume 后统一调
+3. **stage 推进约定**:父 agent 在子 agent(worldsmith)完成 resume 后,调 `advance_stage(project_id, layer="world:static", to="approved")` 推进到终态
+4. **Approved 终态**:stage=approved 后,所有 MCP 工具调用被 dispatch 拒绝(终态全禁),该 layer 的本次世界构建任务结束(注:`loop:state` 每章时机是独立 layer session,不在本次 `world:static` 终态影响范围内)
+
+## Stage 切换约定(4-B 2026-07-20)
+
+**架构铁律**:IronClaw agent 是编排中心(主动方),天权 MCP 是被动工具池。stage 推进由 ironclaw agent 主动调 MCP 工具完成,天权侧不主动驱动。
+
+### 调 MCP 工具时显式传 layer
+
+所有天权 MCP 工具的 param 都含 `layer` 字段(9 个 tier:role 之一)。worldsmith 首建时机调工具时必须传 `layer="world:static"`:
+
+```
+# 正确
+run_world_patch(project_id="iron-city", layer="world:static", context={...})
+
+# 错误(缺 layer 或错值)
+run_world_patch(project_id="iron-city", context={...})  # 缺 layer,serde 反序列化失败
+run_world_patch(project_id="iron-city", layer="L3a", context={...})  # 错值,只认 "world:static"
+```
+
+> 注:`loop:state` 每章时机是另一个 layer session(传 `layer="loop:state"`),不在本段约定范围内。
+
+### 调工具前先 get_layer_stage 确认当前 stage
+
+派生子 agent 前,主 agent 先调 `get_layer_stage(project_id, layer="world:static")` 确认当前 stage,再决定调哪些工具:
+
+| 当前 stage | 允许调用的天权 MCP 工具(world:static layer) |
+|---|---|
+| Plan | list_*/get_*/search_graph/build_novelist_prompt/get_layer_stage(只读 + 拼装) |
+| Lock | Plan 允许的 + **run_world_patch**(layer 专属:世界构建校验) |
+| Execute | Lock 允许的 + import_graph/run_evolution(写 + 引擎执行) |
+| Verify | 只读 + run_auditor/run_quality_gates/run_skill_verify(独立关卡) |
+| Approve | run_committer/advance_stage(提交 + 推进) |
+| Approved | 全部禁止(终态) |
+
+### 父 agent 推进 stage 的时机
+
+子 agent spawn 是 blocking(ironclaw 硬编码),父 agent 在子 agent 完成 resume 后调 `advance_stage` 推进 stage:
+
+```
+# 子 agent(worldsmith)完成后,父 agent 推进 world:static 的 stage
+advance_stage(project_id="iron-city", layer="world:static", to="lock")  # Plan → Lock
+advance_stage(project_id="iron-city", layer="world:static", to="execute")  # Lock → Execute
+# ... 子 agent 在 Execute 阶段写定义图 urn:{proj}:world ...
+advance_stage(project_id="iron-city", layer="world:static", to="verify")  # Execute → Verify
+# ... 子 agent 在 Verify 阶段审计 ...
+advance_stage(project_id="iron-city", layer="world:static", to="approve")  # Verify → Approve
+advance_stage(project_id="iron-city", layer="world:static", to="approved")  # Approve → Approved(终态)
+```
+
+**跳阶段禁止**:Plan→Execute 直接跳会返错(必须相邻下一阶段)。
+
+### dispatch 拒绝非法调用
+
+天权 MCP dispatch 会按 (layer, stage, tool) 三元判定,非法调用返 `invalid_params` 错误:
+
+```
+# Plan 阶段调 run_world_patch → 拒绝
+run_world_patch(project_id="iron-city", layer="world:static", request={...})
+# 错误:工具 'run_world_patch' 不允许在 layer=world:static stage=Plan 调用
+
+# Execute 阶段调 run_world_patch(layer=meta:ontology) → 拒绝(layer 不匹配)
+run_world_patch(project_id="iron-city", layer="meta:ontology", request={...})
+# 错误:工具 'run_world_patch' 不允许在 layer=meta:ontology stage=Execute 调用
+```
+
 ## V12 技术
 
 - 从 `capabilities/` 加载 feature-types 和 appearance-feature-selection

@@ -67,6 +67,7 @@ where
         subagent_await_edge_settler: _,
         subagent_await_edge_evidence: _,
         subagent_definition_resolver: _,
+        subagent_prompt_source: _,
         subagent_spawn_input_codec: _,
         subagent_spawn_limits: _,
         loop_exit_evidence: _,

@@ -375,6 +375,7 @@ impl ProductLiveAgentLoopHarness {
             subagent_await_edge_evidence: Arc::clone(&await_edge_store)
                 as Arc<dyn ironclaw_runner::loop_exit_applier::AwaitDependentRunEvidenceStore>,
             subagent_definition_resolver: Arc::new(
+            subagent_prompt_source: None,
                 ironclaw_runner::subagent::flavors::StaticSubagentDefinitionResolver,
             ),
             subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(Arc::new(

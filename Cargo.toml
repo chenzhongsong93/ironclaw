@@ -357,6 +357,9 @@ ironclaw_wasm = { path = "crates/ironclaw_wasm", version = "0.1.0" }
 ironclaw_embeddings = { path = "crates/ironclaw_embeddings", version = "0.1.0", features = ["testing"] }
 # Named `#[case]` parametrization for the storage-backend matrix tests (slice 3).
 rstest = "0.23"
+# 天权 16 SOUL subagent spawn e2e 验证(2026-07-19):TianquanSubagentDefinitionResolver
+# + 16 SOUL flavors + directions。tests/tianquan_subagent_spawn_e2e.rs 用。
+tianquan_subagents = { path = "crates/tianquan_subagents" }
 
 [features]
 default = ["postgres", "libsql", "html-to-markdown", "tui"]

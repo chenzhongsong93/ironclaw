@@ -928,6 +928,7 @@ impl RebornIntegrationGroupBuilder {
             subagent_await_edge_evidence: await_edge_store
                 as Arc<dyn ironclaw_runner::loop_exit_applier::AwaitDependentRunEvidenceStore>,
             subagent_definition_resolver: Arc::new(StaticSubagentDefinitionResolver),
+            subagent_prompt_source: None,
             subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(
                 capability_input_resolver,
             )),

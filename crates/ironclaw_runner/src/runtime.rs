@@ -216,10 +216,13 @@ fn scheduler_permit_count(worker_count: Option<std::num::NonZeroUsize>) -> usize
 }
 
 fn default_disabled_capability_ids() -> Vec<CapabilityId> {
-    vec![
-        CapabilityId::new(ironclaw_loop_host::DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID)
-            .expect("static spawn_subagent capability id must be valid"), // safety: crate-owned static dotted id.
-    ]
+    // 天权定制(2026-07-20):启用 spawn_subagent(返回空 Vec,不 deny)。
+    //
+    // 上游 main 默认 deny spawn_subagent(commit 42307a764 "temporarily disable"),
+    // re-enable commit 8062cfe00 在 reborn-cov-T0-SPAWN 分支未合 main。天权 16 SOUL
+    // subagent 编排需要 spawn_subagent 可用,故 tianquan-soul 分支提前启用(对齐
+    // upstream T0-SPAWN 方向)。rebase upstream main 时若已合 re-enable,此改动可回退。
+    Vec::new()
 }
 
 pub trait RuntimeTurnStateStore:

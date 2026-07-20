@@ -17,6 +17,21 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+
+/// 子 agent prompt material source 工厂回调类型(2026-07-20 新增)。
+///
+/// 因 TianquanSubagentPromptMaterialSource 构造需 thread_service(在 harness 内部装配,
+/// 调用方拿不到),用 factory 回调在最底层方法内部 thread_service + goal_store 可用后调。
+/// factory 接收 harness 内部的 thread_service + await_edge_goal_store,返回构造好的
+/// prompt_source。type alias 避免 clippy very_complex_type 警告。
+pub(crate) type SubagentPromptSourceFactory = Arc<
+    dyn Fn(
+            Arc<dyn ironclaw_threads::SessionThreadService>,
+            Arc<dyn ironclaw_runner::subagent::goal_store::SubagentGoalStore>,
+        ) -> Arc<dyn ironclaw_loop_host::SubagentPromptMaterialSource>
+        + Send
+        + Sync,
+>;
 use ironclaw_filesystem::{InMemoryBackend, LocalFilesystem};
 use ironclaw_host_api::{
     CapabilityId, NetworkPolicy, ProviderToolName, ResourceScope, RuntimeHttpEgressRequest,
@@ -274,6 +289,8 @@ impl RebornBinaryE2EHarness {
             adapter_id,
             installation_id,
             initial_actor_id,
+            None,
+            None,
         )
         .await
     }
@@ -582,6 +599,60 @@ impl RebornBinaryE2EHarness {
             .await
     }
 
+    /// 天权 16 SOUL subagent spawn 验证专用 harness(2026-07-19 新增)。
+    ///
+    /// 与 `with_harness_blocked_evidence` 一致,但注入天权版
+    /// `TianquanSubagentDefinitionResolver`(16 SOUL flavor),替代默认
+    /// `StaticSubagentDefinitionResolver`(只认 4 内置 flavor)。
+    ///
+    /// **本轮边界**:只注入 definition_resolver(验 16 SOUL resolve_kind + spawn 派生 +
+    /// subagent_kind metadata + reply 回父)。prompt_source 暂不注入(走默认 GateBacked,
+    /// 子 agent system prompt 不含天权 direction_markdown)。direction_markdown 注入验证
+    /// 天权 16 SOUL subagent spawn 验证专用 harness(2026-07-19 新增,2026-07-20 补 prompt_source factory)。
+    ///
+    /// 与 `with_harness_blocked_evidence` 一致,但注入天权版
+    /// `TianquanSubagentDefinitionResolver`(16 SOUL flavor)+ `TianquanSubagentPromptMaterialSource`
+    /// (16 SOUL direction_markdown),替代默认 `StaticSubagentDefinitionResolver`(只认 4 内置 flavor)
+    /// + `GateBackedSubagentPromptMaterialSource`。
+    ///
+    /// **prompt_source factory 解决 thread_service 依赖**:TianquanSubagentPromptMaterialSource::new
+    /// 需 thread_service(在 harness 内部装配),调用方拿不到。用 factory 回调,在最底层方法内部
+    /// thread_service 可用后调 factory 构造。调用方传 goal_store 给 factory 闭包捕获。
+    pub async fn with_harness_blocked_evidence_tianquan_subagents(
+        conversation_id: &str,
+        model_gateway: RebornTraceReplayModelGateway,
+        capability_port: RecordingTestCapabilityPort,
+        definition_resolver: Arc<dyn ironclaw_loop_host::SubagentDefinitionResolver>,
+    ) -> HarnessResult<Self> {
+        // factory 在最底层方法内部 thread_service + goal_store 可用后调,构造天权 prompt_source。
+        // goal_store 用 harness 内部 await_edge_goal_store(子 agent goal 写入处),
+        // thread_service 用 harness 内部 thread_harness.service。调用方无需提供。
+        let prompt_source_factory: SubagentPromptSourceFactory = Arc::new(
+            |thread_service, goal_store| {
+                Arc::new(tianquan_subagents::TianquanSubagentPromptMaterialSource::new(
+                    goal_store,
+                    thread_service,
+                ))
+            },
+        );
+        Self::with_model_gateway_capability_mode_identity_source_trigger_storage_and_adapter(
+            conversation_id,
+            model_gateway,
+            HarnessCapabilityMode::Recording(capability_port),
+            true,
+            ProductTriggerReason::DirectChat,
+            Arc::new(EmptyIdentityContextSource),
+            product_scope(),
+            None,
+            "reborn-test",
+            "install-1",
+            "alice",
+            Some(definition_resolver),
+            Some(prompt_source_factory),
+        )
+        .await
+    }
+
     async fn with_model_gateway_options(
         conversation_id: &str,
         model_gateway: RebornTraceReplayModelGateway,
@@ -689,6 +760,8 @@ impl RebornBinaryE2EHarness {
             "reborn-test",
             "install-1",
             "alice",
+            None,
+            None,
         )
         .await
     }
@@ -706,6 +779,10 @@ impl RebornBinaryE2EHarness {
         adapter_id: &str,
         installation_id: &str,
         initial_actor_id: &str,
+        subagent_definition_resolver_override: Option<
+            Arc<dyn ironclaw_loop_host::SubagentDefinitionResolver>,
+        >,
+        subagent_prompt_source_factory: Option<SubagentPromptSourceFactory>,
     ) -> HarnessResult<Self> {
         let adapter = RebornTestProductAdapter::new(adapter_id, installation_id)?;
         let ingress = RebornTestIngress::new(adapter);
@@ -841,14 +918,26 @@ impl RebornBinaryE2EHarness {
             capability_factory,
             capability_surface_resolver,
             capability_result_writer,
-            subagent_goal_store: await_edge_goal_store,
+            subagent_goal_store: await_edge_goal_store.clone()
+                as Arc<dyn ironclaw_runner::runtime::RuntimeSubagentGoalStore>,
             subagent_await_edge_writer: await_edge_driver
                 as Arc<dyn ironclaw_loop_host::AwaitEdgeWriter>,
             subagent_await_edge_settler: await_edge_resolver
                 as Arc<dyn ironclaw_loop_host::AwaitEdgeSettler>,
             subagent_await_edge_evidence: await_edge_store
                 as Arc<dyn ironclaw_runner::loop_exit_applier::AwaitDependentRunEvidenceStore>,
-            subagent_definition_resolver: Arc::new(StaticSubagentDefinitionResolver),
+            subagent_definition_resolver: subagent_definition_resolver_override
+                .clone()
+                .unwrap_or_else(|| Arc::new(StaticSubagentDefinitionResolver)),
+            subagent_prompt_source: subagent_prompt_source_factory
+                .as_ref()
+                .map(|factory| {
+                    factory(
+                        thread_harness.service.clone(),
+                        await_edge_goal_store.clone()
+                            as Arc<dyn ironclaw_runner::subagent::goal_store::SubagentGoalStore>,
+                    )
+                }),
             subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(
                 capability_input_resolver,
             )),

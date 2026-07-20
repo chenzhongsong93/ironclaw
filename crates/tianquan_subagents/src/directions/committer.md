@@ -196,6 +196,76 @@ CommitRecord 字段说明:
    - 已恢复的快照 ID
    - RetconPatch 记录
 
+### APPROVE Phase
+
+APPROVE 阶段是 committer 的主战场。调 run_committer 执行 commit-gate 9 规则校验,产出提交候选:
+
+1. **调 run_committer**:执行 commit-gate 9 规则校验,产出 `commitRecord`/`snapshot`/`canonWrites` 候选
+2. **generate-only 不落库**:run_committer 是 generate-only,不实际写 Fuseki、不建快照、不回滚——落盘/快照/回滚由主 agent(编排层)决定执行
+3. **stage 推进约定**:提交候选产出后,父 agent 调 `advance_stage(project_id, layer="loop:prose", to="approved")` 推进到终态
+4. **Approved 终态**:stage=approved 后,所有 MCP 工具调用被 dispatch 拒绝(终态全禁),该 layer 的本次创作任务结束
+
+## Stage 切换约定(4-B 2026-07-20)
+
+**架构铁律**:IronClaw agent 是编排中心(主动方),天权 MCP 是被动工具池。stage 推进由 ironclaw agent 主动调 MCP 工具完成,天权侧不主动驱动。
+
+### 调 MCP 工具时显式传 layer
+
+所有天权 MCP 工具的 param 都含 `layer` 字段(9 个 tier:role 之一)。本 layer 调工具时必须传 `layer="loop:prose"`:
+
+```
+# 正确
+run_novelist_prompt(project_id="iron-city", layer="loop:prose", context={...})
+
+# 错误(缺 layer 或错值)
+run_novelist_prompt(project_id="iron-city", context={...})  # 缺 layer,serde 反序列化失败
+run_novelist_prompt(project_id="iron-city", layer="L8", context={...})  # 错值,只认 "loop:prose"
+```
+
+### 调工具前先 get_layer_stage 确认当前 stage
+
+派生子 agent 前,主 agent 先调 `get_layer_stage(project_id, layer="loop:prose")` 确认当前 stage,再决定调哪些工具:
+
+| 当前 stage | 允许调用的天权 MCP 工具(loop:prose layer) |
+|---|---|
+| Plan | list_*/get_*/search_graph/build_novelist_prompt/get_layer_stage(只读 + 拼装) |
+| Lock | 同 Plan(run_novelist 在 Lock 不允许,需推进到 Execute) |
+| Execute | Plan 允许的 + run_novelist/run_novelist_prompt/import_graph/run_evolution(写 + 引擎执行) |
+| Verify | 只读 + run_auditor/run_quality_gates/run_skill_verify(独立关卡) |
+| Approve | run_committer/advance_stage(提交 + 推进) |
+| Approved | 全部禁止(终态) |
+
+### 父 agent 推进 stage 的时机
+
+子 agent spawn 是 blocking(ironclaw 硬编码),父 agent 在子 agent 完成 resume 后调 `advance_stage` 推进 stage:
+
+```
+# 子 agent 完成后,父 agent 推进 loop:prose 的 stage
+advance_stage(project_id="iron-city", layer="loop:prose", to="lock")  # Plan → Lock
+advance_stage(project_id="iron-city", layer="loop:prose", to="execute")  # Lock → Execute
+# ... 子 agent 在 Execute 阶段创作 ...
+advance_stage(project_id="iron-city", layer="loop:prose", to="verify")  # Execute → Verify
+# ... 子 agent 在 Verify 阶段审计 ...
+advance_stage(project_id="iron-city", layer="loop:prose", to="approve")  # Verify → Approve
+advance_stage(project_id="iron-city", layer="loop:prose", to="approved")  # Approve → Approved(终态)
+```
+
+**跳阶段禁止**:Plan→Execute 直接跳会返错(必须相邻下一阶段)。
+
+### dispatch 拒绝非法调用
+
+天权 MCP dispatch 会按 (layer, stage, tool) 三元判定,非法调用返 `invalid_params` 错误:
+
+```
+# Plan 阶段调 run_novelist → 拒绝
+run_novelist(project_id="iron-city", layer="loop:prose", request={...})
+# 错误:工具 'run_novelist' 不允许在 layer=loop:prose stage=Plan 调用
+
+# Execute 阶段调 run_novelist(layer=meta:ontology) → 拒绝(layer 不匹配)
+run_novelist(project_id="iron-city", layer="meta:ontology", request={...})
+# 错误:工具 'run_novelist' 不允许在 layer=meta:ontology stage=Execute 调用
+```
+
 ## Retcon 支持
 
 支持通过 RetconPatch 主动回滚已提交内容:

@@ -40,7 +40,7 @@ pub struct DefaultPlannedRuntimePartsShape {
 
 /// Exhaustive, no-`..` destructure of `parts` into its Option-field shape.
 ///
-/// Every one of the 32 fields is named explicitly here (the 19 required
+/// Every one of the 33 fields is named explicitly here (the 19 required
 /// fields bound to `_`), so this function FAILS TO COMPILE the moment a
 /// field is added to or removed from `DefaultPlannedRuntimeParts` — the
 /// tripwire `wiring_parity.rs` relies on. Match ergonomics on `&parts` bind
@@ -68,6 +68,7 @@ where
         subagent_await_edge_evidence: _,
         subagent_definition_resolver: _,
         subagent_prompt_source: _,
+        subagent_flavor_catalog: _,
         subagent_spawn_input_codec: _,
         subagent_spawn_limits: _,
         loop_exit_evidence: _,

@@ -938,6 +938,7 @@ impl RebornBinaryE2EHarness {
                             as Arc<dyn ironclaw_runner::subagent::goal_store::SubagentGoalStore>,
                     )
                 }),
+            subagent_flavor_catalog: None,
             subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(
                 capability_input_resolver,
             )),

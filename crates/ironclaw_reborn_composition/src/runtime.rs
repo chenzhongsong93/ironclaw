@@ -3750,6 +3750,10 @@ pub async fn build_reborn_runtime(
                 tianquan_prompt_thread_service,
             ),
         )),
+        // P0-② 修复(spec 2026-07-20-novel-studio-skill-e2e-broken-fixes-design.md):
+        // 注入 4+16=20 flavor catalog(4 内置 + 16 SOUL),让 LLM schema enum 含 novelist/auditor 等。
+        // None 时 fallback 4 内置(runtime.rs:691 默认),天权注入 20 个。
+        subagent_flavor_catalog: Some(tianquan_subagents::flavors::merged_flavor_catalog()),
         subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(
             capability_input_resolver,
         )),
@@ -4204,7 +4208,7 @@ struct LocalDevSkillContextSource {
     execution_adapter: Arc<LocalDevSkillExecutionAdapter>,
 }
 
-const LOCAL_DEV_MAX_SKILL_CONTEXT_TOKENS: usize = 6000;
+const LOCAL_DEV_MAX_SKILL_CONTEXT_TOKENS: usize = 20000;
 
 fn optional_nonzero_u32_env(
     key: &'static str,
@@ -4930,8 +4934,8 @@ output_schema_ref = "schemas/write.output.json"
             ironclaw_first_party_extension_ports::SkillInjectionMode::Listing,
         );
         assert_eq!(
-            cfg.max_context_tokens, 6000,
-            "local-dev Reborn skill activation should match the legacy 6000-token skill budget"
+            cfg.max_context_tokens, 20000,
+            "local-dev Reborn skill activation budget raised to 20000 tokens to fit TianQuan novel-studio skill (~16K tokens, L0-L8 full orchestration)"
         );
     }
 

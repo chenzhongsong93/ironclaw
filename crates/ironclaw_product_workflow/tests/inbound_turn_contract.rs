@@ -749,10 +749,11 @@ async fn user_message_no_profile_uses_product_live_runtime_and_persists_reply() 
         subagent_await_edge_writer,
         subagent_await_edge_settler,
         subagent_await_edge_evidence: Arc::clone(&subagent_await_edge_evidence),
+        subagent_prompt_source: None,
         subagent_definition_resolver: Arc::new(
-            subagent_prompt_source: None,
             ironclaw_runner::subagent::flavors::StaticSubagentDefinitionResolver,
         ),
+        subagent_flavor_catalog: None,
         subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(Arc::new(
             ProductLiveCapabilityIo::default(),
         ))),
@@ -930,10 +931,11 @@ async fn user_message_no_profile_can_cancel_product_live_run_from_product_path()
         subagent_await_edge_writer,
         subagent_await_edge_settler,
         subagent_await_edge_evidence: Arc::clone(&subagent_await_edge_evidence),
+        subagent_prompt_source: None,
         subagent_definition_resolver: Arc::new(
-            subagent_prompt_source: None,
             ironclaw_runner::subagent::flavors::StaticSubagentDefinitionResolver,
         ),
+        subagent_flavor_catalog: None,
         subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(Arc::new(
             ProductLiveCapabilityIo::default(),
         ))),
@@ -1124,10 +1126,11 @@ async fn product_live_runtime_rejects_unretained_cancellation_factory() {
         subagent_await_edge_writer,
         subagent_await_edge_settler,
         subagent_await_edge_evidence: Arc::clone(&subagent_await_edge_evidence),
+        subagent_prompt_source: None,
         subagent_definition_resolver: Arc::new(
-            subagent_prompt_source: None,
             ironclaw_runner::subagent::flavors::StaticSubagentDefinitionResolver,
         ),
+        subagent_flavor_catalog: None,
         subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(Arc::new(
             ProductLiveCapabilityIo::default(),
         ))),

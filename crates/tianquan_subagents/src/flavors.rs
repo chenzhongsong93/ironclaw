@@ -224,6 +224,21 @@ pub fn tianquan_flavor_catalog() -> Vec<ironclaw_loop_host::SpawnSubagentFlavorD
         .collect()
 }
 
+/// 合并的 flavor catalog:4 内置(general/explorer/coder/planner)+ 16 天权 SOUL(novelist/auditor 等)。
+///
+/// P0-② 修复(spec 2026-07-20-novel-studio-skill-e2e-broken-fixes-design.md):
+/// ironclaw_runner runtime.rs:691 原硬编码 `flavors::builtin_flavor_catalog()`(4 内置),
+/// LLM schema enum 不含 16 SOUL,派不出 novelist/auditor 等子 agent。
+/// 本函数返回 4+16=20 个 flavor,由 reborn_composition 注入 DefaultPlannedRuntimeParts.subagent_flavor_catalog,
+/// 让 LLM 看到完整 20 个 subagent_type enum 值。
+///
+/// 顺序:4 内置在前(保持 ironclaw 默认行为兼容),16 SOUL 在后(按 TIANQUAN_SOUL_FLAVORS 表序)。
+pub fn merged_flavor_catalog() -> Vec<ironclaw_loop_host::SpawnSubagentFlavorDescriptor> {
+    let mut catalog = ironclaw_runner::subagent::flavors::builtin_flavor_catalog();
+    catalog.extend(tianquan_flavor_catalog());
+    catalog
+}
+
 /// 解析天权 SOUL kind(返回是否是天权 16 kind 之一)。
 pub fn is_tianquan_kind(kind: &str) -> bool {
     TIANQUAN_SOUL_KINDS.contains(&kind)

@@ -309,6 +309,11 @@ where
     /// 子 agent prompt material source(注入点)。None 时 fallback GateBackedSubagentPromptMaterialSource
     /// (ironclaw 内置 4 flavor)。天权注入 TianquanSubagentPromptMaterialSource(16 SOUL)。
     pub subagent_prompt_source: Option<Arc<dyn SubagentPromptMaterialSource>>,
+    /// 子 agent flavor catalog(注入点,P0-② 修复)。None 时 fallback `flavors::builtin_flavor_catalog()`
+    /// (ironclaw 内置 4 flavor:general/explorer/coder/planner)。天权注入 4+16=20 flavor
+    /// (4 内置 + 16 SOUL:novelist/auditor/committer/chapter-packer 等),让 LLM schema enum 含 16 SOUL kind。
+    /// 详见 spec docs/superpowers/specs/2026-07-20-novel-studio-skill-e2e-broken-fixes-design.md P0-②。
+    pub subagent_flavor_catalog: Option<Vec<SpawnSubagentFlavorDescriptor>>,
     pub subagent_spawn_input_codec: Arc<dyn SpawnSubagentInputCodec>,
     pub subagent_spawn_limits: SubagentSpawnLimits,
     pub loop_exit_evidence: Arc<dyn LoopExitEvidencePort>,
@@ -674,6 +679,12 @@ where
                 Arc::clone(&parts.thread_service),
             ))
         });
+    // P0-② 修复:flavor catalog 注入点。None 时 fallback 4 内置(默认行为不变);
+    // 天权 reborn_composition 注入 4+16=20 flavor(含 16 SOUL),让 LLM schema enum 含 novelist/auditor 等。
+    let subagent_flavor_catalog: Vec<SpawnSubagentFlavorDescriptor> = parts
+        .subagent_flavor_catalog
+        .clone()
+        .unwrap_or_else(flavors::builtin_flavor_catalog);
     let subagent_prompt_composer = SubagentPromptComposer::new(Arc::clone(&subagent_prompt_source));
     let spawn_decorator = Arc::new(SubagentSpawnCapabilityDecorator::new(
         SubagentSpawnDeps {
@@ -688,7 +699,7 @@ where
             result_writer: Arc::clone(&parts.capability_result_writer),
         },
         parts.subagent_spawn_limits,
-        flavors::builtin_flavor_catalog(),
+        subagent_flavor_catalog,
     )?);
     let mut capability_factory_builder =
         DecoratingLoopCapabilityPortFactory::new(parts.capability_factory)

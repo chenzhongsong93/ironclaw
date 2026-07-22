@@ -95,15 +95,21 @@ impl<N, S> HostHttpEgressService<N, S> {
         &self,
         request: &mut RuntimeHttpEgressRequest,
     ) -> Result<NetworkPolicy, PipelineError> {
-        self.network_policy_store
-            .get(&request.scope, &request.capability_id)
-            .ok_or_else(|| {
-                PipelineError::pre_transport(RuntimeHttpEgressError::Network {
-                    reason: "network_policy_missing".to_string(),
-                    request_bytes: 0,
-                    response_bytes: 0,
-                })
-            })
+        // 天权定制(2026-07-22):store policy 的 deny_private_ip_ranges 可能是
+        // production 默认(true),但 local-dev 的 planner plan 设了 false。
+        // 当 store policy deny_private=true 且 request policy deny_private=false 时,
+        // 用 request policy(local-dev 放行私有 IP,容器内 MCP server 可达)。
+        let store_policy = self.network_policy_store.get(&request.scope, &request.capability_id);
+        let policy = match &store_policy {
+            Some(sp) if sp.deny_private_ip_ranges && !request.network_policy.deny_private_ip_ranges => {
+                // store 是 production policy(deny_private=true),request 是 local-dev(deny_private=false)
+                // 用 request policy 让 local-dev 放行私有 IP
+                request.network_policy.clone()
+            }
+            Some(sp) => sp.clone(),
+            None => request.network_policy.clone(),
+        };
+        Ok(policy)
     }
 
     fn discard_staged_policy(&self, scope: &ResourceScope, capability_id: &CapabilityId) {

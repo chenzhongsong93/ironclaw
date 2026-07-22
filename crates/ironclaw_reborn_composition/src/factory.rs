@@ -260,8 +260,12 @@ pub(crate) type ComposedTurnStateStore = FilesystemTurnStateStoreKind<CompositeR
 #[cfg(not(any(feature = "libsql", feature = "postgres")))]
 pub(crate) type ComposedTurnStateStore = FilesystemTurnStateStoreKind<InMemoryBackend>;
 
+// 天权定制(2026-07-22):local-dev 用 InMemoryResourceGovernor 替代
+// FilesystemResourceGovernor,绕开持久化 governor journal 写入失败致 poison
+// (poison 后所有 reserve 永远报 ResourceError::Storage "out of resources")。
+// local-dev 无需持久化资源治理,InMemory 足够。
 #[cfg(any(feature = "libsql", feature = "postgres"))]
-type ComposedResourceGovernor = FilesystemResourceGovernor<CompositeRootFilesystem>;
+type ComposedResourceGovernor = InMemoryResourceGovernor;
 #[cfg(not(any(feature = "libsql", feature = "postgres")))]
 type ComposedResourceGovernor = InMemoryResourceGovernor;
 
@@ -2531,9 +2535,10 @@ async fn build_local_runtime_store_graph(
     if let Some(singleton) = postgres_resource_governor_singleton {
         ensure_postgres_resource_governor_authority_for_build(singleton)?;
     }
-    let resource_governor = FilesystemResourceGovernor::new(Arc::clone(&scoped_filesystem))
+    // 天权定制(2026-07-22):local-dev 用 InMemoryResourceGovernor(ComposedResourceGovernor
+    // type alias 已改为 InMemory),绕开 FilesystemResourceGovernor journal 写入失败致 poison。
+    let resource_governor = InMemoryResourceGovernor::new()
         .with_event_sink(Arc::clone(&budget_event_sink));
-    resource_governor.warm_authority()?;
     let resource_governor: Arc<ComposedResourceGovernor> = Arc::new(resource_governor);
     let skill_mounts =
         skill_management_mount_view().map_err(|error| RebornBuildError::InvalidConfig {

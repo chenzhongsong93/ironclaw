@@ -311,6 +311,11 @@ fn hardened_client_builder_base() -> reqwest::ClientBuilder {
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .tcp_keepalive(Duration::from_secs(TCP_KEEPALIVE_SECS))
         .pool_idle_timeout(Duration::from_secs(POOL_IDLE_TIMEOUT_SECS))
+        // 天权定制(2026-07-22):限制每 host 空闲连接数为 1。
+        // 容器 bridge 网络 + 大量 spawn_subagent 并发场景下,h2 连接易进入坏态,
+        // 默认无限空闲连接致坏连接滞留池中被复用(pool 中毒)。
+        // 限制 1 个让坏连接更快淘汰(新请求来时复用唯一空闲,若坏立即失败触发新建)。
+        .pool_max_idle_per_host(1)
 }
 
 /// Hardened client builder for one-shot requests with a total wall-clock

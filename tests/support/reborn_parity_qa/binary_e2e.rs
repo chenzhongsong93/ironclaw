@@ -32,14 +32,14 @@ pub(crate) type SubagentPromptSourceFactory = Arc<
         + Send
         + Sync,
 >;
-use ironclaw_filesystem::{InMemoryBackend, LocalFilesystem};
+use ironclaw_filesystem::{DiskFilesystem, InMemoryBackend};
 use ironclaw_host_api::{
     CapabilityId, NetworkPolicy, ProviderToolName, ResourceScope, RuntimeHttpEgressRequest,
     ThreadId,
 };
 use ironclaw_loop_host::{
     EmptyUserProfileSource, HostIdentityContextSource, HostManagedModelRequest,
-    JsonSpawnSubagentInputCodec,
+    JsonSpawnSubagentInputCodec, in_memory_backed_checkpoint_state_store,
 };
 use ironclaw_network::NetworkHttpRequest;
 use ironclaw_product_adapters::{
@@ -76,7 +76,7 @@ use ironclaw_threads::{
 };
 use ironclaw_turns::{
     CancelRunRequest, FilesystemTurnStateStore, GateRef, GetLoopCheckpointRequest,
-    GetRunStateRequest, IdempotencyKey, InMemoryCheckpointStateStore, LoopBlockedKind,
+    GetRunStateRequest, IdempotencyKey, LoopBlockedKind,
     LoopCheckpointKind, LoopCheckpointStore, ReplyTargetBindingRef, ResumeTurnRequest,
     RetryTurnRequest, RetryTurnResponse, SanitizedCancelReason, SourceBindingRef, TurnActor,
     TurnCoordinator, TurnError, TurnRunId, TurnRunRecord, TurnRunState, TurnScope,
@@ -137,7 +137,7 @@ pub struct SubmittedTurn {
 
 #[derive(Clone)]
 pub struct RebornHarnessSharedStorage {
-    product_backend: Arc<LocalFilesystem>,
+    product_backend: Arc<DiskFilesystem>,
     product_root: Arc<tempfile::TempDir>,
     thread_backend: Arc<InMemoryBackend>,
     turn_backend: Arc<HarnessTurnStorageBackend>,
@@ -837,7 +837,7 @@ impl RebornBinaryE2EHarness {
         };
         let turns_scoped_fs = scoped_turns_fs(turn_backend, &binding)?;
         let turn_store = Arc::new(FilesystemTurnStateStore::new(Arc::clone(&turns_scoped_fs)));
-        let checkpoint_state_store = Arc::new(InMemoryCheckpointStateStore::default());
+        let checkpoint_state_store = in_memory_backed_checkpoint_state_store();
         let loop_checkpoint_store: Arc<dyn LoopCheckpointStore> = turn_store.clone();
         let milestone_sink =
             Arc::new(ironclaw_turns::run_profile::InMemoryLoopHostMilestoneSink::default());
@@ -960,6 +960,11 @@ impl RebornBinaryE2EHarness {
             turn_event_sink: None,
             attachment_read_port: None,
             scheduler_wake_wiring: None,
+            gate_record_store: Some(Arc::new(
+                ironclaw_run_state::FilesystemGateRecordStore::new(
+                    ironclaw_reborn_composition::wrap_scoped(Arc::new(InMemoryBackend::new())),
+                ),
+            )),
         })?;
         let binding_service: Arc<dyn ConversationBindingService> =
             Arc::new(product_harness.binding_service()?);

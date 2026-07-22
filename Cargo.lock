@@ -4567,6 +4567,7 @@ dependencies = [
  "termimad",
  "testcontainers-modules",
  "thiserror 2.0.18",
+ "tianquan_subagents",
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",

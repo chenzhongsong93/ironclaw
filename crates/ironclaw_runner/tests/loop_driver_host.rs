@@ -3583,6 +3583,8 @@ async fn default_planned_runtime_composes_no_profile_coordinator_and_profiled_ho
         subagent_await_edge_settler: await_edge_resolver as Arc<dyn AwaitEdgeSettler>,
         subagent_await_edge_evidence: await_edge_store as Arc<dyn AwaitDependentRunEvidenceStore>,
         subagent_definition_resolver: Arc::new(StaticSubagentDefinitionResolver),
+        subagent_prompt_source: None,
+        subagent_flavor_catalog: None,
         subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(io.clone())),
         subagent_spawn_limits: ironclaw_loop_host::SubagentSpawnLimits::default(),
         loop_exit_evidence: evidence,
@@ -3760,6 +3762,8 @@ async fn pre_minted_scheduler_wake_wiring_drives_scheduler_on_coordinator_submit
         subagent_await_edge_settler: await_edge_resolver as Arc<dyn AwaitEdgeSettler>,
         subagent_await_edge_evidence: await_edge_store as Arc<dyn AwaitDependentRunEvidenceStore>,
         subagent_definition_resolver: Arc::new(StaticSubagentDefinitionResolver),
+        subagent_prompt_source: None,
+        subagent_flavor_catalog: None,
         subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(io.clone())),
         subagent_spawn_limits: ironclaw_loop_host::SubagentSpawnLimits::default(),
         loop_exit_evidence: evidence,
@@ -3935,6 +3939,8 @@ async fn build_runtime_host_with_optional_hooks(
         subagent_await_edge_settler: await_edge_resolver as Arc<dyn AwaitEdgeSettler>,
         subagent_await_edge_evidence: await_edge_store as Arc<dyn AwaitDependentRunEvidenceStore>,
         subagent_definition_resolver: Arc::new(StaticSubagentDefinitionResolver),
+        subagent_prompt_source: None,
+        subagent_flavor_catalog: None,
         subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(io.clone())),
         subagent_spawn_limits: ironclaw_loop_host::SubagentSpawnLimits::default(),
         loop_exit_evidence: evidence,
@@ -4294,6 +4300,8 @@ async fn product_live_runtime_builds_when_all_required_adapters_are_present() {
         subagent_await_edge_evidence: await_edge_store.clone()
             as Arc<dyn AwaitDependentRunEvidenceStore>,
         subagent_definition_resolver: Arc::new(StaticSubagentDefinitionResolver),
+        subagent_prompt_source: None,
+        subagent_flavor_catalog: None,
         subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(io.clone())),
         subagent_spawn_limits: ironclaw_loop_host::SubagentSpawnLimits::default(),
         loop_exit_evidence: Arc::new(ThreadCheckpointLoopExitEvidencePort::new(
@@ -4423,6 +4431,8 @@ async fn product_live_parts_for_gate_test(
         subagent_await_edge_evidence: await_edge_store.clone()
             as Arc<dyn AwaitDependentRunEvidenceStore>,
         subagent_definition_resolver: Arc::new(StaticSubagentDefinitionResolver),
+        subagent_prompt_source: None,
+        subagent_flavor_catalog: None,
         subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(io.clone())),
         subagent_spawn_limits: ironclaw_loop_host::SubagentSpawnLimits::default(),
         loop_exit_evidence: Arc::new(ThreadCheckpointLoopExitEvidencePort::new(

@@ -431,6 +431,7 @@ where
 
 fn attach_hosted_mcp_runtime<F, G, S, R>(
     services: HostRuntimeServices<F, G, S, R>,
+    allow_local_mcp: bool,
 ) -> Result<HostRuntimeServices<F, G, S, R>, RebornBuildError>
 where
     F: ironclaw_filesystem::RootFilesystem + 'static,
@@ -454,6 +455,7 @@ where
     Ok(services.with_mcp_runtime(Arc::new(hosted_http_mcp_runtime(
         registry,
         runtime_http_egress,
+        allow_local_mcp,
     ))))
 }
 
@@ -1804,7 +1806,15 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
     }
     services = apply_runtime_process_binding(services, runtime_process_binding);
     services = apply_post_edit_check_from_env(services)?;
-    services = attach_hosted_mcp_runtime(services)?;
+    // Local-dev profiles admit InstalledLocal + http + private/loopback MCP
+    // egress so container-internal MCP servers (e.g. TianQuan api on
+    // localhost:3002) can be reached. Production/hosted profiles stay
+    // fail-closed (HostBundled + https + public IP only).
+    let allow_local_mcp = matches!(
+        profile,
+        RebornCompositionProfile::LocalDev | RebornCompositionProfile::LocalDevYolo
+    );
+    services = attach_hosted_mcp_runtime(services, allow_local_mcp)?;
     let product_auth_runtime_ports = require_product_auth_runtime_ports(&services)?;
     let provider_composition = compose_provider_client(
         oauth_provider_configs,
@@ -5329,7 +5339,7 @@ where
     .with_run_profile_resolver(planned_run_profile_resolver()?)
     .with_turn_run_wake_notifier_dyn(production_wiring.turn_run_wake_notifier);
     let product_auth_runtime_ports = require_product_auth_runtime_ports(&services)?;
-    let services = attach_hosted_mcp_runtime(services)?;
+    let services = attach_hosted_mcp_runtime(services, false)?;
     let provider_composition = compose_provider_client(
         oauth_provider_configs,
         oauth_dcr_provider_configs,
@@ -6467,7 +6477,8 @@ mod tests {
         assert!(services.product_auth_provider_runtime_ports().is_none());
 
         // attach_hosted_mcp_runtime must succeed (soft-skip) rather than error.
-        let services = attach_hosted_mcp_runtime(services).expect("soft-disable must not error");
+        let services =
+            attach_hosted_mcp_runtime(services, false).expect("soft-disable must not error");
 
         // Runtime ports still absent — no egress was added by the attachment.
         assert!(services.product_auth_provider_runtime_ports().is_none());
@@ -7761,7 +7772,7 @@ mod tests {
             CapabilitySurfaceVersion::new("surface-v1").unwrap(),
         );
 
-        let services = attach_hosted_mcp_runtime(services).expect("attach is optional");
+        let services = attach_hosted_mcp_runtime(services, false).expect("attach is optional");
 
         assert!(services.product_auth_provider_runtime_ports().is_none());
     }

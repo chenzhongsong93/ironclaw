@@ -280,7 +280,11 @@ pub const TCP_KEEPALIVE_SECS: u64 = 30;
 /// runner-lease boundary (90s) so a silently-broken idle socket is never reused
 /// past a single lease lifetime, while still retaining warm connections across
 /// back-to-back turns.
-pub const POOL_IDLE_TIMEOUT_SECS: u64 = 90;
+///
+/// 天权定制(2026-07-22):90s→30s。容器 bridge 网络 + 大量 spawn_subagent 并发场景下,
+/// reqwest h2 连接易进入坏态,90s idle timeout 让坏连接滞留池中致后续请求复用坏连接失败。
+/// 30s 让坏连接更快过期,减少复用坏连接概率。仍 ≤ LEASE_SECS(90s)满足不变式。
+pub const POOL_IDLE_TIMEOUT_SECS: u64 = 30;
 
 /// Request timeout for short auxiliary HTTP calls (OAuth token exchange,
 /// session/credential refresh) that are not turn-model streams. These are quick

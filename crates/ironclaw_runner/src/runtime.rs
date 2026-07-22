@@ -216,10 +216,13 @@ fn scheduler_permit_count(worker_count: Option<std::num::NonZeroUsize>) -> usize
 }
 
 fn default_disabled_capability_ids() -> Vec<CapabilityId> {
-    vec![
-        CapabilityId::new(ironclaw_loop_host::DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID)
-            .expect("static spawn_subagent capability id must be valid"), // safety: crate-owned static dotted id.
-    ]
+    // 天权定制(2026-07-20):启用 spawn_subagent(返回空 Vec,不 deny)。
+    //
+    // 上游 main 默认 deny spawn_subagent(commit 42307a764 "temporarily disable"),
+    // re-enable commit 8062cfe00 在 reborn-cov-T0-SPAWN 分支未合 main。天权 16 SOUL
+    // subagent 编排需要 spawn_subagent 可用,故 tianquan-soul 分支提前启用(对齐
+    // upstream T0-SPAWN 方向)。rebase upstream main 时若已合 re-enable,此改动可回退。
+    Vec::new()
 }
 
 pub trait RuntimeTurnStateStore:
@@ -303,6 +306,12 @@ where
     pub subagent_await_edge_settler: Arc<dyn AwaitEdgeSettler>,
     pub subagent_await_edge_evidence: Arc<dyn AwaitDependentRunEvidenceStore>,
     pub subagent_definition_resolver: Arc<dyn SubagentDefinitionResolver>,
+    /// 子 agent prompt material source(注入点)。None 时 fallback GateBackedSubagentPromptMaterialSource
+    /// (ironclaw 内置 4 flavor)。天权注入 TianquanSubagentPromptMaterialSource(16 SOUL)。
+    pub subagent_prompt_source: Option<Arc<dyn SubagentPromptMaterialSource>>,
+    /// 子 agent flavor catalog(注入点)。None 时 fallback `flavors::builtin_flavor_catalog()`
+    /// (ironclaw 内置 4 flavor)。天权注入 4+16=20 flavor(含 16 SOUL),让 LLM schema enum 含 16 SOUL kind。
+    pub subagent_flavor_catalog: Option<Vec<SpawnSubagentFlavorDescriptor>>,
     pub subagent_spawn_input_codec: Arc<dyn SpawnSubagentInputCodec>,
     pub subagent_spawn_limits: SubagentSpawnLimits,
     pub loop_exit_evidence: Arc<dyn LoopExitEvidencePort>,
@@ -672,10 +681,18 @@ where
 
     let turn_state_store: Arc<dyn TurnStateStore> = turn_state.clone();
     let subagent_prompt_source: Arc<dyn SubagentPromptMaterialSource> =
-        Arc::new(GateBackedSubagentPromptMaterialSource::new(
-            Arc::clone(&parts.subagent_goal_store),
-            Arc::clone(&parts.thread_service),
-        ));
+        parts.subagent_prompt_source.clone().unwrap_or_else(|| {
+            Arc::new(GateBackedSubagentPromptMaterialSource::new(
+                Arc::clone(&parts.subagent_goal_store),
+                Arc::clone(&parts.thread_service),
+            ))
+        });
+    // 天权定制:flavor catalog 注入点。None 时 fallback 4 内置(默认行为不变);
+    // 天权 reborn_composition 注入 4+16=20 flavor(含 16 SOUL),让 LLM schema enum 含 novelist/auditor 等。
+    let subagent_flavor_catalog: Vec<SpawnSubagentFlavorDescriptor> = parts
+        .subagent_flavor_catalog
+        .clone()
+        .unwrap_or_else(flavors::builtin_flavor_catalog);
     let subagent_prompt_composer = SubagentPromptComposer::new(Arc::clone(&subagent_prompt_source));
     let spawn_decorator = Arc::new(SubagentSpawnCapabilityDecorator::new(
         SubagentSpawnDeps {
@@ -690,7 +707,7 @@ where
             result_writer: Arc::clone(&parts.capability_result_writer),
         },
         parts.subagent_spawn_limits,
-        flavors::builtin_flavor_catalog(),
+        subagent_flavor_catalog,
     )?);
     let mut capability_factory_builder =
         DecoratingLoopCapabilityPortFactory::new(parts.capability_factory)

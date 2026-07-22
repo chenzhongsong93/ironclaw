@@ -1421,6 +1421,8 @@ async fn adapter_bundle_satisfies_product_live_runtime_readiness_gate() {
         subagent_await_edge_evidence: Arc::clone(&await_edge_store)
             as Arc<dyn ironclaw_runner::loop_exit_applier::AwaitDependentRunEvidenceStore>,
         subagent_definition_resolver: Arc::new(StaticSubagentDefinitionResolver),
+        subagent_prompt_source: None,
+        subagent_flavor_catalog: None,
         subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(
             adapters.capability_input_resolver,
         )),

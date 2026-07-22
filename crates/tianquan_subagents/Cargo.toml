@@ -1,0 +1,26 @@
+[package]
+name = "tianquan_subagents"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+description = "TianQuan 16 SOUL subagent definitions for IronClaw Reborn (direction personas + resolver + prompt material source)"
+authors = ["TianQuan"]
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/nearai/ironclaw"
+repository = "https://github.com/nearai/ironclaw"
+publish = false
+
+[package.metadata.ironclaw]
+layer = "loops"
+
+[dependencies]
+ironclaw_loop_host = { path = "../ironclaw_loop_host" }
+ironclaw_runner = { path = "../ironclaw_runner" }
+ironclaw_threads = { path = "../ironclaw_threads" }
+ironclaw_host_api = { path = "../ironclaw_host_api" }
+ironclaw_turns = { path = "../ironclaw_turns" }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt"] }
+tracing = "0.1"

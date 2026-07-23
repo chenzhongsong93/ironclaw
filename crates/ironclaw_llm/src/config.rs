@@ -284,7 +284,11 @@ pub const TCP_KEEPALIVE_SECS: u64 = 30;
 /// 天权定制(2026-07-22):90s→30s。容器 bridge 网络 + 大量 spawn_subagent 并发场景下,
 /// reqwest h2 连接易进入坏态,90s idle timeout 让坏连接滞留池中致后续请求复用坏连接失败。
 /// 30s 让坏连接更快过期,减少复用坏连接概率。仍 ≤ LEASE_SECS(90s)满足不变式。
-pub const POOL_IDLE_TIMEOUT_SECS: u64 = 30;
+///
+/// 天权定制(2026-07-23):30s→10s。L3 多 turn 验证发现 30s 对长会话(累计 100+ capability
+/// calls + 多次 minimax 流式)仍不够,坏连接在 30s 窗口内被复用致 minimax HttpError retry
+/// 连环 + gateway 拒连。10s 更激进淘汰,配合 pool_max_idle_per_host(0) 彻底消除坏连接复用。
+pub const POOL_IDLE_TIMEOUT_SECS: u64 = 10;
 
 /// Request timeout for short auxiliary HTTP calls (OAuth token exchange,
 /// session/credential refresh) that are not turn-model streams. These are quick
@@ -315,7 +319,12 @@ fn hardened_client_builder_base() -> reqwest::ClientBuilder {
         // 容器 bridge 网络 + 大量 spawn_subagent 并发场景下,h2 连接易进入坏态,
         // 默认无限空闲连接致坏连接滞留池中被复用(pool 中毒)。
         // 限制 1 个让坏连接更快淘汰(新请求来时复用唯一空闲,若坏立即失败触发新建)。
-        .pool_max_idle_per_host(1)
+        //
+        // 天权定制(2026-07-23):1→0,完全禁用空闲池。L3 多 turn 验证发现 max_idle_per_host(1)
+        // 对单 turn 有效(19 calls 0 retry)但对多 turn 长会话失效(坏连接在唯一空闲位被复用)。
+        // 禁用空闲池 = 每次请求新建连接,彻底消除坏连接复用可能。代价 ~100ms TLS 握手对
+        // minimax 流式调用可接受(单次流式数秒)。配合 POOL_IDLE_TIMEOUT_SECS=10 双保险。
+        .pool_max_idle_per_host(0)
 }
 
 /// Hardened client builder for one-shot requests with a total wall-clock

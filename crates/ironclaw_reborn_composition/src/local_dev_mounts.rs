@@ -54,6 +54,24 @@ pub(crate) fn ambient_workspace_mount_view(
     MountView::new(mounts)
 }
 
+/// Per-user workspace mount view(隔离:每 tenant/user 独享 workspace 目录)。
+///
+/// 仿 `scoped_skill_context_mount_view` 模式:grant `/workspace`(read_write)
+/// → `/projects/tenants/{tenant}/users/{user}/workspace`。
+/// 经 `/projects` mount(factory local_dev_project_filesystem)映射到物理
+/// `{storage_root}/tenants/{tenant}/users/{user}/workspace`。
+/// 用户 A 的 write_file/read_file 只能访问自己的 workspace,物理隔离防越权。
+pub(crate) fn scoped_workspace_mount_view(
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<MountView, HostApiError> {
+    MountView::new(vec![grant(
+        WORKSPACE_ALIAS,
+        &format!("/projects/tenants/{tenant_id}/users/{user_id}/workspace"),
+        MountPermissions::read_write(),
+    )?])
+}
+
 pub(crate) fn scoped_skill_context_mount_view(
     scope: &ResourceScope,
 ) -> Result<MountView, HostApiError> {

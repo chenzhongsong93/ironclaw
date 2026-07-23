@@ -1587,6 +1587,31 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
     .map_err(|error| RebornBuildError::InvalidConfig {
         reason: format!("local-dev legacy skill backfill task failed: {error}"),
     })??;
+    // Per-user workspace 目录初始化(对齐 skills backfill 模式):
+    // 为默认 tenant + owner user 创建 workspace 目录,供 write_file 首次写入。
+    // scoped_workspace_mount_view grant /workspace → /projects/tenants/{tenant}/users/{user}/workspace
+    let ws_root = root.clone();
+    let ws_owner = owner_user_id.clone();
+    tokio::task::spawn_blocking(move || {
+        for tenant_id in ["default", "tianquan"] {
+            let scoped_ws = ws_root
+                .join("tenants")
+                .join(tenant_id)
+                .join("users")
+                .join(ws_owner.as_str())
+                .join("workspace");
+            std::fs::create_dir_all(&scoped_ws).map_err(|error| RebornBuildError::InvalidConfig {
+                reason: format!(
+                    "local-dev per-user workspace root could not be initialized: {error}"
+                ),
+            })?;
+        }
+        Ok::<(), RebornBuildError>(())
+    })
+    .await
+    .map_err(|error| RebornBuildError::InvalidConfig {
+        reason: format!("local-dev per-user workspace init task failed: {error}"),
+    })??;
     let default_system_prompt_path = local_dev_default_system_prompt_path(&root);
     seed_default_system_prompt(&root, &default_system_prompt_path).map_err(|error| {
         RebornBuildError::InvalidConfig {

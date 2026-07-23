@@ -176,11 +176,29 @@ impl RefreshingCapabilityPort {
             .snapshot()
             .await
             .map_err(host_api_agent_loop_error)?;
+        // Per-user workspace 隔离:按 run_context.scope 解析当前 tenant/user,
+        // grant /workspace → /projects/tenants/{tenant}/users/{user}/workspace。
+        // scope 缺 user_id 时 fallback 到全局 workspace_mounts(向后兼容)。
+        let scoped_workspace = self
+            .run_context
+            .scope
+            .explicit_owner_user_id()
+            .map(|user_id| {
+                crate::local_dev_mounts::scoped_workspace_mount_view(
+                    self.run_context.scope.tenant_id.as_str(),
+                    user_id.as_str(),
+                )
+            })
+            .transpose()
+            .map_err(host_api_agent_loop_error)?;
+        let workspace_mounts = scoped_workspace
+            .as_ref()
+            .unwrap_or(&self.workspace_mounts);
         let mut visible_request = visible_capability_request(
             &self.run_context,
             &self.fallback_user_id,
             VisibleCapabilityInputs {
-                workspace_mounts: &self.workspace_mounts,
+                workspace_mounts,
                 skill_mounts: &self.skill_mounts,
                 memory_mounts: &self.memory_mounts,
                 system_extensions_lifecycle_mounts: &self.system_extensions_lifecycle_mounts,
@@ -262,7 +280,7 @@ impl RefreshingCapabilityPort {
             Arc::clone(&self.result_writer),
             Arc::clone(&self.milestone_sink),
         )
-        .with_execution_mounts(self.workspace_mounts.clone())
+        .with_execution_mounts(workspace_mounts.clone())
         // Durable gate-record + host-private replay-payload stores (§5.2.9 /
         // §5.3 Stage 2a-i): without these the port defaults to a no-op gate
         // store and a fail-closed replay store, so production gate records never

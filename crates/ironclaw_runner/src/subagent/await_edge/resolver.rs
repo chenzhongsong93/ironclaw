@@ -545,20 +545,50 @@ where
         event: &TurnLifecycleEvent,
     ) -> Result<ResolveOutcome, TurnError> {
         let Some(terminal_kind) = EdgeTerminalKind::from_status(event.status) else {
+            tracing::info!(
+                target: "tianquan_spawn_diag",
+                run_id = ?event.run_id,
+                status = ?event.status,
+                "resume DIAG: handle_child_terminal NotApplicable (非 terminal status)"
+            );
             return Ok(ResolveOutcome::NotApplicable);
         };
+        tracing::info!(
+            target: "tianquan_spawn_diag",
+            run_id = ?event.run_id,
+            terminal_kind = ?terminal_kind,
+            "resume DIAG: handle_child_terminal 收到 terminal 事件,继续查 child_record"
+        );
         let Some(child_record) = self
             .turn_state_store
             .get_run_record(&event.scope, event.run_id)
             .await?
         else {
+            tracing::warn!(
+                target: "tianquan_spawn_diag",
+                run_id = ?event.run_id,
+                "resume DIAG: handle_child_terminal NotApplicable (child_record 找不到)"
+            );
             return Ok(ResolveOutcome::NotApplicable);
         };
         let (Some(parent_run_id), true) =
             (child_record.parent_run_id, child_record.subagent_depth > 0)
         else {
+            tracing::warn!(
+                target: "tianquan_spawn_diag",
+                run_id = ?event.run_id,
+                parent_run_id = ?child_record.parent_run_id,
+                depth = child_record.subagent_depth,
+                "resume DIAG: handle_child_terminal NotApplicable (非子 run: parent_run_id 缺或 depth=0)"
+            );
             return Ok(ResolveOutcome::NotApplicable);
         };
+        tracing::info!(
+            target: "tianquan_spawn_diag",
+            run_id = ?event.run_id,
+            parent_run_id = ?parent_run_id,
+            "resume DIAG: child_record 确认是子 run,继续 peek await edge"
+        );
         let event = self
             .event_with_recovered_owner(event, &child_record)
             .await?;
@@ -575,6 +605,12 @@ where
                 .reconstruct_edge(&child_record, parent_run_id, &event)
                 .await?
             else {
+                tracing::warn!(
+                    target: "tianquan_spawn_diag",
+                    run_id = ?event.run_id,
+                    parent_run_id = ?parent_run_id,
+                    "resume DIAG: handle_child_terminal NotApplicable (peek + reconstruct 都没找到 await edge)"
+                );
                 return Ok(ResolveOutcome::NotApplicable);
             };
             self.store
@@ -583,6 +619,12 @@ where
                 .map_err(store_error)?;
         }
 
+        tracing::info!(
+            target: "tianquan_spawn_diag",
+            run_id = ?event.run_id,
+            parent_run_id = ?parent_run_id,
+            "resume DIAG: 找到 await edge,调 settle_and_maybe_drain"
+        );
         self.settle_and_maybe_drain(
             &child_scope,
             parent_run_id,
@@ -618,15 +660,37 @@ where
                     event.sanitized_reason.clone(),
                 )
                 .await?;
+            tracing::info!(
+                target: "tianquan_spawn_diag",
+                child_run_id = ?child_run_id,
+                parent_run_id = ?parent_run_id,
+                has_final_text = output.final_text.is_some(),
+                "resume DIAG: child_terminal_output 取到,准备 update_capability_result"
+            );
             let payload = background_completion_payload(event, &edge, &output)?;
             let parent_run_context = self.parent_run_context(&edge);
             let byte_len = self
                 .result_writer()?
                 .update_capability_result(&parent_run_context, &edge.result_ref, payload)
                 .await
-                .map_err(|error| TurnError::Unavailable {
-                    reason: error.safe_summary,
+                .map_err(|error| {
+                    tracing::warn!(
+                        target: "tianquan_spawn_diag",
+                        child_run_id = ?child_run_id,
+                        result_ref = ?edge.result_ref,
+                        error = %error.safe_summary,
+                        "resume DIAG: update_capability_result FAILED (断裂点A: 占位记录找不到致 Err,resume 链路中断)"
+                    );
+                    TurnError::Unavailable {
+                        reason: error.safe_summary,
+                    }
                 })?;
+            tracing::info!(
+                target: "tianquan_spawn_diag",
+                child_run_id = ?child_run_id,
+                byte_len,
+                "resume DIAG: update_capability_result OK,继续 settle"
+            );
             self.store
                 .settle(
                     child_scope,

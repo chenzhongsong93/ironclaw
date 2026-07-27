@@ -850,7 +850,12 @@ impl SubagentSpawnCapabilityPort {
                 "registered provider tool-call activity identity does not match the requested activity",
             ));
         }
-        spawn_authorizations.remove(&invocation.input_ref);
+        // 天权治本(2026-07-27):不在 authorize_spawn 阶段 remove input_ref。
+        // 原因:finish_spawn 后续的 check_scope_recovered 可能失败(scope recovery in progress),
+        // 返 resolution::failed 不阻塞。若此时 input_ref 已 remove,LLM 重试同一 tool call 时
+        // authorize_spawn 查 map 找不到 → spawn_requires_provider_registration reject(永久卡死)。
+        // remove 移到 finish_spawn 成功返回 await_dependent_run 前,确保 check_scope_recovered
+        // 失败时 input_ref 保留供重试命中。
         Ok(None)
     }
 
@@ -1096,6 +1101,18 @@ impl SubagentSpawnCapabilityPort {
         }
 
         let loop_gate_ref = LoopGateRef::new(gate_ref.as_str()).map_err(invalid_static_ref)?;
+        // 天权治本(2026-07-27):finish_spawn 成功(走完 check_scope_recovered + submit_child_run)
+        // 才 remove input_ref。check_scope_recovered 失败时提前 return resolution::failed,
+        // 不走这里,input_ref 保留供 LLM 重试命中(治 authorize_spawn 提前 remove 致重试 reject)。
+        {
+            let mut spawn_authorizations = self.spawn_authorizations.lock().map_err(|_| {
+                AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::Unavailable,
+                    "subagent spawn authorization store is unavailable",
+                )
+            })?;
+            spawn_authorizations.remove(&invocation.input_ref);
+        }
         Ok(resolution::await_dependent_run(
             loop_gate_ref,
             result_ref,

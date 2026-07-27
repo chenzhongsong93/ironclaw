@@ -394,8 +394,14 @@ pub struct SubagentSpawnCapabilityPort {
     limits: SubagentSpawnLimits,
     deps: Arc<SubagentSpawnDeps>,
     parameters_schema: Arc<serde_json::Value>,
-    spawn_authorizations: Mutex<HashMap<CapabilityInputRef, CapabilityActivityId>>,
-    spawned_this_turn: AtomicU32,
+    /// 天权治本(2026-07-27):spawn_authorizations 从 per-run 改共享 Arc。
+    /// 原因:decorate 每次 create_capability_port 创建新 port 实例(per-run),
+    /// register(model stage 写)和 authorize(CapabilityStage 读)可能用不同 port 实例,
+    /// 致 authorize 读空 map → spawn_requires_provider_registration reject 不阻塞。
+    /// 改共享 Arc 让 register/authorize 无论 port 是否重建都读写同一 map。
+    /// input_ref payload 含 run_id(capability_port.rs:3193),天然按 run 隔离,共享 map 不会混。
+    spawn_authorizations: Arc<Mutex<HashMap<CapabilityInputRef, CapabilityActivityId>>>,
+    spawned_this_turn: Arc<AtomicU32>,
 }
 
 struct SpawnContext {
@@ -508,16 +514,16 @@ impl SubagentSpawnCapabilityPort {
         flavor_catalog: Vec<SpawnSubagentFlavorDescriptor>,
     ) -> Self {
         let parameters_schema = Arc::new(build_spawn_subagent_parameters_schema(&flavor_catalog));
-        Self {
+        Self::new_with_shared_state(
             inner,
             run_context,
             spawn_id,
             limits,
             deps,
             parameters_schema,
-            spawn_authorizations: Mutex::new(HashMap::new()),
-            spawned_this_turn: AtomicU32::new(0),
-        }
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(AtomicU32::new(0)),
+        )
     }
 
     /// Creates a port with a precomputed parameters schema, avoiding the
@@ -534,6 +540,31 @@ impl SubagentSpawnCapabilityPort {
         deps: Arc<SubagentSpawnDeps>,
         parameters_schema: Arc<serde_json::Value>,
     ) -> Self {
+        Self::new_with_shared_state(
+            inner,
+            run_context,
+            spawn_id,
+            limits,
+            deps,
+            parameters_schema,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(AtomicU32::new(0)),
+        )
+    }
+
+    /// 天权治本(2026-07-27):接收外部共享的 spawn_authorizations + spawned_this_turn。
+    /// decorator 持有共享 Arc,decorate 时 clone 传给每个 port 实例,
+    /// 确保 register/authorize 跨 port 重建读写同一 map(治 per-run 致 authorize 读空 map)。
+    pub fn new_with_shared_state(
+        inner: Arc<dyn LoopCapabilityPort>,
+        run_context: LoopRunContext,
+        spawn_id: CapabilityId,
+        limits: SubagentSpawnLimits,
+        deps: Arc<SubagentSpawnDeps>,
+        parameters_schema: Arc<serde_json::Value>,
+        spawn_authorizations: Arc<Mutex<HashMap<CapabilityInputRef, CapabilityActivityId>>>,
+        spawned_this_turn: Arc<AtomicU32>,
+    ) -> Self {
         Self {
             inner,
             run_context,
@@ -541,8 +572,8 @@ impl SubagentSpawnCapabilityPort {
             limits,
             deps,
             parameters_schema,
-            spawn_authorizations: Mutex::new(HashMap::new()),
-            spawned_this_turn: AtomicU32::new(0),
+            spawn_authorizations,
+            spawned_this_turn,
         }
     }
 

@@ -1,6 +1,8 @@
 //! Default Reborn runtime-loop composition.
 
 use std::{error::Error, fmt, sync::Arc};
+use std::collections::HashMap;
+use std::sync::{Mutex, atomic::AtomicU32};
 
 use ironclaw_events::SecurityAuditSink;
 use ironclaw_host_api::CapabilityId;
@@ -17,16 +19,16 @@ use ironclaw_loop_host::{
 };
 use ironclaw_threads::{SessionThreadService, ThreadScope};
 use ironclaw_turns::{
-    AgentLoopDriverError, CheckpointStateStore, DefaultTurnCoordinator,
+    AgentLoopDriverError, CapabilityActivityId, CheckpointStateStore, DefaultTurnCoordinator,
     DefaultTurnLifecycleEventBus, LifecyclePublicationErrorPort, LifecyclePublishingTurnStateStore,
     LoopCheckpointStore, RunProfileResolver, TurnCommittedEventObserver, TurnEventSink,
     TurnLifecycleEventBus, TurnRunWakeNotifier, TurnSpawnTreePort, TurnSpawnTreeStateStore,
     TurnStateStore,
     loop_exit::LoopExitEvidencePort,
     run_profile::{
-        AgentLoopHostError, CommunicationContextProvider, InstructionSafetyContext,
-        LoopCapabilityPort, LoopHostMilestoneSink, LoopModelBudgetAccountant, LoopModelPolicyGuard,
-        LoopRunContext,
+        AgentLoopHostError, CapabilityInputRef, CommunicationContextProvider,
+        InstructionSafetyContext, LoopCapabilityPort, LoopHostMilestoneSink,
+        LoopModelBudgetAccountant, LoopModelPolicyGuard, LoopRunContext,
     },
     runner::TurnRunTransitionPort,
 };
@@ -873,6 +875,14 @@ struct SubagentSpawnCapabilityDecorator {
     /// Schema precomputed once at construction time so `decorate()` does not
     /// rebuild it on every loop run.
     parameters_schema: Arc<serde_json::Value>,
+    /// 天权治本(2026-07-27):共享 spawn_authorizations + spawned_this_turn。
+    /// decorate 每次 create_capability_port 创建新 port 实例(per-run),
+    /// 若 spawn_authorizations 在 port 里则 register/authorize 跨 port 重建读写不同 map,
+    /// 致 authorize 读空 map → spawn_requires_provider_registration reject 不阻塞。
+    /// 放 decorator(per-process 共享),decorate 时 Arc::clone 传给 port,
+    /// input_ref payload 含 run_id(capability_port.rs:3193)天然按 run 隔离。
+    spawn_authorizations: Arc<Mutex<HashMap<CapabilityInputRef, CapabilityActivityId>>>,
+    spawned_this_turn: Arc<AtomicU32>,
 }
 
 impl SubagentSpawnCapabilityDecorator {
@@ -891,6 +901,8 @@ impl SubagentSpawnCapabilityDecorator {
             spawn_id,
             spawn_limits,
             parameters_schema,
+            spawn_authorizations: Arc::new(Mutex::new(HashMap::new())),
+            spawned_this_turn: Arc::new(AtomicU32::new(0)),
         })
     }
 }
@@ -905,13 +917,15 @@ impl LoopCapabilityPortDecorator for SubagentSpawnCapabilityDecorator {
         // schema tree on every decorate() call (the schema is rendered to a
         // serde_json::Value only at the single render site in
         // spawn_tool_definition / spawn_descriptor when the model requests it).
-        Arc::new(SubagentSpawnCapabilityPort::new_with_schema(
+        Arc::new(SubagentSpawnCapabilityPort::new_with_shared_state(
             inner,
             run_context.clone(),
             self.spawn_id.clone(),
             self.spawn_limits,
             Arc::clone(&self.spawn_deps),
             Arc::clone(&self.parameters_schema),
+            Arc::clone(&self.spawn_authorizations),
+            Arc::clone(&self.spawned_this_turn),
         ))
     }
 }

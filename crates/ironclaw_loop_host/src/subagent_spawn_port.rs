@@ -941,6 +941,44 @@ impl SubagentSpawnCapabilityPort {
             .await?;
         let result_ref = write_result.result_ref;
         compensation.result_written = Some(result_ref.clone());
+        // 天权治本(2026-07-28):child_turn_scope 构造 + check_scope_recovered 提到 ensure_thread 之前。
+        // 原因:check_scope_recovered 失败(scope recovery in progress)时返 resolution::failed 不阻塞,
+        // 但原顺序 ensure_thread 在 check 之前,已创建孤儿子 thread(没 submit_child_run 没调度,
+        // 但 thread 残留)。提到前面后,scope recovery 失败时不创建子 thread(无孤儿)。
+        // child_thread_id 是 spawn 早期预生成,ensure_thread 用它(line 949),两者一致可安全提前用。
+        let child_turn_scope = match self.run_context.scope.explicit_owner_user_id() {
+            Some(owner_user_id) => TurnScope::new_with_owner(
+                child_scope.tenant_id.clone(),
+                Some(child_scope.agent_id.clone()),
+                child_scope.project_id.clone(),
+                child_thread_id.clone(),
+                Some(owner_user_id.clone()),
+            ),
+            None => TurnScope::new(
+                child_scope.tenant_id.clone(),
+                Some(child_scope.agent_id.clone()),
+                child_scope.project_id.clone(),
+                child_thread_id.clone(),
+            ),
+        };
+        // Lazy-recovery admission gate (§5.3): refuse to open a new edge onto
+        // a scope whose boot/lazy recovery is still in flight. Transient and
+        // retryable, like the `spawn_rejected(...)` outcomes above — surface
+        // it as a model-visible recoverable failure, not `Err(AgentLoopHostError)`,
+        // which maps to a run-ending `HostUnavailable` (external review,
+        // PR #5819).
+        if let Err(error) = self
+            .deps
+            .await_edge_writer
+            .check_scope_recovered(&child_turn_scope)
+            .await
+        {
+            return Ok(resolution::failed(
+                CapabilityFailureKind::Transient,
+                format!("subagent spawn scope recovery in progress: {error}"),
+                None,
+            ));
+        }
         let child_thread = self
             .deps
             .thread_service
@@ -966,45 +1004,6 @@ impl SubagentSpawnCapabilityPort {
             .await
             .map_err(map_thread_error)?;
         compensation.thread_written = Some((child_scope.clone(), child_thread.thread_id.clone()));
-        // Mirror the parent's own scope ownership mode instead of always
-        // defaulting to `ActorFallback`: an `ActorFallback` child scope maps
-        // to the system mount, but `has_awaited_child_gate` reads this edge
-        // back under the parent's real-owner scope, so a multi-user parent's
-        // edge would be invisible to its own evidence check (external
-        // review, PR #5819). A parent with no explicit owner is unaffected.
-        let child_turn_scope = match self.run_context.scope.explicit_owner_user_id() {
-            Some(owner_user_id) => TurnScope::new_with_owner(
-                child_scope.tenant_id.clone(),
-                Some(child_scope.agent_id.clone()),
-                child_scope.project_id.clone(),
-                child_thread.thread_id.clone(),
-                Some(owner_user_id.clone()),
-            ),
-            None => TurnScope::new(
-                child_scope.tenant_id.clone(),
-                Some(child_scope.agent_id.clone()),
-                child_scope.project_id.clone(),
-                child_thread.thread_id.clone(),
-            ),
-        };
-        // Lazy-recovery admission gate (§5.3): refuse to open a new edge onto
-        // a scope whose boot/lazy recovery is still in flight. Transient and
-        // retryable, like the `spawn_rejected(...)` outcomes above — surface
-        // it as a model-visible recoverable failure, not `Err(AgentLoopHostError)`,
-        // which maps to a run-ending `HostUnavailable` (external review,
-        // PR #5819).
-        if let Err(error) = self
-            .deps
-            .await_edge_writer
-            .check_scope_recovered(&child_turn_scope)
-            .await
-        {
-            return Ok(resolution::failed(
-                CapabilityFailureKind::Transient,
-                format!("subagent spawn scope recovery in progress: {error}"),
-                None,
-            ));
-        }
         self.deps
             .goal_store
             .put_goal(

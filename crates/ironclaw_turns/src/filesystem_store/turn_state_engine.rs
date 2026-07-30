@@ -119,7 +119,10 @@ const MAX_IDEMPOTENCY_RECORDS: usize = 10_000;
 /// below this value (enforced by an invariant test in `run_profile::model`) so
 /// a hung provider surfaces as a retryable error before the lease reclaims the
 /// runner mid-flight.
-pub(crate) const DEFAULT_RUNNER_LEASE_TTL_SECONDS: i64 = 90;
+// 天权定制(2026-07-29):90→200。minimax 生成 3000 字正文实测 115s,
+// 原 90s lease + 60s request_timeout 致子 agent 长 正文生成被砍断 TimedOut 无限 retry。
+// 调 LLM_REQUEST_TIMEOUT_SECS=180(覆盖 115s 生成)+ lease 200(>180 满足 request<lease 不变式)。
+pub(crate) const DEFAULT_RUNNER_LEASE_TTL_SECONDS: i64 = 200;
 
 /// Default crash-retry bound for lease recovery of a checkpointless run (#6284).
 /// Small and consistent with the crate's other bounded-retry counters — a

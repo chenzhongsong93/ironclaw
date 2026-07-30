@@ -152,7 +152,8 @@ fn dispatch_error_kind(error: &DispatchError) -> DispatchFailureKind {
 fn dispatch_error_safe_summary(error: &DispatchError) -> Option<String> {
     match error {
         DispatchError::FirstParty { safe_summary, .. }
-        | DispatchError::Wasm { safe_summary, .. } => safe_summary.clone(),
+        | DispatchError::Wasm { safe_summary, .. }
+        | DispatchError::Mcp { safe_summary, .. } => safe_summary.clone(),
         _ => None,
     }
 }
@@ -227,6 +228,7 @@ mod tests {
     fn dispatch_error_kind_forwards_mcp_runtime_kind_as_str() {
         let kind = dispatch_error_kind(&DispatchError::Mcp {
             kind: RuntimeDispatchErrorKind::Backend,
+            safe_summary: None,
         });
         assert_eq!(kind.as_str(), "Backend");
     }

@@ -556,6 +556,7 @@ mod tests {
             (
                 DispatchError::Mcp {
                     kind: RuntimeDispatchErrorKind::NetworkDenied,
+                    safe_summary: None,
                 },
                 "network_denied",
             ),

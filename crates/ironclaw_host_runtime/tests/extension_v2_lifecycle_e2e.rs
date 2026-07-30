@@ -538,7 +538,7 @@ fn dispatch_error_for_runtime(
             kind,
             safe_summary: None,
         },
-        RuntimeKind::Mcp => DispatchError::Mcp { kind },
+        RuntimeKind::Mcp => DispatchError::Mcp { kind, safe_summary: None },
         RuntimeKind::FirstParty | RuntimeKind::System => DispatchError::UnsupportedRuntime {
             capability: CapabilityId::new("system.unsupported").unwrap(),
             runtime,

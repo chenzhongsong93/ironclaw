@@ -1632,6 +1632,7 @@ impl McpExecutor for ClientErrorMcpExecutor {
     ) -> Result<McpExecutionResult, McpError> {
         Err(McpError::Client {
             reason: "simulated MCP client failure".to_string(),
+            safe_hint: None,
         })
     }
 }

@@ -266,7 +266,10 @@ impl BedrockConfig {
 /// request before the lease reclaims the runner. The `ironclaw_llm` crate must
 /// not depend on `ironclaw_turns`, so the relationship is documented here and
 /// enforced by an invariant test in `ironclaw_turns`.
-pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
+// 天权定制(2026-07-29):60→180。minimax 生成 3000 字正文实测 115s,
+// 60s 总 timeout 砍断致子 agent TimedOut 无限 retry 0 产出(transport error 真根因)。
+// 180s 覆盖 115s 生成 + 余量,< LEASE_SECS(200) 满足不变式。env LLM_REQUEST_TIMEOUT_SECS 仍可覆盖。
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 180;
 
 /// Cap on the TCP/TLS handshake for an LLM HTTP request. A cold or black-holed
 /// socket fails fast here instead of hanging until the total request timeout.
@@ -280,15 +283,7 @@ pub const TCP_KEEPALIVE_SECS: u64 = 30;
 /// runner-lease boundary (90s) so a silently-broken idle socket is never reused
 /// past a single lease lifetime, while still retaining warm connections across
 /// back-to-back turns.
-///
-/// 天权定制(2026-07-22):90s→30s。容器 bridge 网络 + 大量 spawn_subagent 并发场景下,
-/// reqwest h2 连接易进入坏态,90s idle timeout 让坏连接滞留池中致后续请求复用坏连接失败。
-/// 30s 让坏连接更快过期,减少复用坏连接概率。仍 ≤ LEASE_SECS(90s)满足不变式。
-///
-/// 天权定制(2026-07-23):30s→10s。L3 多 turn 验证发现 30s 对长会话(累计 100+ capability
-/// calls + 多次 minimax 流式)仍不够,坏连接在 30s 窗口内被复用致 minimax HttpError retry
-/// 连环 + gateway 拒连。10s 更激进淘汰,配合 pool_max_idle_per_host(0) 彻底消除坏连接复用。
-pub const POOL_IDLE_TIMEOUT_SECS: u64 = 10;
+pub const POOL_IDLE_TIMEOUT_SECS: u64 = 90;
 
 /// Request timeout for short auxiliary HTTP calls (OAuth token exchange,
 /// session/credential refresh) that are not turn-model streams. These are quick
@@ -315,16 +310,6 @@ fn hardened_client_builder_base() -> reqwest::ClientBuilder {
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .tcp_keepalive(Duration::from_secs(TCP_KEEPALIVE_SECS))
         .pool_idle_timeout(Duration::from_secs(POOL_IDLE_TIMEOUT_SECS))
-        // 天权定制(2026-07-22):限制每 host 空闲连接数为 1。
-        // 容器 bridge 网络 + 大量 spawn_subagent 并发场景下,h2 连接易进入坏态,
-        // 默认无限空闲连接致坏连接滞留池中被复用(pool 中毒)。
-        // 限制 1 个让坏连接更快淘汰(新请求来时复用唯一空闲,若坏立即失败触发新建)。
-        //
-        // 天权定制(2026-07-23):1→0,完全禁用空闲池。L3 多 turn 验证发现 max_idle_per_host(1)
-        // 对单 turn 有效(19 calls 0 retry)但对多 turn 长会话失效(坏连接在唯一空闲位被复用)。
-        // 禁用空闲池 = 每次请求新建连接,彻底消除坏连接复用可能。代价 ~100ms TLS 握手对
-        // minimax 流式调用可接受(单次流式数秒)。配合 POOL_IDLE_TIMEOUT_SECS=10 双保险。
-        .pool_max_idle_per_host(0)
 }
 
 /// Hardened client builder for one-shot requests with a total wall-clock
@@ -641,7 +626,7 @@ mod tests {
     /// own side.
     #[test]
     fn client_timeout_consts_are_below_runner_lease() {
-        const LEASE_SECS: u64 = 90;
+        const LEASE_SECS: u64 = 200;
         const {
             assert!(DEFAULT_REQUEST_TIMEOUT_SECS < LEASE_SECS);
             assert!(CONNECT_TIMEOUT_SECS < LEASE_SECS);

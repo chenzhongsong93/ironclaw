@@ -387,8 +387,17 @@ where
                     required_secrets,
                     credential_requirements,
                 },
+                // `Client` is the one variant that may carry a host-authored
+                // `safe_hint` (sourced from the JSON-RPC `error.data.safe_hint`
+                // side-channel). Forward it as `safe_summary` so the model sees
+                // actionable remediation; `kind` stays a stable audit token.
+                McpError::Client { safe_hint, .. } => DispatchError::Mcp {
+                    kind: RuntimeDispatchErrorKind::Client,
+                    safe_summary: safe_hint,
+                },
                 error => DispatchError::Mcp {
                     kind: mcp_error_kind(&error),
+                    safe_summary: None,
                 },
             })?;
 
@@ -1002,7 +1011,7 @@ fn dispatch_error_for_runtime(
     kind: RuntimeDispatchErrorKind,
 ) -> DispatchError {
     match runtime {
-        RuntimeKind::Mcp => DispatchError::Mcp { kind },
+        RuntimeKind::Mcp => DispatchError::Mcp { kind, safe_summary: None },
         RuntimeKind::Script => DispatchError::Script { kind },
         RuntimeKind::Wasm => DispatchError::Wasm {
             kind,

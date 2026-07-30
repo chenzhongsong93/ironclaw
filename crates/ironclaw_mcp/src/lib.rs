@@ -160,7 +160,15 @@ pub trait McpClient: Send + Sync {
 /// Stable, sanitized MCP client-side failure categories.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpClientError {
-    Client { reason: String },
+    /// Generic client-side failure carrying the stable `reason` token plus an
+    /// optional host-authored `safe_hint` side-channel. The `safe_hint` does
+    /// not enter `reason` (which stays a stable audit token); it flows toward
+    /// `DispatchError::Mcp::safe_summary` so the model sees actionable
+    /// remediation when the server provided `error.data.safe_hint`.
+    Client {
+        reason: String,
+        safe_hint: Option<String>,
+    },
     AuthRequired,
 }
 
@@ -168,12 +176,22 @@ impl McpClientError {
     pub fn client(reason: impl Into<String>) -> Self {
         Self::Client {
             reason: reason.into(),
+            safe_hint: None,
+        }
+    }
+
+    /// Construct a `Client` variant that carries both the stable `reason`
+    /// token and an optional host-authored `safe_hint` side-channel.
+    pub fn client_with_safe_hint(reason: impl Into<String>, safe_hint: Option<String>) -> Self {
+        Self::Client {
+            reason: reason.into(),
+            safe_hint,
         }
     }
 
     pub fn stable_reason(&self) -> &str {
         match self {
-            Self::Client { reason } => reason,
+            Self::Client { reason, .. } => reason,
             Self::AuthRequired => "auth_required",
         }
     }
@@ -619,9 +637,15 @@ where
             .await?;
         accumulate_usage(&mut usage, initialize.usage);
         if let Some(error) = initialize.response.error {
-            return Err(McpClientError::client(response_error(
-                McpResponseErrorCause::JsonRpcError { code: error.code },
-            )));
+            let cause = McpResponseErrorCause::JsonRpcError {
+                code: error.code,
+                safe_hint: error.safe_hint,
+            };
+            let safe_hint = cause.safe_hint();
+            return Err(McpClientError::client_with_safe_hint(
+                response_error(cause),
+                safe_hint,
+            ));
         }
         self.store_session(
             session_key,
@@ -644,9 +668,15 @@ where
         accumulate_usage(&mut usage, initialized.usage);
         self.update_session_id(session_key, initialized.session_id.clone())?;
         if let Some(error) = initialized.response.error {
-            return Err(McpClientError::client(response_error(
-                McpResponseErrorCause::JsonRpcError { code: error.code },
-            )));
+            let cause = McpResponseErrorCause::JsonRpcError {
+                code: error.code,
+                safe_hint: error.safe_hint,
+            };
+            let safe_hint = cause.safe_hint();
+            return Err(McpClientError::client_with_safe_hint(
+                response_error(cause),
+                safe_hint,
+            ));
         }
         Ok(usage)
     }
@@ -702,9 +732,15 @@ where
         accumulate_usage(&mut usage, call.usage);
         self.update_session_id(&session_key, call.session_id.clone())?;
         if let Some(error) = call.response.error {
-            return Err(McpClientError::client(response_error(
-                McpResponseErrorCause::JsonRpcError { code: error.code },
-            )));
+            let cause = McpResponseErrorCause::JsonRpcError {
+                code: error.code,
+                safe_hint: error.safe_hint,
+            };
+            let safe_hint = cause.safe_hint();
+            return Err(McpClientError::client_with_safe_hint(
+                response_error(cause),
+                safe_hint,
+            ));
         }
         let output = call.response.result.ok_or_else(|| {
             McpClientError::client(response_error(McpResponseErrorCause::MissingResult))
@@ -759,9 +795,15 @@ where
         accumulate_usage(&mut usage, tools.usage);
         self.update_session_id(&session_key, tools.session_id.clone())?;
         if let Some(error) = tools.response.error {
-            return Err(McpClientError::client(response_error(
-                McpResponseErrorCause::JsonRpcError { code: error.code },
-            )));
+            let cause = McpResponseErrorCause::JsonRpcError {
+                code: error.code,
+                safe_hint: error.safe_hint,
+            };
+            let safe_hint = cause.safe_hint();
+            return Err(McpClientError::client_with_safe_hint(
+                response_error(cause),
+                safe_hint,
+            ));
         }
         let result = tools.response.result.ok_or_else(|| {
             McpClientError::client(response_error(McpResponseErrorCause::MissingResult))
@@ -785,9 +827,18 @@ struct McpJsonRpcResponse {
 /// diagnostics, or credential-shaped values) and is deliberately dropped rather
 /// than carried toward the model-visible reason. Length-bounding is not
 /// redaction, so the message is never captured here.
+///
+/// `safe_hint` is the exception: an opt-in, host-authored diagnostic that the
+/// server may place at `error.data.safe_hint`. Unlike the free-text `message`,
+/// this field is meant for model consumption (it carries actionable remediation
+/// such as "advance_stage then retry"), so it is captured, length-bounded, and
+/// control-character scrubbed via [`bound_mcp_reason_detail`]. The reason token
+/// produced by [`McpResponseErrorCause::into_reason`] is unchanged — `safe_hint`
+/// travels a parallel side-channel toward `DispatchError::Mcp::safe_summary`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct JsonRpcErrorInfo {
     code: Option<i64>,
+    safe_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1022,7 +1073,17 @@ fn parse_json_rpc_error_info(error: Option<&Value>) -> Option<JsonRpcErrorInfo> 
     // `message` is untrusted free text and is intentionally not read, so it can
     // never flow into the model-visible reason.
     let code = error.get("code").and_then(Value::as_i64);
-    Some(JsonRpcErrorInfo { code })
+    // The optional `data.safe_hint` is a host-authored diagnostic meant for
+    // model consumption (e.g. "advance_stage then retry"). It is length-bounded
+    // and control-character scrubbed via `bound_mcp_reason_detail`; the
+    // downstream `SafeSummary` validator applies a second defense-in-depth
+    // check. The untrusted `message` is still never read.
+    let safe_hint = error
+        .get("data")
+        .and_then(|d| d.get("safe_hint"))
+        .and_then(Value::as_str)
+        .map(bound_mcp_reason_detail);
+    Some(JsonRpcErrorInfo { code, safe_hint })
 }
 
 fn parse_tools_list_result(value: &Value) -> Result<Vec<HostedMcpDiscoveredTool>, String> {
@@ -1302,7 +1363,17 @@ enum McpResponseErrorCause {
     /// Non-2xx HTTP status from the MCP endpoint.
     HttpStatus(u16),
     /// JSON-RPC `error` object with code and bounded message.
-    JsonRpcError { code: Option<i64> },
+    ///
+    /// `safe_hint` carries the optional host-authored `error.data.safe_hint`
+    /// diagnostic. It does NOT enter the stable `reason` token produced by
+    /// [`McpResponseErrorCause::into_reason`] (the token is a stable audit
+    /// identifier that must never echo server free text); it travels a parallel
+    /// side-channel toward `DispatchError::Mcp::safe_summary` so the model can
+    /// see actionable remediation.
+    JsonRpcError {
+        code: Option<i64>,
+        safe_hint: Option<String>,
+    },
     /// Response body failed JSON parsing.
     ParseFailed(String),
     /// A successful response carried no `result` field.
@@ -1324,12 +1395,14 @@ impl McpResponseErrorCause {
     fn into_reason(self) -> String {
         match self {
             Self::HttpStatus(status) => format!("mcp_http_status_{status}"),
-            Self::JsonRpcError { code } => {
+            Self::JsonRpcError { code, .. } => {
                 // The untrusted server-provided `message` is deliberately NOT
                 // included: MCP servers can echo request args, paths, provider
                 // diagnostics, or credential-shaped values, and this reason is a
                 // stable, model-visible token. The standardized protocol `code`
                 // is the safe diagnostic; length-bounding is not redaction.
+                // `safe_hint` is likewise kept out of the reason token: it
+                // travels the parallel `safe_summary` side-channel instead.
                 let mut reason = String::from("mcp_jsonrpc_error");
                 if let Some(code) = code {
                     reason.push_str(&format!(" code={code}"));
@@ -1345,6 +1418,15 @@ impl McpResponseErrorCause {
             Self::IdMismatch => "mcp_jsonrpc_id_mismatch".to_string(),
             Self::NoPayload => "mcp_no_payload".to_string(),
             Self::InvalidToolList => "mcp_invalid_tool_list".to_string(),
+        }
+    }
+
+    /// Side-channel accessor for the optional host-authored `safe_hint`
+    /// diagnostic. Returns `None` for all non-JSON-RPC causes.
+    fn safe_hint(&self) -> Option<String> {
+        match self {
+            Self::JsonRpcError { safe_hint, .. } => safe_hint.clone(),
+            _ => None,
         }
     }
 }
@@ -1363,7 +1445,10 @@ pub enum McpError {
     #[error("resource governor error: {0}")]
     Resource(Box<ResourceError>),
     #[error("MCP client error: {reason}")]
-    Client { reason: String },
+    Client {
+        reason: String,
+        safe_hint: Option<String>,
+    },
     #[error("MCP capability requires authentication")]
     AuthRequired {
         required_secrets: Vec<SecretHandle>,
@@ -1570,7 +1655,7 @@ where
 
 fn mcp_error_from_client_error(error: McpClientError, auth_context: McpAuthContext) -> McpError {
     match error {
-        McpClientError::Client { reason } => McpError::Client { reason },
+        McpClientError::Client { reason, safe_hint } => McpError::Client { reason, safe_hint },
         McpClientError::AuthRequired => McpError::AuthRequired {
             required_secrets: auth_context.required_secrets,
             credential_requirements: auth_context.credential_requirements,
@@ -1979,15 +2064,36 @@ mod tests {
             json!({
                 "jsonrpc": "2.0",
                 "id": 1,
-                "error": { "code": -32601, "message": "Method not found" }
+                "error": {
+                    "code": -32601,
+                    "message": "Method not found",
+                    "data": { "safe_hint": "stage mismatch: advance_stage then retry" }
+                }
             }),
         );
 
         let parsed = parse_mcp_response(&response, Some(1)).expect("parse json-rpc error response");
         let error = parsed.error.expect("error object captured");
 
+        // The host-authored safe_hint is captured on the side-channel...
+        assert_eq!(
+            error.safe_hint.as_deref(),
+            Some("stage mismatch: advance_stage then retry"),
+            "safe_hint should be captured from error.data.safe_hint"
+        );
+
         // Drive the same reason construction the call sites use.
-        let reason = response_error(McpResponseErrorCause::JsonRpcError { code: error.code });
+        let cause = McpResponseErrorCause::JsonRpcError {
+            code: error.code,
+            safe_hint: error.safe_hint,
+        };
+        // ...but the side-channel accessor mirrors it, while into_reason stays
+        // a stable token that never echoes server free text.
+        assert_eq!(
+            cause.safe_hint().as_deref(),
+            Some("stage mismatch: advance_stage then retry")
+        );
+        let reason = response_error(cause);
         assert!(
             reason.contains("-32601"),
             "reason should carry the standardized protocol code: {reason}"
@@ -1997,6 +2103,12 @@ mod tests {
         assert!(
             !reason.contains("Method not found"),
             "raw server message must not leak into the reason: {reason}"
+        );
+        // safe_hint must also stay out of the stable reason token; it travels
+        // the parallel safe_summary side-channel instead.
+        assert!(
+            !reason.contains("advance_stage"),
+            "safe_hint must not leak into the reason token: {reason}"
         );
         assert!(reason.starts_with("mcp_jsonrpc_error"));
     }
@@ -2008,7 +2120,11 @@ mod tests {
         let parsed = parse_mcp_response(&response, Some(4)).expect("parse non-object error");
         let error = parsed.error.expect("error present even when non-object");
         assert_eq!(error.code, None);
-        let reason = response_error(McpResponseErrorCause::JsonRpcError { code: error.code });
+        assert!(error.safe_hint.is_none(), "no data.safe_hint present");
+        let reason = response_error(McpResponseErrorCause::JsonRpcError {
+            code: error.code,
+            safe_hint: error.safe_hint,
+        });
         assert_eq!(reason, "mcp_jsonrpc_error");
     }
 
@@ -2041,6 +2157,72 @@ mod tests {
         let parsed = parse_mcp_response(&response, Some(9)).expect("success path unchanged");
         assert_eq!(parsed.result, Some(json!({ "ok": true })));
         assert!(parsed.error.is_none());
+    }
+
+    #[test]
+    fn safe_hint_is_control_scrubbed_and_length_bounded() {
+        // Control characters must be replaced with spaces (defense-in-depth
+        // before the downstream SafeSummary validator runs).
+        let response = json_response(
+            200,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "error": {
+                    "code": -32602,
+                    "data": { "safe_hint": "stage\r\nmismatch\tadvance" }
+                }
+            }),
+        );
+        let parsed = parse_mcp_response(&response, Some(7)).expect("parse error response");
+        let error = parsed.error.expect("error captured");
+        assert_eq!(
+            error.safe_hint.as_deref(),
+            Some("stage  mismatch advance"),
+            "control chars must be scrubbed to spaces"
+        );
+
+        // Oversized safe_hint is capped at MAX_MCP_REASON_BYTES (512) on a char
+        // boundary with an ellipsis marker, matching bound_mcp_reason_detail.
+        let oversized = "a".repeat(1024);
+        let response = json_response(
+            200,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "error": {
+                    "code": -32602,
+                    "data": { "safe_hint": oversized }
+                }
+            }),
+        );
+        let parsed = parse_mcp_response(&response, Some(8)).expect("parse oversized safe_hint");
+        let error = parsed.error.expect("error captured");
+        let hint = error.safe_hint.expect("safe_hint captured");
+        assert!(
+            hint.len() <= 512,
+            "safe_hint must be bounded to 512 bytes, got {}",
+            hint.len()
+        );
+        assert!(
+            hint.ends_with("..."),
+            "bounded safe_hint must end with ellipsis: {hint}"
+        );
+
+        // A non-string safe_hint is ignored, and missing data.safe_hint yields None.
+        let response = json_response(
+            200,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "error": { "code": -32602, "data": { "safe_hint": 42 } }
+            }),
+        );
+        let parsed = parse_mcp_response(&response, Some(10)).expect("parse non-string safe_hint");
+        assert!(
+            parsed.error.as_ref().and_then(|e| e.safe_hint.as_ref()).is_none(),
+            "non-string safe_hint must be ignored"
+        );
     }
 
     #[test]

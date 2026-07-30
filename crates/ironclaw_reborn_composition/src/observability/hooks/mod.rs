@@ -8,16 +8,16 @@
 //!    runtime composes exactly as it did before hooks existed (zero behavior
 //!    change). This is the hard rollout-safety contract for the activation.
 //! 2. **The first-party builtin hook set** ([`factory::install_first_party_hooks`]) —
-//!    installed regardless of extensions. The production catalog is
-//!    deliberately **EMPTY**: no real first-party builtin hook has been
-//!    productized, so we ship none. A production type + install path + behavior
-//!    for a hook that does nothing is scaffolding, not a deliverable. The
-//!    activation machinery is exercised end-to-end with test-only hooks (see
-//!    the `#[cfg(test)]` `NoOpObserverHook` and the test-only first-party
-//!    installer seam in [`tests`]), not with a shipped no-op. An empty
-//!    first-party set composed with no extension hooks is a legitimate state —
-//!    the dispatcher composes with zero bindings, which is valid (not a
-//!    panic/error).
+//!    installed regardless of extensions. The production catalog ships the
+//!    [`tianquan_guard::TianquanBuiltinGuard`], a hard `before_capability`
+//!    guard that curbs three LLM anti-patterns on the builtin tools
+//!    (`builtin.spawn_subagent` / `builtin.result_read` / `builtin.shell`) that
+//!    Tianquan cannot enforce itself (no dispatch authority over ironclaw
+//!    builtins). The activation machinery is additionally exercised end-to-end
+//!    with test-only hooks (see the `#[cfg(test)]` `NoOpObserverHook` and the
+//!    test-only first-party installer seam in [`tests`]). An empty extension
+//!    set composed with the first-party guard is a legitimate state — the
+//!    dispatcher composes with the guard binding only, which is valid.
 //! 3. **The manifest → registry loader** ([`factory::project_extension_hook_sets`])
 //!    — takes the hook-only [`projection::HookProjection`] of each installed
 //!    extension, projects each declared `[[hooks]]` payload into a typed
@@ -68,6 +68,7 @@
 pub(crate) mod audit;
 pub(crate) mod factory;
 pub(crate) mod projection;
+pub(crate) mod tianquan_guard;
 
 #[cfg(test)]
 mod tests;

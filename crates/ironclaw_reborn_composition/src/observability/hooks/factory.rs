@@ -44,19 +44,21 @@ fn reborn_replay_error(
 /// extension id. They are installed regardless of which extensions are
 /// present.
 ///
-/// **The production catalog is empty.** No real first-party builtin hook has
-/// been productized, so this installs nothing and returns the builder
-/// unchanged. An empty first-party set is a legitimate composed state — the
-/// activation machinery below composes a valid (possibly zero-binding)
-/// dispatcher with the flag ON. First-party hooks are added here when (and
-/// if) one is productized; the install + dispatch path is already exercised
-/// end-to-end by test-only hooks.
+/// The production catalog currently ships one first-party hook: the
+/// [`tianquan_guard::TianquanBuiltinGuard`], a hard `before_capability` guard
+/// that curbs three LLM anti-patterns on the builtin tools
+/// (`builtin.spawn_subagent` / `builtin.result_read` / `builtin.shell`). See
+/// the guard's module docs for the rationale — the short version is that
+/// Tianquan has no dispatch authority over ironclaw-internal builtin tools, so
+/// the only point a hard deny can be enforced for them is here, ironclaw-side.
+///
+/// The install step is a pure replayable function of its builder input: the
+/// same call is proven to succeed against a scratch builder at composition
+/// time and replayed per run (see [`build_hook_dispatcher_builder_factory_with`]).
 pub(super) fn install_first_party_hooks(
     builder: HookDispatcherBuilder,
 ) -> Result<HookDispatcherBuilder, RebornBuildError> {
-    // Empty production catalog. See the module docs (item 2) for why no no-op
-    // hook is shipped here.
-    Ok(builder)
+    super::tianquan_guard::install_tianquan_guard(builder)
 }
 
 /// A surviving extension's projected hook install set: the typed entries that
@@ -248,8 +250,8 @@ pub fn build_hook_dispatcher_builder_factory(
     config: HooksActivationConfig,
     registry: &HookProjectionRegistry,
 ) -> Result<Option<HookDispatcherBuilderFactory>, RebornBuildError> {
-    // Production path: the first-party catalog is empty
-    // (`install_first_party_hooks` is a no-op). All other wiring lives in the
+    // Production path: the first-party catalog ships the Tianquan builtin
+    // guard (see `install_first_party_hooks`). All other wiring lives in the
     // shared helper.
     build_hook_dispatcher_builder_factory_with(
         config,

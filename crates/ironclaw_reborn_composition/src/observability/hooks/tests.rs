@@ -33,6 +33,27 @@ use ironclaw_host_api::{HostPortCatalog, VirtualPath};
 const TEST_NOOP_OBSERVER_CANONICAL_PATH: &str =
     "ironclaw_reborn_composition::hooks::tests::NoOpObserverHook";
 
+/// The production first-party `before_capability` guard
+/// (`tianquan_guard::TianquanBuiltinGuard`) is always bound at
+/// `BeforeCapability` once the hook framework is enabled. Tests that assert an
+/// extension's hooks were/ were NOT installed must exclude this always-present
+/// first-party binding from the count — otherwise the guard's binding would
+/// masquerade as an extension binding. This helper returns the count of
+/// `BeforeCapability` bindings NOT contributed by the first-party guard.
+fn before_capability_extension_binding_count(
+    dispatcher: &ironclaw_hooks::dispatch::HookDispatcher,
+) -> usize {
+    let guard_id = HookId::for_builtin(
+        super::tianquan_guard::TIANQUAN_GUARD_CANONICAL_PATH,
+        HookVersion::ONE,
+    );
+    dispatcher
+        .active_bindings_snapshot(HookPointSpec::BeforeCapability)
+        .into_iter()
+        .filter(|b| b.hook_id != guard_id)
+        .count()
+}
+
 /// A test-only first-party no-op observer. Observers cannot affect
 /// outcomes; this one records nothing. It proves the builtin install +
 /// dispatch path end to end through `build_hook_dispatcher_builder_factory_with`.
@@ -192,22 +213,32 @@ fn disabled_config_yields_no_factory() {
 }
 
 #[test]
-fn enabled_config_with_empty_production_catalog_yields_valid_zero_binding_factory() {
-    // The PRODUCTION first-party catalog is empty. Flag ON + empty
-    // first-party set + no extension hooks must still compose a valid
-    // dispatcher — a zero-binding dispatcher, not a panic/error. This pins
-    // the empty-catalog-is-valid contract.
+fn enabled_config_with_no_extensions_yields_valid_factory() {
+    // Flag ON + the first-party guard + no extension hooks must still compose
+    // a valid dispatcher — the guard is the sole first-party binding, and the
+    // extension-derived bindings are zero. This pins the
+    // no-extensions-is-valid contract. (The guard is bound at
+    // BeforeCapability, so AfterCapability has zero extension bindings.)
     let registry = projection(ExtensionRegistry::new());
     let factory =
         build_hook_dispatcher_builder_factory(HooksActivationConfig::enabled(), &registry)
-            .expect("enabled build with empty registry + empty catalog succeeds")
-            .expect("flag ON yields a factory even with an empty catalog");
-    // The factory mints a valid dispatcher with no first-party bindings.
+            .expect("enabled build with empty registry + first-party guard succeeds")
+            .expect("flag ON yields a factory");
     let dispatcher = factory().expect("mint hook builder").build_arc();
-    let bindings = dispatcher.active_bindings_snapshot(HookPointSpec::AfterCapability);
+    let after = dispatcher.active_bindings_snapshot(HookPointSpec::AfterCapability);
     assert!(
-        bindings.is_empty(),
-        "empty production catalog must yield zero first-party bindings, saw {bindings:?}"
+        after.is_empty(),
+        "no extension hooks must yield zero AfterCapability bindings, saw {after:?}"
+    );
+    // The first-party Tianquan guard IS bound at BeforeCapability.
+    let before = dispatcher.active_bindings_snapshot(HookPointSpec::BeforeCapability);
+    let guard_id = HookId::for_builtin(
+        super::tianquan_guard::TIANQUAN_GUARD_CANONICAL_PATH,
+        HookVersion::ONE,
+    );
+    assert!(
+        before.iter().any(|b| b.hook_id == guard_id),
+        "first-party Tianquan guard must be bound at BeforeCapability; saw {before:?}"
     );
 }
 
@@ -361,11 +392,11 @@ body = { mode = "nonsense" }
             .expect("malformed INSTALLED manifest must NOT fail the build (quarantine)")
             .expect("flag ON yields a factory");
     let dispatcher = factory().expect("mint hook builder").build_arc();
-    assert!(
-        dispatcher
-            .active_bindings_snapshot(HookPointSpec::BeforeCapability)
-            .is_empty(),
-        "quarantined extension must contribute no bindings"
+    assert_eq!(
+        before_capability_extension_binding_count(&dispatcher),
+        0,
+        "quarantined extension must contribute no BeforeCapability bindings \
+         (only the always-present first-party guard may be bound)"
     );
 }
 
@@ -471,11 +502,11 @@ body = { mode = "predicate", spec = { type = "deny_capability", reason = "wider-
             .expect("ungranted wider-scope INSTALLED hook must quarantine, not fail the build")
             .expect("flag ON yields a factory");
     let dispatcher = factory().expect("mint hook builder").build_arc();
-    assert!(
-        dispatcher
-            .active_bindings_snapshot(HookPointSpec::BeforeCapability)
-            .is_empty(),
-        "ungranted wider-scope hook must be quarantined (no binding)"
+    assert_eq!(
+        before_capability_extension_binding_count(&dispatcher),
+        0,
+        "ungranted wider-scope hook must be quarantined (no extension binding; \
+         only the always-present first-party guard may be bound)"
     );
 }
 
@@ -590,9 +621,9 @@ fn surplus_extensions_beyond_consider_cap_are_quarantined() {
             .expect("surplus extensions must quarantine, not fail the build")
             .expect("flag ON yields a factory");
     let dispatcher = factory().expect("mint hook builder").build_arc();
-    let installed = dispatcher
-        .active_bindings_snapshot(HookPointSpec::BeforeCapability)
-        .len();
+    // Count only extension-contributed bindings: the first-party guard is
+    // always present and must not count toward the per-extension consider-cap.
+    let installed = before_capability_extension_binding_count(&dispatcher);
     assert!(
         installed <= MAX_INSTALLED_EXTENSIONS_CONSIDERED,
         "no more than the consider-cap of extensions may install (saw {installed})"

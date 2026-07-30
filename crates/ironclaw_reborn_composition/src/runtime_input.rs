@@ -492,7 +492,7 @@ impl RebornRuntimeInput {
             default_project_id: None,
             regex_skill_activation_enabled: true,
             skill_context_source: None,
-            hooks: HooksActivationConfig::default(),
+            hooks: HooksActivationConfig::from_env(),
             budget_defaults: None,
             budget_event_observer: None,
             trajectory_observer: None,

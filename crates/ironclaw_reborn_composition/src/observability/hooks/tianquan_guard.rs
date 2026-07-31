@@ -43,12 +43,15 @@
 //! off a context field. Instead:
 //!
 //! - `pending_spawn` clears itself on a **time window**: a spawn is considered
-//!   "pending" for `PENDING_SPAWN_WINDOW` (60 s) after the spawn is allowed.
-//!   A subagent that has not resumed within 60 s is presumed to have resumed
-//!   (or the loop has moved on), so `result_read` is no longer denied. This is
-//!   the simplified scheme called out in the task: a precise "spawn resumed"
-//!   signal would require an `after_capability` hook or a loop-host callback,
-//!   which is out of scope here (see TODO below).
+//!   "pending" for `PENDING_SPAWN_WINDOW` (300 s) after the spawn is allowed.
+//!   The window is sized to cover worst-case subagent generation: minimax
+//!   needs ~115 s for a 3000-char chapter (measured 2026-07-29), the request
+//!   timeout is 180 s and the runner lease is 200 s, so a slow-but-healthy
+//!   child completes within ~200 s; 300 s adds margin without making a hung
+//!   child block recovery re-spawn forever. The previous 60 s window expired
+//!   mid-generation and re-allowed `result_read` polling (handover 2026-07-31
+//!   下轮首做①). A precise "spawn resumed" signal would require a loop-host
+//!   callback (see TODO below); the window remains a conservative stop-gap.
 //! - `spawn_count` / `shell_count` are cumulative for the lifetime of the
 //!   guard instance. A guard instance is installed into a single
 //!   [`HookDispatcher`], and the composition root mints a fresh dispatcher
@@ -57,12 +60,15 @@
 //!   dispatcher and thus a fresh guard. Cross-run leaks cannot occur.
 //!
 //! TODO(turn-precise reset): wire a precise "spawn resumed" / turn-boundary
-//! signal (e.g. an `AfterCapability` observer hook that clears
-//! `pending_spawn` when the spawn capability returns, or threading the loop
-//! run_id through the context once that field lands). The time-window scheme
-//! is a conservative stop-gap: it may under-deny if a subagent takes longer
-//! than 60 s to resume (result_read would be allowed mid-wait), but it never
-//! over-denies legitimate post-resume result_read.
+//! signal (e.g. threading the loop run_id / child-terminal event through the
+//! context once those fields land). Note an `AfterCapability` observer cannot
+//! serve as the signal: `ObserverHookContext` carries no capability name, and
+//! `spawn_subagent` returns a `spawned` handle immediately (the blocking is at
+//! the loop-resume level), so its completion event fires long before the child
+//! finishes. The time-window scheme is a conservative stop-gap: it may
+//! over-deny a legitimate post-resume `result_read` / re-spawn issued within
+//! the window, but in the Tianquan flow the parent must wait for the blocking
+//! resume and has no legitimate mid-window use of either.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -82,9 +88,11 @@ pub(crate) const TIANQUAN_GUARD_CANONICAL_PATH: &str =
     "ironclaw_reborn_composition::hooks::tianquan_guard::TianquanBuiltinGuard";
 
 /// Window after an allowed spawn during which `result_read` is denied as a
-/// "polling while spawn is blocking" anti-pattern. See the module docs for the
-/// rationale and the TODO for a precise reset.
-pub(crate) const PENDING_SPAWN_WINDOW: Duration = Duration::from_secs(60);
+/// "polling while spawn is blocking" anti-pattern. Sized at 300 s to cover
+/// worst-case subagent prose generation (~200 s request-timeout/lease bound
+/// plus margin); the previous 60 s window expired mid-generation and let the
+/// polling anti-pattern resume. See the module docs for the full rationale.
+pub(crate) const PENDING_SPAWN_WINDOW: Duration = Duration::from_secs(300);
 
 /// Per-guard cap on `builtin.shell` invocations. The 4th call (and later) in a
 /// guard lifetime is denied. Tuned to let an LLM do a small amount of shell
@@ -119,8 +127,10 @@ struct TianquanGuardState {
     /// `pending_spawn` after [`PENDING_SPAWN_WINDOW`].
     last_spawn_at: Option<Instant>,
     /// Cumulative count of `builtin.spawn_subagent` evaluations seen by this
-    /// guard (both allowed and denied). A denied duplicate still increments so
-    /// the guard stays in "already spawned" mode.
+    /// guard (both allowed and denied). Retained for observability/tests; the
+    /// duplicate-spawn deny keys on `pending_spawn` (window-active), not on
+    /// this counter, so a legitimate re-spawn after the previous child's
+    /// window expired is allowed.
     spawn_count: u32,
     /// Cumulative count of `builtin.shell` evaluations seen by this guard.
     /// Denied over-limit calls still increment so a storm of shell calls keeps
@@ -209,14 +219,18 @@ impl PrivilegedBeforeCapabilityHook for TianquanBuiltinGuard {
         match ctx.capability_name.as_str() {
             CAPABILITY_SPAWN_SUBAGENT => {
                 state.spawn_count = state.spawn_count.saturating_add(1);
-                if state.spawn_count > 1 {
-                    // Already spawned this run and it has not expired: a
-                    // second spawn is a duplicate-spawn anti-pattern.
+                if state.pending_spawn {
+                    // A previous spawn's blocking window is still active: a
+                    // second spawn now is the duplicate-spawn anti-pattern.
+                    // Once the window expires (child presumed resumed or hung
+                    // past recovery), a fresh spawn is allowed again — this
+                    // permits legitimate re-spawn (e.g. validator blocked the
+                    // first child's prose, or the child hung).
                     drop(state);
                     sink.deny(REASON_DUPLICATE_SPAWN);
                     return;
                 }
-                // First spawn: record the window start and allow.
+                // No spawn pending: record the window start and allow.
                 state.pending_spawn = true;
                 state.last_spawn_at = Some(now);
                 drop(state);
@@ -422,6 +436,57 @@ mod tests {
         // Second spawn within the window: denied as a duplicate.
         let second = evaluate(&guard, &ctx_for(CAPABILITY_SPAWN_SUBAGENT));
         assert_denied(second);
+    }
+
+    #[test]
+    fn respawn_allowed_after_window_expiry() {
+        // The duplicate-spawn deny keys on the pending window, not a
+        // cumulative count: once the window has elapsed (child presumed
+        // resumed, or hung past recovery), a fresh spawn must be allowed so
+        // legitimate re-spawn (validator blocked the first child's prose, or
+        // the child hung) is not permanently blocked.
+        //
+        // `Instant` cannot be advanced, so we expire the window the same way
+        // `expire_pending_spawn` would once `now - last_spawn_at >= window`,
+        // then assert the public behavior (spawn passes again).
+        let guard = TianquanBuiltinGuard::new();
+        evaluate(&guard, &ctx_for(CAPABILITY_SPAWN_SUBAGENT));
+        let denied = evaluate(&guard, &ctx_for(CAPABILITY_SPAWN_SUBAGENT));
+        assert_denied(denied);
+
+        {
+            let mut state = guard
+                .state
+                .lock()
+                .expect("Tianquan guard state mutex poisoned");
+            state.pending_spawn = false;
+            state.last_spawn_at = None;
+        }
+
+        let respawn = evaluate(&guard, &ctx_for(CAPABILITY_SPAWN_SUBAGENT));
+        assert_passed(respawn);
+        assert!(
+            guard.pending_spawn(),
+            "re-spawn must re-arm the pending window"
+        );
+    }
+
+    #[test]
+    fn pending_spawn_window_covers_subagent_generation() {
+        // Pin the window sizing contract (handover 2026-07-31): minimax needs
+        // ~115 s for a 3000-char chapter, the request timeout is 180 s and the
+        // runner lease is 200 s, so the window must exceed the ~200 s
+        // slow-but-healthy bound or result_read polling is re-allowed
+        // mid-generation. It must also stay bounded so a hung child does not
+        // block recovery re-spawn forever.
+        assert!(
+            PENDING_SPAWN_WINDOW >= Duration::from_secs(200),
+            "window must cover worst-case subagent generation; saw {PENDING_SPAWN_WINDOW:?}"
+        );
+        assert!(
+            PENDING_SPAWN_WINDOW <= Duration::from_secs(600),
+            "window must stay bounded so a hung child can be re-spawned; saw {PENDING_SPAWN_WINDOW:?}"
+        );
     }
 
     #[test]

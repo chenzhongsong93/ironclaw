@@ -36,39 +36,43 @@
 //! therefore uses coarse, argument-free rules keyed on `capability_name` plus
 //! cross-call state, not on argument content.
 //!
-//! # State lifetime & turn reset
+//! # State lifetime & segment reset (verified 2026-07-31)
 //!
 //! The context does not carry a `run_id` / `turn_id` (verified against
-//! `ironclaw_hooks::points::capability`), so turn-boundary reset cannot key
-//! off a context field. Instead:
+//! `ironclaw_hooks::points::capability`), but the guard's effective state
+//! lifetime is **one continuous execution segment of a run**, not the whole
+//! run: `RebornTurnRunExecutor` calls `HostFactory::create_host(claimed)` each
+//! time the scheduler (re-)claims a run, and each host build mints a fresh
+//! dispatcher (see `factory::build_hook_dispatcher_builder_factory_with`), so
+//! each segment gets a fresh guard. When a blocking spawn parks the run and
+//! the child's terminal event settles it, the resume re-claims the run and
+//! builds a new host — **`pending_spawn` clears implicitly at the resume
+//! boundary**. This is the precise "spawn completed" reset the original design
+//! wanted as a TODO: it already exists structurally. Live verification
+//! (verify_l3 2026-07-31, thread d36377fa): post-resume `result_read` calls
+//! 78 s after spawn (child completed) were correctly allowed — no over-deny of
+//! legitimate result reads — while pre-resume polls within a segment are
+//! denied for the full `PENDING_SPAWN_WINDOW`.
 //!
-//! - `pending_spawn` clears itself on a **time window**: a spawn is considered
-//!   "pending" for `PENDING_SPAWN_WINDOW` (300 s) after the spawn is allowed.
-//!   The window is sized to cover worst-case subagent generation: minimax
+//! - `pending_spawn` also clears itself on a **time window** as a segment-
+//!   internal backstop: a spawn is considered "pending" for
+//!   `PENDING_SPAWN_WINDOW` (300 s) after the spawn is allowed. The window is
+//!   sized to cover worst-case subagent generation within one segment: minimax
 //!   needs ~115 s for a 3000-char chapter (measured 2026-07-29), the request
-//!   timeout is 180 s and the runner lease is 200 s, so a slow-but-healthy
-//!   child completes within ~200 s; 300 s adds margin without making a hung
-//!   child block recovery re-spawn forever. The previous 60 s window expired
-//!   mid-generation and re-allowed `result_read` polling (handover 2026-07-31
-//!   下轮首做①). A precise "spawn resumed" signal would require a loop-host
-//!   callback (see TODO below); the window remains a conservative stop-gap.
+//!   timeout is 180 s and the runner lease is 200 s (a segment cannot outlive
+//!   its lease by much), so 300 s ≈ the rest of the segment for any spawn that
+//!   has time to run at all. The previous 60 s window expired mid-generation
+//!   and re-allowed `result_read` polling (handover 2026-07-31 下轮首做①).
 //! - `spawn_count` / `shell_count` are cumulative for the lifetime of the
-//!   guard instance. A guard instance is installed into a single
-//!   [`HookDispatcher`], and the composition root mints a fresh dispatcher
-//!   per run (see `factory::build_hook_dispatcher_builder_factory_with`), so
-//!   the counters are effectively per-turn / per-run: a new run gets a new
-//!   dispatcher and thus a fresh guard. Cross-run leaks cannot occur.
+//!   guard instance (one segment). Cross-segment leaks cannot occur; per-turn
+//!   accumulation across resume boundaries is intentionally NOT enforced
+//!   (post-resume re-spawn and result_read are legitimate).
 //!
-//! TODO(turn-precise reset): wire a precise "spawn resumed" / turn-boundary
-//! signal (e.g. threading the loop run_id / child-terminal event through the
-//! context once those fields land). Note an `AfterCapability` observer cannot
-//! serve as the signal: `ObserverHookContext` carries no capability name, and
-//! `spawn_subagent` returns a `spawned` handle immediately (the blocking is at
-//! the loop-resume level), so its completion event fires long before the child
-//! finishes. The time-window scheme is a conservative stop-gap: it may
-//! over-deny a legitimate post-resume `result_read` / re-spawn issued within
-//! the window, but in the Tianquan flow the parent must wait for the blocking
-//! resume and has no legitimate mid-window use of either.
+//! Note: an `AfterCapability` observer cannot serve as the completion signal:
+//! `ObserverHookContext` carries no capability name, and `spawn_subagent`
+//! returns a `spawned` handle immediately (the blocking is at the loop-resume
+//! level), so its completion event fires long before the child finishes. The
+//! segment-boundary reset + time window is the correct mechanism.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

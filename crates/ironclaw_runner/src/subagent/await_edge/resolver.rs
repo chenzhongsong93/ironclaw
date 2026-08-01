@@ -631,6 +631,7 @@ where
             event.run_id,
             terminal_kind,
             &event,
+            child_record.received_at,
         )
         .await
     }
@@ -642,6 +643,7 @@ where
         child_run_id: TurnRunId,
         terminal_kind: EdgeTerminalKind,
         event: &TurnLifecycleEvent,
+        spawned_at: ironclaw_turns::TurnTimestamp,
     ) -> Result<ResolveOutcome, TurnError> {
         let Some(edge) = self
             .store
@@ -702,6 +704,27 @@ where
                 )
                 .await
                 .map_err(store_error)?;
+            // TianQuan spawn provenance v2 hardgate (cross-repo debt
+            // `spawn-provenance-hardgate`): best-effort upsert of the child's
+            // terminal state + sha256(final_text) into the shared PG
+            // `spawn_records` table so the TianQuan api validator can verify
+            // `provenance.sessionId` authenticity. No-op unless env
+            // TIANQUAN_SPAWN_PG_URL is set; errors are logged inside, the
+            // settle path is never affected.
+            let provenance =
+                crate::subagent::spawn_provenance::SpawnProvenanceRecord::from_terminal(
+                    &child_run_id,
+                    child_scope,
+                    &edge.subagent_kind,
+                    terminal_kind,
+                    output.final_text.as_deref(),
+                    spawned_at,
+                );
+            crate::subagent::spawn_provenance::record_spawn_terminal(
+                std::env::var("TIANQUAN_SPAWN_PG_URL").ok().as_deref(),
+                &provenance,
+            )
+            .await;
         }
 
         self.drain_settled_group(child_scope, parent_run_id, child_run_id)

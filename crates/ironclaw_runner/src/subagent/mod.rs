@@ -6,5 +6,6 @@ pub mod directions;
 pub mod flavors;
 pub mod goal_store;
 pub mod prompt_material;
+pub(crate) mod spawn_provenance;
 pub mod spawn_result;
 pub(crate) mod untrusted_text;

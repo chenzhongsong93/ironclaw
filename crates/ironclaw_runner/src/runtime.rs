@@ -1,8 +1,8 @@
 //! Default Reborn runtime-loop composition.
 
-use std::{error::Error, fmt, sync::Arc};
 use std::collections::HashMap;
 use std::sync::{Mutex, atomic::AtomicU32};
+use std::{error::Error, fmt, sync::Arc};
 
 use ironclaw_events::SecurityAuditSink;
 use ironclaw_host_api::CapabilityId;

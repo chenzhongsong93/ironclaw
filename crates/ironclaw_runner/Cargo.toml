@@ -68,8 +68,13 @@ parking_lot = "0.12"
 secrecy = { version = "0.10", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# TianQuan spawn provenance v2 hardgate (subagent/spawn_provenance.rs):
+# sha256(final_text) + best-effort upsert into the shared PG spawn_records
+# table, opt-in via TIANQUAN_SPAWN_PG_URL (unset upstream = zero-cost no-op).
+sha2 = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 

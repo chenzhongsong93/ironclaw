@@ -74,6 +74,7 @@
 //! level), so its completion event fires long before the child finishes. The
 //! segment-boundary reset + time window is the correct mechanism.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -103,6 +104,17 @@ pub(crate) const PENDING_SPAWN_WINDOW: Duration = Duration::from_secs(300);
 /// work (e.g. one quick check) while preventing shell-as-MCP-bypass.
 pub(crate) const SHELL_LIMIT: u32 = 3;
 
+/// Per-guard cap on **consecutive** invocations of the same capability (any
+/// capability, including MCP tools such as `tianquan-graph.run_skill_verify`).
+/// The Nth consecutive call (and later) is denied. Tuned to let an LLM do a
+/// legitimate bounded retry (e.g. 2-3 verify passes) while cutting the
+/// "same-tool infinite loop" anti-pattern that burns the context budget before
+/// L8 (measured 2026-08-03: 30+ consecutive `run_skill_verify` calls in one
+/// round). The counter resets as soon as a *different* capability is invoked,
+/// so normal interleaved flows (verify -> check stage -> advance) are never
+/// affected.
+pub(crate) const REPEAT_CALL_LIMIT: u32 = 6;
+
 /// Capability names this guard keys on. These are the ironclaw builtin
 /// capability names; the guard is inert for any other capability (it `pass`es,
 /// contributing nothing to the composed decision).
@@ -117,6 +129,8 @@ const REASON_RESULT_READ_DURING_PENDING_SPAWN: &str =
     "spawn 是 blocking,等 resume 不要 result_read 轮询";
 const REASON_DUPLICATE_SPAWN: &str = "已 spawn,等 resume 不要重复 spawn";
 const REASON_SHELL_RATE_LIMITED: &str = "builtin.shell 调用过多,用 MCP 工具而非 shell";
+const REASON_REPEAT_CALL: &str =
+    "同工具连续调用过多,勿空转重试:conforms 稳定则 advance_stage(to=approve) 进 committer,或 L7 完成切 loop:prose spawn_subagent 进 L8;真问题请报告而非重复调用";
 
 /// Cross-call state for [`TianquanBuiltinGuard`]. Held behind an
 /// `Arc<Mutex<...>>` so the guard (which is `Send + Sync + 'static`) can share
@@ -140,6 +154,17 @@ struct TianquanGuardState {
     /// Denied over-limit calls still increment so a storm of shell calls keeps
     /// the guard in "rate-limited" mode rather than flickering.
     shell_count: u32,
+    /// Consecutive-call counters keyed by `capability_name`. Only *consecutive*
+    /// calls of the same capability accumulate (the counter resets to 1 when a
+    /// different capability is invoked). This implements the
+    /// [`REPEAT_CALL_LIMIT`] deny for any capability — including MCP tools
+    /// such as `tianquan-graph.run_skill_verify` (hook covers all capability
+    /// kinds via `HookedLoopCapabilityPort`). Special-cased capabilities
+    /// (spawn/result_read/shell) do not touch these counters.
+    repeat_calls: HashMap<String, u32>,
+    /// The last capability name evaluated, used to detect *consecutive* vs
+    /// *interleaved* calls. `None` before the first evaluation.
+    last_capability: Option<String>,
 }
 
 impl TianquanGuardState {
@@ -149,6 +174,8 @@ impl TianquanGuardState {
             last_spawn_at: None,
             spawn_count: 0,
             shell_count: 0,
+            repeat_calls: HashMap::new(),
+            last_capability: None,
         }
     }
 
@@ -261,9 +288,37 @@ impl PrivilegedBeforeCapabilityHook for TianquanBuiltinGuard {
                 drop(state);
                 sink.pass();
             }
-            // Any other capability: the guard has no opinion. `pass` lets the
-            // composed decision proceed under the other hooks' authority.
+            // Any other capability (including all MCP tools, e.g.
+            // `tianquan-graph.run_skill_verify`): enforce the consecutive-call
+            // limit. The counter only accumulates while the *same* capability
+            // is invoked back-to-back; an interleaved call of any other
+            // capability resets it to 1, so normal multi-step flows
+            // (verify -> get_layer_stage -> advance_stage) never trip this.
             _ => {
+                let cap_name = ctx.capability_name.clone();
+                let count = if state.last_capability.as_deref() == Some(cap_name.as_str()) {
+                    state
+                        .repeat_calls
+                        .get(&cap_name)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(1)
+                } else {
+                    1
+                };
+                state
+                    .repeat_calls
+                    .insert(cap_name.clone(), count);
+                state.last_capability = Some(cap_name.clone());
+                if count >= REPEAT_CALL_LIMIT {
+                    let detail = format!(
+                        "{cap_name} 已连续调用 {count} 次未推进(上限 {REPEAT_CALL_LIMIT} 次)"
+                    );
+                    drop(state);
+                    sink.record_audit_reason(detail);
+                    sink.deny(REASON_REPEAT_CALL);
+                    return;
+                }
                 drop(state);
                 sink.pass();
             }
@@ -561,10 +616,62 @@ mod tests {
 
     #[test]
     fn other_capability_passes() {
-        // A capability the guard does not key on must pass (no opinion),
-        // proving the guard is inert for the rest of the capability surface.
+        // A single call of a capability the guard does not otherwise key on
+        // passes (count 1 < REPEAT_CALL_LIMIT) — the guard is inert for the
+        // rest of the capability surface until the same tool is hammered
+        // consecutively.
         let guard = TianquanBuiltinGuard::new();
         let outcome = evaluate(&guard, &ctx_for("builtin.some_other_tool"));
+        assert_passed(outcome);
+    }
+
+    #[test]
+    fn repeat_call_denied_after_limit() {
+        // The L7 VERIFY infinite-loop anti-pattern (measured 2026-08-03: 30+
+        // consecutive `run_skill_verify` calls in one round burning the context
+        // budget before L8). REPEAT_CALL_LIMIT - 1 consecutive calls pass; the
+        // LIMIT-th consecutive call is denied.
+        let guard = TianquanBuiltinGuard::new();
+        for i in 0..REPEAT_CALL_LIMIT - 1 {
+            let outcome = evaluate(&guard, &ctx_for("tianquan-graph.run_skill_verify"));
+            assert_eq!(
+                outcome,
+                CapturedOutcome::Passed,
+                "consecutive call {} (0-indexed) should pass",
+                i
+            );
+        }
+        let over = evaluate(&guard, &ctx_for("tianquan-graph.run_skill_verify"));
+        assert_denied(over);
+    }
+
+    #[test]
+    fn repeat_call_resets_on_interleaved_capability() {
+        // Interleaving any *different* capability resets the consecutive
+        // counter: verify -> get_layer_stage -> verify... is a normal flow and
+        // must never be denied even after many total verify calls.
+        let guard = TianquanBuiltinGuard::new();
+        for i in 0..REPEAT_CALL_LIMIT + 2 {
+            let outcome = evaluate(&guard, &ctx_for("tianquan-graph.run_skill_verify"));
+            assert_passed(outcome);
+            let interleave = evaluate(&guard, &ctx_for("tianquan-graph.get_layer_stage"));
+            assert_passed(interleave);
+        }
+    }
+
+    #[test]
+    fn repeat_call_exempts_special_capabilities() {
+        // spawn / result_read / shell do not feed the consecutive-call counter
+        // (they are handled by their own dedicated rules). A storm of shell
+        // calls followed by a single other-tool call must not be treated as a
+        // 10-consecutive repeat of that other tool.
+        let guard = TianquanBuiltinGuard::new();
+        for _ in 0..SHELL_LIMIT {
+            assert_passed(evaluate(&guard, &ctx_for(CAPABILITY_SHELL)));
+        }
+        assert_denied(evaluate(&guard, &ctx_for(CAPABILITY_SHELL)));
+        // A fresh tool after the shell storm starts its counter at 1.
+        let outcome = evaluate(&guard, &ctx_for("tianquan-graph.get_layer_stage"));
         assert_passed(outcome);
     }
 

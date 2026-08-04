@@ -24,9 +24,26 @@ pub(crate) fn shape_tool_schema(
     schema: &JsonValue,
     description: &mut String,
 ) -> JsonValue {
+    let mut schema = schema.clone();
+    // 2026-08-04:先剥 JSON-Schema 元/引用关键字——DeepSeek 等严格校验器把相对
+    // `$id`(如 "schemas/tianquan-graph/advance_stage.input.v1.json")当 URI 解析,
+    // 报 "relative URL without a base" 拒整请求;$ref/definitions/$defs 也按外部
+    // 引用处理。LLM 只消费 properties/enum/required/description,这些元数据全无
+    // 用且有害 → 全部剥掉(对 minimax 等宽松端零行为影响)。
+    strip_provider_rejected_keywords(&mut schema);
     match policy {
-        ToolSchemaPolicy::StrictOpenAi => normalize_schema_strict(schema, description),
-        ToolSchemaPolicy::FlattenOnly => normalize_schema_flatten_only(schema, description),
+        ToolSchemaPolicy::StrictOpenAi => normalize_schema_strict(&schema, description),
+        ToolSchemaPolicy::FlattenOnly => normalize_schema_flatten_only(&schema, description),
+    }
+}
+
+/// JSON-Schema 关键字,严格 LLM provider(DeepSeek)会拒/误解析 → 发送前剥掉。
+fn strip_provider_rejected_keywords(schema: &mut JsonValue) {
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+    for key in ["$id", "$schema", "$ref", "$defs", "definitions"] {
+        obj.remove(key);
     }
 }
 
@@ -516,6 +533,56 @@ mod tests {
             serde_json::json!(["names", "summary", "schema"])
         );
         assert!(description.contains("Upstream JSON schema"));
+    }
+
+    // 2026-08-04:strict provider(DeepSeek)把相对 `$id` 当 URI 解析拒整请求,
+    // $ref/definitions/$defs 按外部引用处理 → shape_tool_schema 入口全剥。
+    #[test]
+    fn test_shape_strict_strips_meta_and_ref_keywords() {
+        let input = serde_json::json!({
+            "$id": "schemas/tianquan-graph/advance_stage.input.v1.json",
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {
+                "layer": { "type": "string", "enum": ["loop:pack", "loop:prose"] },
+                "to": { "type": "string", "enum": ["execute", "verify"] }
+            },
+            "required": ["layer", "to"]
+        });
+        let mut description = "advance_stage".to_string();
+        let result = shape_tool_schema(ToolSchemaPolicy::StrictOpenAi, &input, &mut description);
+        assert!(result.get("$id").is_none(), "$id 必须剥掉(相对 URI)");
+        assert!(result.get("$schema").is_none(), "$schema 必须剥掉");
+        assert_eq!(result["type"], "object");
+        assert_eq!(result["properties"]["layer"]["enum"][0], "loop:pack");
+    }
+
+    #[test]
+    fn test_shape_flatten_only_strips_ref_keywords() {
+        let input = serde_json::json!({
+            "$ref": "#/definitions/Stage",
+            "definitions": { "Stage": { "type": "string" } }
+        });
+        let mut description = "ref-only".to_string();
+        let result = shape_tool_schema(ToolSchemaPolicy::FlattenOnly, &input, &mut description);
+        assert!(result.get("$ref").is_none(), "$ref 必须剥掉");
+        assert!(result.get("definitions").is_none(), "definitions 必须剥掉");
+        assert!(result.get("type").is_some(), "flatten 后应保底有 type");
+    }
+
+    #[test]
+    fn test_shape_strict_strips_ref_in_original_defs_only() {
+        // 只带 $defs 的输入:剥掉后不残留引用关键字
+        let input = serde_json::json!({
+            "type": "object",
+            "$defs": { "TierRole": { "enum": ["a", "b"] } },
+            "properties": { "layer": { "$ref": "#/$defs/TierRole" } }
+        });
+        let mut description = "d".to_string();
+        let result = shape_tool_schema(ToolSchemaPolicy::StrictOpenAi, &input, &mut description);
+        assert!(result.get("$defs").is_none(), "$defs 必须剥掉");
+        let layer = result.get("properties").and_then(|p| p.get("layer"));
+        assert!(layer.and_then(|v| v.get("$ref")).is_none(), "属性内 $ref 不剥会误导");
     }
 
     #[test]

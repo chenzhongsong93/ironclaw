@@ -881,10 +881,25 @@ fn build_rig_request(
 /// handling of duplicate JSON keys (most Python/Go servers use last-key-wins,
 /// but this is not guaranteed by the JSON spec). The `effective_model_name()`
 /// trait method should be consulted to determine the model actually used.
-fn inject_model_override(rig_req: &mut RigRequest, model_override: Option<&str>) {
+///
+/// 2026-08-04:when `model_override` equals the provider's `active_model_name()`
+/// the injected key duplicates the request's top-level `model` (rig-core writes
+/// the construction-time model into the payload) and strict servers (DeepSeek
+/// `invalid_request_error: duplicate field 'model'`) reject the whole request.
+/// The same-value injection is a no-op semantically, so skip it entirely.
+fn inject_model_override(
+    rig_req: &mut RigRequest,
+    model_override: Option<&str>,
+    active_model_name: &str,
+) {
     let Some(model) = model_override else {
         return;
     };
+    if model == active_model_name {
+        // Same value rig already bakes into the payload — injecting it via
+        // flatten would create a duplicate `model` key (DeepSeek 400).
+        return;
+    }
     match rig_req.additional_params {
         Some(ref mut params) => {
             if let Some(obj) = params.as_object_mut() {
@@ -959,7 +974,7 @@ where
         )?;
 
         merge_additional_params(&mut rig_req, self.default_additional_params.as_ref());
-        inject_model_override(&mut rig_req, model_override.as_deref());
+        inject_model_override(&mut rig_req, model_override.as_deref(), &self.model_name);
 
         let response = self
             .model
@@ -1021,7 +1036,7 @@ where
         )?;
 
         merge_additional_params(&mut rig_req, self.default_additional_params.as_ref());
-        inject_model_override(&mut rig_req, model_override.as_deref());
+        inject_model_override(&mut rig_req, model_override.as_deref(), &self.model_name);
 
         let response = self
             .model
@@ -2960,7 +2975,7 @@ mod tests {
     #[test]
     fn test_inject_model_override_creates_params_when_none() {
         let mut req = make_rig_request(None);
-        inject_model_override(&mut req, Some("test-model"));
+        inject_model_override(&mut req, Some("test-model"), "active-model");
 
         let params = req
             .additional_params
@@ -2973,7 +2988,7 @@ mod tests {
         let mut req = make_rig_request(Some(serde_json::json!({
             "cache_control": { "type": "ephemeral" },
         })));
-        inject_model_override(&mut req, Some("override-model"));
+        inject_model_override(&mut req, Some("override-model"), "active-model");
 
         let params = req.additional_params.expect("should remain Some");
         let obj = params.as_object().expect("should be object");
@@ -2987,8 +3002,44 @@ mod tests {
     #[test]
     fn test_inject_model_override_noop_when_none() {
         let mut req = make_rig_request(None);
-        inject_model_override(&mut req, None);
+        inject_model_override(&mut req, None, "active-model");
         assert!(req.additional_params.is_none());
+    }
+
+    // 2026-08-04:inject_model_override 若把与 provider 构造时相同的 model 塞进
+    // additional_params,rig flatten 后与请求顶层 `model` 重复(duplicate field),
+    // deepseek API 严格反序列化直接 400。同值注入是纯冗余 → 跳过。
+    #[test]
+    fn test_inject_model_override_skips_when_same_as_active_model() {
+        let mut req = make_rig_request(None);
+        inject_model_override(&mut req, Some("deepseek-v4-flash"), "deepseek-v4-flash");
+        assert!(
+            req.additional_params.is_none(),
+            "override 与 active model 同值时必须跳过,否则 flatten 后与顶层 model 重复"
+        );
+    }
+
+    #[test]
+    fn test_inject_model_override_skips_same_value_preserves_other_params() {
+        let mut req = make_rig_request(Some(serde_json::json!({
+            "think": true,
+        })));
+        inject_model_override(&mut req, Some("deepseek-v4-flash"), "deepseek-v4-flash");
+        let params = req.additional_params.expect("should remain Some");
+        let obj = params.as_object().expect("should be object");
+        assert_eq!(obj.get("think"), Some(&serde_json::json!(true)));
+        assert!(
+            !obj.contains_key("model"),
+            "同值 model 不得注入(防 flatten duplicate)"
+        );
+    }
+
+    #[test]
+    fn test_inject_model_override_injects_when_different_from_active() {
+        let mut req = make_rig_request(None);
+        inject_model_override(&mut req, Some("deepseek-v4-flash"), "other-model");
+        let params = req.additional_params.expect("should be Some");
+        assert_eq!(params, serde_json::json!({ "model": "deepseek-v4-flash" }));
     }
 
     // ── map_rig_error: context length detection ─────────────────────────

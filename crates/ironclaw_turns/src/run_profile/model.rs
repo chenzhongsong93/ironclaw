@@ -30,7 +30,10 @@ use super::model_work::{ModelWorkOutcome, ModelWorkRequest};
 /// runtime on 2026-06-24. The invariant is enforced by
 /// `primary_model_call_idle_timeout_is_below_runner_lease` below.
 ///
-const PRIMARY_MODEL_CALL_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
+/// 2026-08-03:75s→150s(minimax 首 token 偶发抖动 > 75s 无 delta 被砍断 → RecoveryStrategy
+/// 重试 → 退避累积撞 lease 200s → 子 agent Failed 空产出,S5 阶段偶发 byte_len=326)。
+/// 150s 给首 token 更多余量,健康流(每 delta 间隙远 < 150s)不受影响,lease 200s 仍兜底卡死请求。
+const PRIMARY_MODEL_CALL_IDLE_TIMEOUT: Duration = Duration::from_secs(150);
 const FALLBACK_TEXT_DELTA_MILESTONE_STEP: usize = 15;
 
 /// Outcome passed to [`LoopModelBudgetAccountant::post_model_call`] so the

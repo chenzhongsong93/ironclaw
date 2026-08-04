@@ -723,6 +723,7 @@ where
             crate::subagent::spawn_provenance::record_spawn_terminal(
                 std::env::var("TIANQUAN_SPAWN_PG_URL").ok().as_deref(),
                 &provenance,
+                output.final_text.as_deref(),
             )
             .await;
         }

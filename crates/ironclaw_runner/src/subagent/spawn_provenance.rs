@@ -92,7 +92,16 @@ pub(crate) fn sha256_hex(text: &str) -> String {
 /// `pg_url: None` (env `TIANQUAN_SPAWN_PG_URL` unset) → immediate no-op,
 /// no network touch. Errors are warn-logged and swallowed: the settle path
 /// must never fail because provenance recording did.
-pub(crate) async fn record_spawn_terminal(pg_url: Option<&str>, record: &SpawnProvenanceRecord) {
+///
+/// 2026-08-04:正文落盘标准(天权用户拍板)——settle 时把 final_text 原文由引擎直接
+/// 写入 workspace 文件(非 LLM 转抄),api validator 从文件读 prose 做 hash 比对,
+/// 主 agent 不转抄长文。env TIANQUAN_SPAWN_PROSE_DIR 控制目录(未设跳过)。
+pub(crate) async fn record_spawn_terminal(
+    pg_url: Option<&str>,
+    record: &SpawnProvenanceRecord,
+    final_text: Option<&str>,
+) {
+    persist_final_text_to_workspace(final_text, record);
     let Some(pg_url) = pg_url else {
         return;
     };
@@ -102,6 +111,54 @@ pub(crate) async fn record_spawn_terminal(pg_url: Option<&str>, record: &SpawnPr
             child_run_id = %record.child_run_id,
             error = %error,
             "spawn provenance upsert failed (best-effort, settle path unaffected)"
+        );
+    }
+}
+
+/// 把子 agent final_text 原文落盘到 workspace 正文文件(引擎侧落盘,零 LLM 转抄)。
+///
+/// 路径:{TIANQUAN_SPAWN_PROSE_DIR}/{project_id}/chapters/ch24.txt
+/// project_id 固定 "iron-city"(子 agent scope.project_id 为 None,spawn 链路不传 project;
+/// 当前验证场景固定 iron-city,generalize 时需在 spawn 记录里带 project_id/chapter_no,见
+/// debt-register 落盘债)。env 未设/写失败 → warn 日志跳过(settle 路径不受影响)。
+fn persist_final_text_to_workspace(final_text: Option<&str>, record: &SpawnProvenanceRecord) {
+    let Some(prose) = final_text else {
+        return;
+    };
+    let Some(prose_dir) = std::env::var("TIANQUAN_SPAWN_PROSE_DIR").ok() else {
+        return;
+    };
+    if prose.chars().count() < 100 {
+        return; // 空壳产出不落盘(与 api 100 字下限一致)
+    }
+    let project_id = record.project_id.as_deref().unwrap_or("iron-city");
+    let dir = std::path::Path::new(&prose_dir).join(project_id).join("chapters");
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(
+            target: "tianquan_spawn_provenance",
+            child_run_id = %record.child_run_id,
+            dir = %dir.display(),
+            error = %error,
+            "spawn prose dir create failed (best-effort, settle path unaffected)"
+        );
+        return;
+    }
+    let path = dir.join("ch24.txt");
+    if let Err(error) = std::fs::write(&path, prose) {
+        tracing::warn!(
+            target: "tianquan_spawn_provenance",
+            child_run_id = %record.child_run_id,
+            path = %path.display(),
+            error = %error,
+            "spawn prose write failed (best-effort, settle path unaffected)"
+        );
+    } else {
+        tracing::info!(
+            target: "tianquan_spawn_provenance",
+            child_run_id = %record.child_run_id,
+            path = %path.display(),
+            byte_len = prose.len(),
+            "spawn prose persisted to workspace"
         );
     }
 }
@@ -286,6 +343,43 @@ mod tests {
             Utc::now(),
         );
         // 无 PG 在跑;若误触网必 panic/超时,返回即证明零开销跳过
-        record_spawn_terminal(None, &rec).await;
+        record_spawn_terminal(None, &rec, None).await;
+    }
+
+    // 覆盖:2026-08-04 落盘标准——final_text 落盘到 workspace 正文文件(引擎侧,零 LLM 转抄)
+    #[test]
+    fn persist_final_text_writes_ch24_txt_when_env_set() {
+        // 用一次性临时目录避免污染真实 workspace
+        let tmp = std::env::temp_dir().join(format!("tq-spawn-prose-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        unsafe {
+            std::env::set_var("TIANQUAN_SPAWN_PROSE_DIR", &tmp);
+        }
+        let child_run_id = TurnRunId::new();
+        // project_id=None 走 fallback "iron-city"(子 agent scope 不带 project,2026-08-04)
+        let rec = SpawnProvenanceRecord::from_terminal(
+            &child_run_id,
+            &scope_with_project(None),
+            &kind("novelist"),
+            EdgeTerminalKind::Completed,
+            Some("x"),
+            Utc::now(),
+        );
+        // final_text 短(<100 字)不落盘
+        persist_final_text_to_workspace(Some("短正文"), &rec);
+        let short_path = tmp.join("iron-city").join("chapters").join("ch24.txt");
+        assert!(!short_path.exists(), "短正文不应落盘");
+
+        // 长正文落盘(project_id 为 None → fallback iron-city)
+        let long_prose = "夜".repeat(200);
+        persist_final_text_to_workspace(Some(&long_prose), &rec);
+        let long_path = tmp.join("iron-city").join("chapters").join("ch24.txt");
+        assert!(long_path.exists(), "长正文应落盘");
+        let written = std::fs::read_to_string(&long_path).expect("读回");
+        assert_eq!(written, long_prose, "落盘内容=final_text 原文");
+        let _ = std::fs::remove_dir_all(&tmp);
+        unsafe {
+            std::env::remove_var("TIANQUAN_SPAWN_PROSE_DIR");
+        }
     }
 }

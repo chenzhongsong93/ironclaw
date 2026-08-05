@@ -23,11 +23,12 @@ use sha2::{Digest, Sha256};
 
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use crate::error::LlmError;
 use crate::provider::{
-    ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmProvider,
-    ReasoningDetail as IronReasoningDetail, ReasoningDetails as IronReasoningDetails,
+    ChatMessage, CompletionRequest, CompletionResponse, CompletionStreamSink, FinishReason,
+    LlmProvider, ReasoningDetail as IronReasoningDetail, ReasoningDetails as IronReasoningDetails,
     ToolCall as IronToolCall, ToolCompletionRequest, ToolCompletionResponse,
     ToolDefinition as IronToolDefinition, strip_unsupported_completion_params,
     strip_unsupported_tool_params,
@@ -54,6 +55,14 @@ pub struct RigAdapter<M: CompletionModel> {
     /// Default additional parameters merged into every request.
     /// Used by providers that need extra top-level fields (e.g., Ollama `think: true`).
     default_additional_params: Option<serde_json::Value>,
+    /// Discard provider-emitted reasoning artifacts instead of round-tripping
+    /// them. Set for DeepSeek thinking models (deepseek-v4-flash): TianQuan
+    /// never consumes `reasoning_content`, and echoing it across turns trips
+    /// the API's strict "must be passed back" validation when the round-trip
+    /// loses fidelity (compact/truncation). API probe (2026-08-05): plain-text
+    /// and tool-call multi-turn both accept dropped reasoning. See
+    /// `crates/ironclaw_llm` #3201 context and debt ironclaw-thinking-reasoning-integration.
+    discard_reasoning: bool,
     /// Optional model-discovery endpoint. When set, [`LlmProvider::list_models`]
     /// issues a `GET` instead of returning the empty default. rig-core's
     /// `CompletionModel` does not expose model discovery, so this is wired
@@ -251,8 +260,19 @@ impl<M: CompletionModel> RigAdapter<M> {
             cache_retention: CacheRetention::None,
             unsupported_params: HashSet::new(),
             default_additional_params: None,
+            discard_reasoning: false,
             models_endpoint: None,
         }
+    }
+
+    /// Drop provider-emitted reasoning artifacts on this adapter.
+    ///
+    /// Used by the DeepSeek factory for thinking models whose `reasoning_content`
+    /// TianQuan never consumes; echoing it across turns triggers the provider's
+    /// "must be passed back" validation when the round-trip loses fidelity.
+    pub(crate) fn with_discard_reasoning(mut self) -> Self {
+        self.discard_reasoning = true;
+        self
     }
 
     /// Enable model discovery for [`LlmProvider::list_models`].
@@ -338,9 +358,28 @@ fn round_f32_to_f64(val: f32) -> f64 {
 ///
 /// Returns `(preamble, chat_history)` where preamble is extracted from
 /// any System message and chat_history contains the rest.
-fn convert_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<RigMessage>) {
+fn convert_messages(
+    messages: &[ChatMessage],
+    preserve_tool_call_ids: bool,
+) -> (Option<String>, Vec<RigMessage>) {
     let mut preamble: Option<String> = None;
     let mut history = Vec::new();
+
+    // DeepSeek thinking mode requires tool-call ids echoed verbatim from the
+    // original response; rebuilding them (even deterministically) trips the
+    // provider's strict id/reasoning round-trip validation (observed as a
+    // misleading "reasoning_content must be passed back" HTTP 400). See
+    // rig_adapter field `discard_reasoning` / `preserve_tool_call_ids`.
+    let normalize_id = |raw: Option<&str>, seed: usize| -> String {
+        if preserve_tool_call_ids {
+            raw.map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| normalized_tool_call_id(raw, seed))
+        } else {
+            normalized_tool_call_id(raw, seed)
+        }
+    };
 
     for msg in messages {
         match msg.role {
@@ -415,8 +454,7 @@ fn convert_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<RigMessage
                         contents.push(reasoning);
                     }
                     for (idx, tc) in tool_calls.iter().enumerate() {
-                        let tool_call_id =
-                            normalized_tool_call_id(Some(tc.id.as_str()), history.len() + idx);
+                        let tool_call_id = normalize_id(Some(tc.id.as_str()), history.len() + idx);
                         let mut rig_tc = rig::message::ToolCall::new(
                             tool_call_id.clone(),
                             ToolFunction::new(tc.name.clone(), tc.arguments.clone()),
@@ -477,7 +515,7 @@ fn convert_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<RigMessage
                 // Merge consecutive tool results into a single User message
                 // so the API sees one multi-result message instead of
                 // multiple consecutive User messages (which Anthropic rejects).
-                let tool_id = normalized_tool_call_id(msg.tool_call_id.as_deref(), history.len());
+                let tool_id = normalize_id(msg.tool_call_id.as_deref(), history.len());
                 let tool_result = UserContent::ToolResult(RigToolResult {
                     id: tool_id.clone(),
                     call_id: Some(tool_id),
@@ -961,7 +999,7 @@ where
 
         let mut messages = request.messages;
         crate::provider::sanitize_tool_messages(&mut messages);
-        let (preamble, history) = convert_messages(&messages);
+        let (preamble, history) = convert_messages(&messages, self.discard_reasoning);
 
         let mut rig_req = build_rig_request(
             preamble,
@@ -1021,7 +1059,7 @@ where
 
         let mut messages = request.messages;
         crate::provider::sanitize_tool_messages(&mut messages);
-        let (preamble, history) = convert_messages(&messages);
+        let (preamble, history) = convert_messages(&messages, self.discard_reasoning);
         let tools = convert_tools(&request.tools);
         let tool_choice = convert_tool_choice(request.tool_choice.as_deref());
 
@@ -1044,8 +1082,17 @@ where
             .await
             .map_err(|e| map_rig_error(&self.model_name, e))?;
 
-        let (text, mut tool_calls, finish, reasoning, reasoning_details) =
+        let (text, mut tool_calls, finish, mut reasoning, mut reasoning_details) =
             extract_response(&response.choice, &response.usage);
+
+        if self.discard_reasoning {
+            // DeepSeek thinking models: TianQuan never consumes reasoning; see
+            // field docs. Dropping keeps the next request free of
+            // `reasoning_content` so the provider's strict round-trip
+            // validation never triggers.
+            reasoning = None;
+            reasoning_details = None;
+        }
 
         // Normalize tool call names: some proxies prepend "proxy_" prefixes.
         for tc in &mut tool_calls {
@@ -1093,6 +1140,19 @@ where
         }
 
         Ok(resp)
+    }
+
+    async fn complete_with_tools_streaming(
+        &self,
+        request: ToolCompletionRequest,
+        _sink: Arc<dyn CompletionStreamSink>,
+    ) -> Result<ToolCompletionResponse, LlmError> {
+        // Route streaming tool calls through the non-streaming path so the
+        // reasoning-discard logic applies uniformly (TianQuan deepseek-v4-flash).
+        // The final response remains authoritative for tool calls, finish
+        // reason, and usage accounting; this adapter emits no interim text
+        // deltas, so sink forwarding is a no-op.
+        self.complete_with_tools(request).await
     }
 
     fn active_model_name(&self) -> String {
@@ -2090,7 +2150,7 @@ mod tests {
             ChatMessage::system("You are a helpful assistant."),
             ChatMessage::user("Hello"),
         ];
-        let (preamble, history) = convert_messages(&messages);
+        let (preamble, history) = convert_messages(&messages, false);
         assert_eq!(preamble, Some("You are a helpful assistant.".to_string()));
         assert_eq!(history.len(), 1);
     }
@@ -2102,7 +2162,7 @@ mod tests {
             ChatMessage::system("System 2"),
             ChatMessage::user("Hi"),
         ];
-        let (preamble, history) = convert_messages(&messages);
+        let (preamble, history) = convert_messages(&messages, false);
         assert_eq!(preamble, Some("System 1\nSystem 2".to_string()));
         assert_eq!(history.len(), 1);
     }
@@ -2115,7 +2175,7 @@ mod tests {
             "search",
             "result text",
         )];
-        let (preamble, history) = convert_messages(&messages);
+        let (preamble, history) = convert_messages(&messages, false);
         assert!(preamble.is_none());
         assert_eq!(history.len(), 1);
         // Tool results become User messages in rig-core
@@ -2144,7 +2204,7 @@ mod tests {
         };
         let msg = ChatMessage::assistant_with_tool_calls(Some("thinking".to_string()), vec![tc]);
         let messages = vec![msg];
-        let (_preamble, history) = convert_messages(&messages);
+        let (_preamble, history) = convert_messages(&messages, false);
         assert_eq!(history.len(), 1);
         match &history[0] {
             RigMessage::Assistant { content, .. } => {
@@ -2161,6 +2221,46 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_messages_preserves_long_tool_call_ids_when_flagged() {
+        // DeepSeek thinking mode (deepseek-v4-flash) returns long provider
+        // tool-call ids (e.g. `call_00_VCVqSydK9l4pzKq93GEW5271`). The default
+        // path re-hashes them (9-char alpha-numeric), which breaks the provider's
+        // strict id round-trip → HTTP 400. With `preserve_tool_call_ids=true`
+        // the raw id must be echoed verbatim.
+        let long_id = "call_00_VCVqSydK9l4pzKq93GEW5271";
+        let tc = IronToolCall {
+            id: long_id.to_string(),
+            name: "get_weather".to_string(),
+            arguments: serde_json::json!({}),
+            reasoning: None,
+            signature: None,
+            arguments_parse_error: None,
+        };
+        let msg = ChatMessage::assistant_with_tool_calls(None, vec![tc.clone()]);
+        let messages = vec![msg];
+        // Default: id is re-hashed to a 9-char id.
+        let (_, default_history) = convert_messages(&messages, false);
+        // Preserve: raw id is echoed verbatim.
+        let (_, preserve_history) = convert_messages(&messages, true);
+        let extract = |history: &Vec<RigMessage>| {
+            history
+                .iter()
+                .filter_map(|m| match m {
+                    RigMessage::Assistant { content, .. } => content.iter().find_map(|c| match c {
+                        AssistantContent::ToolCall(tc) => tc.call_id.clone(),
+                        _ => None,
+                    }),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let default_ids = extract(&default_history);
+        let preserve_ids = extract(&preserve_history);
+        assert_eq!(preserve_ids, vec![long_id.to_string()]);
+        assert_ne!(default_ids, vec![long_id.to_string()]);
+    }
+
+    #[test]
     fn test_convert_messages_tool_result_without_id_gets_fallback() {
         let messages = vec![ChatMessage {
             role: crate::Role::Tool,
@@ -2172,7 +2272,7 @@ mod tests {
             reasoning: None,
             reasoning_details: None,
         }];
-        let (_preamble, history) = convert_messages(&messages);
+        let (_preamble, history) = convert_messages(&messages, false);
         match &history[0] {
             RigMessage::User { content } => match content.first() {
                 UserContent::ToolResult(r) => {
@@ -2204,7 +2304,7 @@ mod tests {
             }],
         )];
 
-        let (_preamble, history) = convert_messages(&messages);
+        let (_preamble, history) = convert_messages(&messages, false);
         match &history[0] {
             RigMessage::User { content } => {
                 let image = content
@@ -2241,8 +2341,8 @@ mod tests {
             }],
         )];
 
-        let (_, low_history) = convert_messages(&low_messages);
-        let (_, high_history) = convert_messages(&high_messages);
+        let (_, low_history) = convert_messages(&low_messages, false);
+        let (_, high_history) = convert_messages(&high_messages, false);
 
         for (history, expected) in [
             (&low_history, ImageDetail::Low),
@@ -2339,7 +2439,7 @@ mod tests {
             arguments_parse_error: None,
         };
         let messages = vec![ChatMessage::assistant_with_tool_calls(None, vec![tc])];
-        let (_preamble, history) = convert_messages(&messages);
+        let (_preamble, history) = convert_messages(&messages, false);
 
         match &history[0] {
             RigMessage::Assistant { content, .. } => {
@@ -2373,7 +2473,7 @@ mod tests {
             arguments_parse_error: None,
         };
         let messages = vec![ChatMessage::assistant_with_tool_calls(None, vec![tc])];
-        let (_preamble, history) = convert_messages(&messages);
+        let (_preamble, history) = convert_messages(&messages, false);
 
         match &history[0] {
             RigMessage::Assistant { content, .. } => {
@@ -2420,7 +2520,7 @@ mod tests {
             reasoning_details: None,
         };
         let messages = vec![assistant_msg, tool_result_msg];
-        let (_preamble, history) = convert_messages(&messages);
+        let (_preamble, history) = convert_messages(&messages, false);
 
         // Extract the generated call_id from the assistant tool call
         let assistant_call_id = match &history[0] {
@@ -2745,7 +2845,7 @@ mod tests {
         let result_b = ChatMessage::tool_result("call_b", "fetch", "fetch results");
 
         let messages = vec![assistant, result_a, result_b];
-        let (_preamble, history) = convert_messages(&messages);
+        let (_preamble, history) = convert_messages(&messages, false);
 
         // Should be: 1 assistant + 1 merged user (not 1 assistant + 2 users)
         assert_eq!(
@@ -2782,7 +2882,7 @@ mod tests {
         let tool_msg = ChatMessage::tool_result("call_1", "search", "results");
 
         let messages = vec![user_msg, tool_msg];
-        let (_preamble, history) = convert_messages(&messages);
+        let (_preamble, history) = convert_messages(&messages, false);
 
         // Should be 2 separate User messages (text user + tool result user)
         assert_eq!(history.len(), 2);
@@ -2795,7 +2895,7 @@ mod tests {
         let empty = ChatMessage::user("");
         let non_empty = ChatMessage::user("hello");
         let messages = vec![empty, non_empty];
-        let (_preamble, history) = convert_messages(&messages);
+        let (_preamble, history) = convert_messages(&messages, false);
 
         assert_eq!(history.len(), 1, "empty user message must be dropped");
         match &history[0] {
@@ -2826,7 +2926,7 @@ mod tests {
         };
         let non_empty = ChatMessage::user("hi");
         let messages = vec![empty_asst, non_empty];
-        let (_preamble, history) = convert_messages(&messages);
+        let (_preamble, history) = convert_messages(&messages, false);
 
         assert_eq!(history.len(), 1, "empty assistant message must be dropped");
         assert!(matches!(history[0], RigMessage::User { .. }));
@@ -2849,7 +2949,7 @@ mod tests {
         let user2 = ChatMessage::user("");
         let asst = ChatMessage::assistant("response");
         let messages = vec![user1, empty_asst, user2, asst];
-        let (_preamble, history) = convert_messages(&messages);
+        let (_preamble, history) = convert_messages(&messages, false);
 
         assert_eq!(history.len(), 2, "only non-empty messages should survive");
         assert!(matches!(history[0], RigMessage::User { .. }));
@@ -3242,7 +3342,7 @@ mod tests {
             assistant,
             tool_result,
         ];
-        let (_preamble, history) = convert_messages(&messages);
+        let (_preamble, history) = convert_messages(&messages, false);
 
         // The rebuilt rig assistant message must carry both reasoning and
         // signature; otherwise the dedicated DeepSeek/Gemini/OpenRouter rig
@@ -3327,11 +3427,14 @@ mod tests {
         let assistant = ChatMessage::assistant_with_tool_calls(text, tool_calls)
             .with_reasoning_details(reasoning_details);
 
-        let (_preamble, history) = convert_messages(&[
-            ChatMessage::user("continue"),
-            assistant,
-            ChatMessage::tool_result("call_abc123", "lookup", "{}"),
-        ]);
+        let (_preamble, history) = convert_messages(
+            &[
+                ChatMessage::user("continue"),
+                assistant,
+                ChatMessage::tool_result("call_abc123", "lookup", "{}"),
+            ],
+            false,
+        );
         let assistant_msg = history
             .iter()
             .find(|m| matches!(m, RigMessage::Assistant { .. }))
@@ -3372,7 +3475,7 @@ mod tests {
             "with_reasoning_details must preserve a signature-only Text block"
         );
 
-        let (_preamble, history) = convert_messages(&[ChatMessage::user("ping"), assistant]);
+        let (_preamble, history) = convert_messages(&[ChatMessage::user("ping"), assistant], false);
         let assistant_msg = history
             .iter()
             .find(|m| matches!(m, RigMessage::Assistant { .. }))

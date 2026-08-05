@@ -582,7 +582,10 @@ mod tests {
         let result = shape_tool_schema(ToolSchemaPolicy::StrictOpenAi, &input, &mut description);
         assert!(result.get("$defs").is_none(), "$defs 必须剥掉");
         let layer = result.get("properties").and_then(|p| p.get("layer"));
-        assert!(layer.and_then(|v| v.get("$ref")).is_none(), "属性内 $ref 不剥会误导");
+        assert!(
+            layer.and_then(|v| v.get("$ref")).is_none(),
+            "属性内 $ref 不剥会误导"
+        );
     }
 
     #[test]

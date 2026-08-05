@@ -660,12 +660,14 @@ fn create_deepseek_from_registry(
         provider = %config.provider_id,
         model = %config.model,
         base_url = if config.base_url.is_empty() { "default" } else { &config.base_url },
-        "Using DeepSeek provider (preserves reasoning_content across turns)"
+        "Using DeepSeek provider (discarding reasoning_content: TianQuan never consumes it, \
+         and echoing trips strict round-trip validation)"
     );
 
     Ok(Arc::new(
         RigAdapter::new(model, &config.model)
-            .with_unsupported_params(config.unsupported_params.clone()),
+            .with_unsupported_params(config.unsupported_params.clone())
+            .with_discard_reasoning(),
     ))
 }
 

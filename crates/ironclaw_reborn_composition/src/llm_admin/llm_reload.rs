@@ -6,7 +6,7 @@ use ironclaw_reborn_config::{RebornBootConfig, RebornConfigFile};
 use crate::LlmKeyStore;
 use crate::llm_admin::llm_catalog::{
     RebornLlmCatalogError, apply_stored_api_key, resolve_llm_selection_allow_missing_key,
-    resolve_reborn_runtime_llm,
+    resolve_reborn_mission_llm, resolve_reborn_runtime_llm,
 };
 use crate::llm_admin::llm_config_service::LlmReloadTrigger;
 use crate::runtime_input::ResolvedRebornLlm;
@@ -14,11 +14,16 @@ use crate::runtime_input::ResolvedRebornLlm;
 /// Live-reload adapter wired by the runtime. Re-resolves the LLM config from
 /// `config.toml` + `providers.json` + the stored key, then hot-swaps the
 /// running provider's inner backend via the `ironclaw_llm` reload handle.
+///
+/// In the dual-model setup (`[llm.mission]` configured) it additionally
+/// rebuilds and swaps the mission provider chain (TianQuan: novelist subagent →
+/// minimax) so both routes hot-reload without a restart.
 pub(crate) struct RebornLlmReloadAdapter {
     boot: RebornBootConfig,
     reload_handle: Arc<ironclaw_llm::LlmReloadHandle>,
     session: Arc<ironclaw_llm::SessionManager>,
     keys: LlmKeyStore,
+    mission_swappable: Option<Arc<ironclaw_llm::SwappableLlmProvider>>,
 }
 
 impl RebornLlmReloadAdapter {
@@ -27,12 +32,14 @@ impl RebornLlmReloadAdapter {
         reload_handle: Arc<ironclaw_llm::LlmReloadHandle>,
         session: Arc<ironclaw_llm::SessionManager>,
         keys: LlmKeyStore,
+        mission_swappable: Option<Arc<ironclaw_llm::SwappableLlmProvider>>,
     ) -> Self {
         Self {
             boot,
             reload_handle,
             session,
             keys,
+            mission_swappable,
         }
     }
 
@@ -119,6 +126,47 @@ impl LlmReloadTrigger for RebornLlmReloadAdapter {
             succeeded = result.is_ok(),
             "LLM reload applied to the live provider"
         );
-        result
+        result?;
+
+        // Dual-model: rebuild and swap the mission provider chain too.
+        // Failure to reload the mission route is non-fatal (default chain is
+        // already swapped); it is logged and the previous mission provider
+        // stays active until the next reload.
+        if let Some(mission_swappable) = self.mission_swappable.as_ref() {
+            if let Some(mission_resolved) =
+                resolve_reborn_mission_llm(&self.boot, config_file.as_ref())
+                    .map_err(|error| error.to_string())?
+            {
+                let mission_provider_id = mission_resolved.provider_id().to_string();
+                let mut mission_config = mission_resolved.config;
+                if let Some(stored) = self
+                    .keys
+                    .read(&mission_provider_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    apply_stored_api_key(&mut mission_config, stored);
+                }
+                match ironclaw_llm::build_provider_chain(&mission_config, Arc::clone(&self.session))
+                    .await
+                {
+                    Ok((mission_chain, _, _, _)) => {
+                        mission_swappable.swap(mission_chain);
+                        tracing::debug!(
+                            mission_provider_id = %mission_provider_id,
+                            "mission LLM provider reloaded"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            mission_provider_id = %mission_provider_id,
+                            "mission LLM reload failed; previous mission provider stays active"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }

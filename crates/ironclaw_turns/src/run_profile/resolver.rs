@@ -228,6 +228,17 @@ impl RunProfileDefinition {
         self
     }
 
+    /// Override the model profile this run profile binds to.
+    ///
+    /// Used to route a run family to a different `ModelSlot` (e.g. the
+    /// novelist subagent → `mission_model` → mission slot → a dedicated
+    /// cheaper provider), while inheriting everything else from
+    /// `interactive_like` / the planned scaffold.
+    pub fn with_model_profile_id(mut self, model_profile_id: ModelProfileId) -> Self {
+        self.model_profile_id = model_profile_id;
+        self
+    }
+
     fn resolve(&self, request: &RunProfileResolutionRequest) -> ResolvedRunProfile {
         let mut provenance = provenance_for(self, request);
         let resource_budget_policy = self.resolve_resource_budget_policy(request, &mut provenance);

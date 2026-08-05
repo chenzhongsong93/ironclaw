@@ -12,7 +12,7 @@ use ironclaw_turns::{
     RunProfileVersion,
     run_profile::{
         CapabilitySurfaceProfileId, CheckpointSchemaId, InMemoryRunProfileRegistry,
-        InMemoryRunProfileResolver, RunProfileDefinition, RunProfileRegistryError,
+        InMemoryRunProfileResolver, ModelProfileId, RunProfileDefinition, RunProfileRegistryError,
     },
 };
 
@@ -32,9 +32,18 @@ pub const PLANNED_DRIVER_CHECKPOINT_SCHEMA_VERSION: u64 = CHECKPOINT_SCHEMA_VERS
 pub const PLANNED_DEFAULT_PROFILE_ID: &str = "reborn-planned-default";
 pub const SUBAGENT_PLANNED_DRIVER_ID: &str = "reborn:planned-subagent";
 pub const SUBAGENT_PLANNED_PROFILE_ID: &str = "reborn-planned-subagent";
+/// Dedicated run profile for the novelist subagent, which routes to the
+/// `mission_model` profile (ModelSlot::Mission) so the novelist writer runs on
+/// a cheaper dedicated provider (TianQuan: minimax) while the orchestrating
+/// parent runs on the primary model (deepseek-v4-flash). See
+/// `tianquan_subagents` resolver and the model-route wiring in
+/// `ironclaw_reborn_composition::runtime`.
+pub const SUBAGENT_NOVELIST_PROFILE_ID: &str = "reborn-planned-novelist";
 /// Capability-surface profile id for the default interactive planned driver.
 const INTERACTIVE_CAPABILITY_SURFACE_PROFILE_ID: &str = "interactive_tools";
 pub const SUBAGENT_CAPABILITY_SURFACE_PROFILE_ID: &str = "subagent_tools";
+/// Model profile bound to the mission model slot (cheaper/secondary provider).
+pub const MISSION_MODEL_PROFILE_ID: &str = "mission_model";
 /// Capability-surface profile id for scheduled-trigger fires (issue #5505).
 /// Shared with `runtime.rs`, which keys its per-profile deny-map on this
 /// string to strip the trigger mutator capabilities from a fire's
@@ -94,6 +103,10 @@ pub fn planned_default_profile_id() -> Result<RunProfileId, String> {
 
 pub fn subagent_planned_profile_id() -> Result<RunProfileId, String> {
     RunProfileId::new(SUBAGENT_PLANNED_PROFILE_ID)
+}
+
+pub fn subagent_novelist_planned_profile_id() -> Result<RunProfileId, String> {
+    RunProfileId::new(SUBAGENT_NOVELIST_PROFILE_ID)
 }
 
 pub(crate) fn is_subagent_planned_profile(
@@ -272,6 +285,27 @@ pub fn subagent_planned_profile_definition() -> Result<RunProfileDefinition, Run
     )
 }
 
+/// Run profile for the novelist subagent — same planned subagent driver and
+/// capability surface as `reborn-planned-subagent`, but bound to the mission
+/// model profile so the writer run resolves to `ModelSlot::Mission` and uses
+/// the dedicated cheaper provider (TianQuan: minimax) while the parent
+/// orchestrator stays on the primary model.
+pub fn subagent_novelist_planned_profile_definition()
+-> Result<RunProfileDefinition, RunProfileRegistryError> {
+    let descriptor = subagent_planned_driver_descriptor()
+        .map_err(|reason| RunProfileRegistryError::InvalidProfile { reason })?;
+    let profile_id = subagent_novelist_planned_profile_id()
+        .map_err(|reason| RunProfileRegistryError::InvalidProfile { reason })?;
+    let model_profile_id = ModelProfileId::new(MISSION_MODEL_PROFILE_ID)
+        .map_err(|reason| RunProfileRegistryError::InvalidProfile { reason })?;
+    let definition = planned_like_profile_definition(
+        profile_id,
+        descriptor,
+        SUBAGENT_CAPABILITY_SURFACE_PROFILE_ID,
+    )?;
+    Ok(definition.with_model_profile_id(model_profile_id))
+}
+
 /// Dedicated run profile for scheduled-trigger fires (issue #5505). Reuses
 /// the default planned driver/family unchanged — only the capability
 /// surface differs — so `runtime.rs`'s host deny-map can strip the trigger
@@ -299,6 +333,12 @@ pub fn register_subagent_planned_profile(
     registry.register(subagent_planned_profile_definition()?)
 }
 
+pub fn register_subagent_novelist_planned_profile(
+    registry: &mut InMemoryRunProfileRegistry,
+) -> Result<(), RunProfileRegistryError> {
+    registry.register(subagent_novelist_planned_profile_definition()?)
+}
+
 pub fn register_scheduled_trigger_planned_profile(
     registry: &mut InMemoryRunProfileRegistry,
 ) -> Result<(), RunProfileRegistryError> {
@@ -310,6 +350,7 @@ pub fn default_planned_run_profile_resolver()
     let mut registry = InMemoryRunProfileRegistry::with_builtin_profiles();
     register_default_planned_profile(&mut registry)?;
     register_subagent_planned_profile(&mut registry)?;
+    register_subagent_novelist_planned_profile(&mut registry)?;
     register_scheduled_trigger_planned_profile(&mut registry)?;
     let implicit_default = planned_default_profile_id()
         .map_err(|reason| RunProfileRegistryError::InvalidProfile { reason })?;
@@ -464,6 +505,34 @@ mod tests {
             .expect("profile should resolve");
 
         assert_eq!(snapshot.profile_id.as_str(), SUBAGENT_PLANNED_PROFILE_ID);
+        assert_eq!(snapshot.loop_driver.id.as_str(), SUBAGENT_PLANNED_DRIVER_ID);
+        assert_eq!(
+            snapshot.capability_surface_profile_id.as_str(),
+            SUBAGENT_CAPABILITY_SURFACE_PROFILE_ID
+        );
+    }
+
+    #[tokio::test]
+    async fn novelist_profile_resolves_to_mission_model_slot() {
+        // Dual-model: the novelist subagent's dedicated profile must bind the
+        // `mission_model` profile so the writer run routes to ModelSlot::Mission
+        // (the dedicated cheaper provider, e.g. minimax) while the parent
+        // orchestrator stays on the primary model.
+        let mut registry = InMemoryRunProfileRegistry::with_builtin_profiles();
+        register_subagent_novelist_planned_profile(&mut registry)
+            .expect("novelist profile should register");
+        let resolver = InMemoryRunProfileResolver::new(registry);
+        let snapshot = resolver
+            .resolve_run_profile(
+                RunProfileResolutionRequest::interactive_default().with_requested_run_profile(
+                    RunProfileRequest::new(SUBAGENT_NOVELIST_PROFILE_ID).unwrap(),
+                ),
+            )
+            .await
+            .expect("novelist profile should resolve");
+
+        assert_eq!(snapshot.profile_id.as_str(), SUBAGENT_NOVELIST_PROFILE_ID);
+        assert_eq!(snapshot.model_profile_id.as_str(), MISSION_MODEL_PROFILE_ID);
         assert_eq!(snapshot.loop_driver.id.as_str(), SUBAGENT_PLANNED_DRIVER_ID);
         assert_eq!(
             snapshot.capability_surface_profile_id.as_str(),

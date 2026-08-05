@@ -129,6 +129,27 @@ pub fn resolve_reborn_runtime_llm(
     resolve_llm_from_env(boot)
 }
 
+/// Resolve the optional `mission` LLM slot into a second [`LlmConfig`].
+///
+/// Used by the dual-model wiring (TianQuan: novelist subagent runs on the
+/// mission provider, e.g. minimax, while the orchestrator runs on the default
+/// provider). Returns `Ok(None)` when no `[llm.mission]` selection is present
+/// — the runtime then stays single-provider (default slot only).
+pub(crate) fn resolve_reborn_mission_llm(
+    boot: &RebornBootConfig,
+    config_file: Option<&RebornConfigFile>,
+) -> Result<Option<ResolvedRebornLlm>, RebornLlmCatalogError> {
+    let Some(selection) = config_file.and_then(|file| file.mission_llm_slot()) else {
+        return Ok(None);
+    };
+    resolve_llm_selection_against_catalog(
+        selection,
+        Some(boot.home().providers_file_path().as_path()),
+    )
+    .map(ResolvedRebornLlm::from_llm_config)
+    .map(Some)
+}
+
 fn resolve_llm_from_env(
     boot: &RebornBootConfig,
 ) -> Result<Option<ResolvedRebornLlm>, RebornLlmCatalogError> {

@@ -23,7 +23,9 @@ use ironclaw_loop_host::{
     SubagentPromptMaterial, SubagentPromptMaterialSource, SubagentThreadKind,
     SubagentThreadMetadata,
 };
-use ironclaw_runner::planned_driver_factory::SUBAGENT_PLANNED_PROFILE_ID;
+use ironclaw_runner::planned_driver_factory::{
+    SUBAGENT_NOVELIST_PROFILE_ID, SUBAGENT_PLANNED_PROFILE_ID,
+};
 use ironclaw_runner::subagent::goal_store::{SubagentGoalStore, SubagentGoalStoreError};
 use ironclaw_threads::{SessionThreadService, ThreadHistoryRequest, ThreadScope};
 use ironclaw_turns::{
@@ -63,9 +65,16 @@ impl SubagentDefinitionResolver for TianquanSubagentDefinitionResolver {
         let Some(flavor) = lookup_soul_flavor(kind_str) else {
             return Ok(None);
         };
-        let run_profile = RunProfileRequest::new(SUBAGENT_PLANNED_PROFILE_ID).map_err(|reason| {
-            AgentLoopHostError::new(AgentLoopHostErrorKind::Internal, reason)
-        })?;
+        // 双模型:novelist 写手子 agent 走 mission model profile(→ ModelSlot::Mission →
+        // 便宜的 minimax),其余 15 SOUL 走默认 subagent profile(→ 主模型 v4-flash)。
+        // 见 planned_driver_factory::subagent_novelist_planned_profile_definition。
+        let profile_id = if kind_str == "novelist" {
+            SUBAGENT_NOVELIST_PROFILE_ID
+        } else {
+            SUBAGENT_PLANNED_PROFILE_ID
+        };
+        let run_profile = RunProfileRequest::new(profile_id)
+            .map_err(|reason| AgentLoopHostError::new(AgentLoopHostErrorKind::Internal, reason))?;
         Ok(Some(SubagentDefinition {
             subagent_kind: kind.clone(),
             allow_nesting: flavor.allow_nesting,
@@ -133,8 +142,12 @@ where
         }
 
         // 2. 取 goal(task + handoff)
-        let goal = goal_for_run(self.goal_store.as_ref(), Some(self.thread_service.as_ref()), run_context)
-            .await?;
+        let goal = goal_for_run(
+            self.goal_store.as_ref(),
+            Some(self.thread_service.as_ref()),
+            run_context,
+        )
+        .await?;
 
         // 3. 取 SOUL direction prompt(persona 正文)
         let direction_markdown = directions::direction_prompt_for_kind(&kind_str)
@@ -148,9 +161,7 @@ where
 
         // 4. 取工具白名单
         let allowed_capabilities: BTreeSet<CapabilityId> = allowed_capabilities_for(&kind_str)
-            .map_err(|e| {
-                AgentLoopHostError::new(AgentLoopHostErrorKind::Invalid, e)
-            })?;
+            .map_err(|e| AgentLoopHostError::new(AgentLoopHostErrorKind::Invalid, e))?;
 
         Ok(SubagentPromptMaterial {
             direction_markdown,

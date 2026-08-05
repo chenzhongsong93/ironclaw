@@ -1286,6 +1286,14 @@ impl RebornConfigFile {
     pub fn default_llm_slot(&self) -> Option<&LlmSlotSelection> {
         self.llm.as_ref().and_then(|map| map.get("default"))
     }
+
+    /// Resolve the `mission` LLM slot, if present. Used by the dual-model
+    /// wiring (TianQuan: novelist subagent → minimax) to build the second
+    /// provider route. `None` when unconfigured — the runtime then degrades
+    /// to a single-provider (default-slot) setup.
+    pub fn mission_llm_slot(&self) -> Option<&LlmSlotSelection> {
+        self.llm.as_ref().and_then(|map| map.get("mission"))
+    }
 }
 
 /// Apply a typed patch to `[llm.default]` while preserving unrelated TOML.

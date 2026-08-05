@@ -75,7 +75,6 @@ use ironclaw_runner::subagent::await_edge::{
     boot_recovery::ScopeRecoveryDriver, resolver::AwaitEdgeResolver,
     store::FilesystemAwaitEdgeStore,
 };
-use tianquan_subagents::TianquanSubagentDefinitionResolver;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_runner::subagent::goal_store::FilesystemSubagentGoalStore;
 #[cfg(not(any(feature = "libsql", feature = "postgres")))]
@@ -94,6 +93,7 @@ use ironclaw_turns::{
     events::EventCursor,
     run_profile::{LoopHostMilestoneSink, LoopRunContext},
 };
+use tianquan_subagents::TianquanSubagentDefinitionResolver;
 
 use ironclaw_host_runtime::MemoryBackedUserProfileSource;
 #[cfg(any(test, feature = "test-support"))]
@@ -1487,6 +1487,7 @@ impl RebornRuntime {
                 Arc::clone(&parts.reload_handle),
                 Arc::clone(&parts.session),
                 crate::LlmKeyStore::new(self.services.secret_store()),
+                parts.mission_swappable.clone(),
             ),
         ))
     }
@@ -3330,14 +3331,27 @@ pub async fn build_reborn_runtime(
     let boot_provider_factory = llm
         .as_ref()
         .and_then(|resolved| resolved.provider_factory.clone());
+    // Dual-model: resolve the mission model name from `[llm.mission]` so the
+    // gateway builds the router with the correct dispatch key before the first
+    // reload swaps the real mission chain in. `None` when unconfigured →
+    // single-provider (default slot only).
+    let mission_model = boot.as_ref().and_then(|boot_config| {
+        let config_file =
+            ironclaw_reborn_config::RebornConfigFile::load(&boot_config.home().config_file_path())
+                .ok()
+                .flatten()?;
+        config_file
+            .mission_llm_slot()
+            .and_then(|slot| slot.model.clone())
+    });
     #[cfg(any(test, feature = "test-support"))]
     let (model_gateway, llm_cost_table, llm_reload) = match model_gateway_override {
         Some(override_gateway) => (override_gateway, None, None),
-        None => build_production_model_gateway(boot_provider_factory).await?,
+        None => build_production_model_gateway(boot_provider_factory, mission_model).await?,
     };
     #[cfg(not(any(test, feature = "test-support")))]
     let (model_gateway, llm_cost_table, llm_reload) =
-        build_production_model_gateway(boot_provider_factory).await?;
+        build_production_model_gateway(boot_provider_factory, mission_model).await?;
 
     // Resolved cost table is either: the LLM-policy-derived table (real
     // LLM wired), a test override (so tests can drive deterministic
@@ -4102,6 +4116,7 @@ pub async fn build_reborn_runtime(
             Arc::clone(&reload_parts.reload_handle),
             Arc::clone(&reload_parts.session),
             crate::LlmKeyStore::new(services.secret_store()),
+            reload_parts.mission_swappable.clone(),
         );
         if let Err(error) = crate::LlmReloadTrigger::reload(&boot_reload_adapter).await {
             tracing::warn!(
@@ -4527,6 +4542,7 @@ impl CapabilitySurfaceProfileResolver for AllowAllCapabilitySurfaceResolver {
 /// the cold-boot path.
 async fn build_production_model_gateway(
     provider_factory: Option<crate::runtime_input::RebornProviderFactory>,
+    mission_model: Option<String>,
 ) -> Result<
     (
         Arc<dyn ironclaw_loop_host::HostManagedModelGateway>,
@@ -4537,7 +4553,7 @@ async fn build_production_model_gateway(
 > {
     let LlmGatewayBundle {
         gateway, reload, ..
-    } = build_placeholder_llm_gateway(provider_factory).await?;
+    } = build_placeholder_llm_gateway(provider_factory, mission_model).await?;
     Ok((gateway, None, Some(reload)))
 }
 
@@ -4590,11 +4606,17 @@ struct LlmGatewayBundle {
 /// The pieces the LLM-config settings service needs to hot-swap the running
 /// provider: the reload handle wrapping the live `SwappableLlmProvider`, and
 /// the session manager to rebuild the chain against.
+///
+/// `mission_swappable` is present only when the dual-model wiring is active
+/// (`[llm.mission]` configured): the mission provider chain (e.g. minimax for
+/// the novelist subagent) is rebuilt and swapped independently of the default
+/// chain by [`RebornLlmReloadAdapter`].
 pub(crate) struct RebornLlmReloadParts {
     pub(crate) reload_handle: Arc<ironclaw_llm::LlmReloadHandle>,
     pub(crate) session: Arc<ironclaw_llm::SessionManager>,
     pub(crate) nearai_login_states:
         Arc<crate::llm_admin::llm_config_service::NearAiLoginStateStore>,
+    pub(crate) mission_swappable: Option<Arc<ironclaw_llm::SwappableLlmProvider>>,
 }
 
 /// Cold-boot gateway: no LLM configured yet. Wraps a placeholder provider (which
@@ -4608,11 +4630,23 @@ pub(crate) struct RebornLlmReloadParts {
 /// contract documented on [`wrap_swappable_gateway`].
 async fn build_placeholder_llm_gateway(
     provider_factory: Option<crate::runtime_input::RebornProviderFactory>,
+    mission_model: Option<String>,
 ) -> Result<LlmGatewayBundle, RebornRuntimeError> {
     let session =
         ironclaw_llm::create_session_manager(ironclaw_llm::SessionConfig::default()).await;
     let raw: Arc<dyn ironclaw_llm::LlmProvider> = Arc::new(PlaceholderLlmProvider);
-    wrap_swappable_gateway(raw, session, provider_factory)
+    // Dual-model: a mission placeholder swappable is wired from cold boot so
+    // the reload seam can swap the real mission chain (TianQuan: novelist →
+    // minimax) in without a restart, mirroring the default-slot path. The
+    // mission model name is resolved from config.toml at boot; until the
+    // first reload the mission chain is the placeholder.
+    wrap_swappable_gateway_with_mission(
+        raw,
+        Some(Arc::new(PlaceholderLlmProvider) as Arc<dyn ironclaw_llm::LlmProvider>),
+        mission_model,
+        session,
+        provider_factory,
+    )
 }
 
 /// Wrap a raw provider in a [`SwappableLlmProvider`] + reload handle and build
@@ -4626,16 +4660,37 @@ async fn build_placeholder_llm_gateway(
 /// instrumentation stays in the call path and continues to observe model calls
 /// against the reloaded provider. (Applying the factory to the bare provider
 /// instead would let the first reload silently drop the wrapper.)
+/// Single-provider wrapper (no mission slot): used by the placeholder boot
+/// path and tests that drive a lone swappable. See
+/// [`wrap_swappable_gateway_with_mission`] for the dual-model variant.
 fn wrap_swappable_gateway(
     raw: Arc<dyn ironclaw_llm::LlmProvider>,
     session: Arc<ironclaw_llm::SessionManager>,
     provider_factory: Option<crate::runtime_input::RebornProviderFactory>,
 ) -> Result<LlmGatewayBundle, RebornRuntimeError> {
-    use ironclaw_llm::{LlmProvider, LlmReloadHandle, SwappableLlmProvider};
+    wrap_swappable_gateway_with_mission(raw, None, None, session, provider_factory)
+}
+
+/// Wrap a raw provider in a [`SwappableLlmProvider`] + reload handle and build
+/// the model gateway. When a mission provider is supplied (dual-model wiring:
+/// TianQuan novelist subagent → minimax), the gateway drives a
+/// [`DualModelRouter`] that dispatches per-request model overrides to the
+/// default or mission provider, and both swappables are carried on the reload
+/// parts so a hot reload can rebuild each chain independently.
+#[allow(clippy::too_many_arguments)]
+fn wrap_swappable_gateway_with_mission(
+    raw: Arc<dyn ironclaw_llm::LlmProvider>,
+    mission_raw: Option<Arc<dyn ironclaw_llm::LlmProvider>>,
+    mission_model: Option<String>,
+    session: Arc<ironclaw_llm::SessionManager>,
+    provider_factory: Option<crate::runtime_input::RebornProviderFactory>,
+) -> Result<LlmGatewayBundle, RebornRuntimeError> {
+    use ironclaw_llm::{DualModelRouter, LlmProvider, LlmReloadHandle, SwappableLlmProvider};
     use ironclaw_runner::model_gateway::{LlmModelProfilePolicy, LlmProviderModelGateway};
     use ironclaw_turns::run_profile::ModelProfileId;
 
     let swappable = Arc::new(SwappableLlmProvider::new(raw));
+    let mission_swappable = mission_raw.map(|p| Arc::new(SwappableLlmProvider::new(p)));
     let reload_handle = Arc::new(LlmReloadHandle::new(Arc::clone(&swappable), None));
     let swappable_provider: Arc<dyn LlmProvider> = swappable;
     // Gateway drives the factory's wrapper over the swappable (reload-stable);
@@ -4648,16 +4703,44 @@ fn wrap_swappable_gateway(
     let model_profile_id = ModelProfileId::new("interactive_model").map_err(|reason| {
         RebornRuntimeError::LlmProvider(format!("invalid interactive model profile id: {reason}"))
     })?;
-    let policy = LlmModelProfilePolicy::new().allow_model_profile(model_profile_id, None);
-    let gateway = LlmProviderModelGateway::new(provider, policy);
+    let mut policy = LlmModelProfilePolicy::new().allow_model_profile(model_profile_id, None);
+    // Dual-model: the novelist subagent's run profile binds `mission_model`;
+    // its per-profile override carries the mission model name so
+    // `request_model_override` fills `completion.model`, which the
+    // `DualModelRouter` uses to dispatch to the mission provider.
+    if let Some(mission_model_name) = mission_model.as_deref() {
+        let mission_profile_id = ModelProfileId::new("mission_model").map_err(|reason| {
+            RebornRuntimeError::LlmProvider(format!("invalid mission model profile id: {reason}"))
+        })?;
+        policy =
+            policy.allow_model_profile(mission_profile_id, Some(mission_model_name.to_string()));
+    }
+    let gateway: Arc<dyn ironclaw_loop_host::HostManagedModelGateway> =
+        match (mission_swappable.clone(), mission_model.clone()) {
+            (Some(mission_handle), Some(mission_model_name)) => {
+                let mission_provider: Arc<dyn LlmProvider> = mission_handle;
+                let router = DualModelRouter::new(
+                    Arc::clone(&provider),
+                    mission_provider,
+                    mission_model_name,
+                )
+                .map_err(|error| RebornRuntimeError::LlmProvider(error.to_string()))?;
+                Arc::new(LlmProviderModelGateway::new(
+                    Arc::new(router) as Arc<dyn LlmProvider>,
+                    policy,
+                ))
+            }
+            _ => Arc::new(LlmProviderModelGateway::new(provider, policy)),
+        };
     Ok(LlmGatewayBundle {
-        gateway: Arc::new(gateway),
+        gateway,
         reload: RebornLlmReloadParts {
             reload_handle,
             session,
             nearai_login_states: Arc::new(
                 crate::llm_admin::llm_config_service::NearAiLoginStateStore::new(),
             ),
+            mission_swappable,
         },
     })
 }

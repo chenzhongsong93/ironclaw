@@ -12,6 +12,10 @@
 //! `sha256(prose) == final_text_hash`), blocking LLM-written prose that
 //! never went through a real novelist subagent spawn.
 //!
+//! 2026-08-07 治本:`final_text_hash` 是**提取正文**(剥 ```json``` 围栏)的 sha256,
+//! 非 raw final_text——无正文产物(汇报文本/无围栏)hash=None,api 校验必然 block,
+//! 杜绝"非正文被 accept"假正。落盘文件同样只写提取正文(纯正文 txt)。
+//!
 //! Zero-cost when disabled: `TIANQUAN_SPAWN_PG_URL` unset → every call is an
 //! immediate no-op (upstream IronClaw never sets it; only the TianQuan
 //! docker-compose gateway service does). All errors are logged, never
@@ -22,6 +26,36 @@ use ironclaw_turns::{TurnRunId, TurnScope, TurnTimestamp};
 use sha2::Digest as _;
 
 use super::await_edge::EdgeTerminalKind;
+
+/// 从子 agent final_text 提取正文(2026-08-07 治本:落盘/哈希只用正文,不落 raw final_text)。
+///
+/// 协议(l8-delegate-goal.md):子 agent "直接输出正文 + 末尾 ```json``` 围栏",围栏内 JSON
+/// 含 `prose`(协议字段)+ usedGraphFacts/dnaTechniquesUsed/newFactCandidates。
+/// 提取规则:
+/// - 找到 ``` 围栏 → 剥围栏解析 JSON → 取 `prose`(协议字段)或 `final_text`(子 agent 变体字段)
+/// - 无围栏 / 解析失败 / 无正文字段 / 正文 <100 字 → None
+///   (视为非正文产物——如"状态汇报"文本——不落盘 + final_text_hash=None → api validator block)
+/// 返回剥离围栏后的纯正文。
+pub(crate) fn extract_prose_from_final_text(final_text: &str) -> Option<String> {
+    let start = final_text.find("```")?;
+    let rest = &final_text[start + 3..];
+    let end = rest.find("```")?;
+    let json_block = rest[..end].trim();
+    let json_str = json_block
+        .strip_prefix("json")
+        .map(str::trim)
+        .unwrap_or(json_block);
+    let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let prose = value
+        .get("prose")
+        .and_then(|p| p.as_str())
+        .or_else(|| value.get("final_text").and_then(|p| p.as_str()))?
+        .trim();
+    if prose.chars().count() < 100 {
+        return None; // 正文过短(<100 字)视为未产出,与 api 100 字下限一致
+    }
+    Some(prose.to_string())
+}
 
 /// One `spawn_records` row (mirror of TianQuan api migration 0005).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +93,12 @@ impl SpawnProvenanceRecord {
             layer: None,
             spawned_at,
             terminal_status: terminal_status_str(terminal_kind).to_string(),
-            final_text_hash: final_text.map(sha256_hex),
+            // 2026-08-07 治本:final_text_hash = 提取正文的 hash(剥 ```json``` 围栏),
+            // 非 raw final_text。无正文(汇报文本/无围栏)→ None → api validator hash 比对
+            // 必然不匹配 → block(杜绝"汇报文本被 accept"假正)。
+            final_text_hash: final_text
+                .and_then(extract_prose_from_final_text)
+                .map(|prose| sha256_hex(&prose)),
         }
     }
 }
@@ -76,7 +115,8 @@ pub(crate) fn terminal_status_str(kind: EdgeTerminalKind) -> &'static str {
 }
 
 /// sha256 hex lowercase (64 chars) — cross-repo contract with the TianQuan
-/// api (`spawn_store::sha256_hex`); both sides hash the raw `final_text`.
+/// api (`spawn_store::sha256_hex`); both sides hash the extracted prose
+/// (2026-08-07:正文 hash,剥 ```json``` 围栏后,非 raw final_text)。
 pub(crate) fn sha256_hex(text: &str) -> String {
     let digest = sha2::Sha256::digest(text.as_bytes());
     let mut out = String::with_capacity(64);
@@ -93,9 +133,10 @@ pub(crate) fn sha256_hex(text: &str) -> String {
 /// no network touch. Errors are warn-logged and swallowed: the settle path
 /// must never fail because provenance recording did.
 ///
-/// 2026-08-04:正文落盘标准(天权用户拍板)——settle 时把 final_text 原文由引擎直接
-/// 写入 workspace 文件(非 LLM 转抄),api validator 从文件读 prose 做 hash 比对,
-/// 主 agent 不转抄长文。env TIANQUAN_SPAWN_PROSE_DIR 控制目录(未设跳过)。
+/// 2026-08-04:正文落盘标准(天权用户拍板)——settle 时由引擎直接落盘(非 LLM 转抄),
+/// api validator 从文件读 prose 做 hash 比对,主 agent 不转抄长文。
+/// 2026-08-07 治本:落盘/哈希只用提取正文(剥 ```json``` 围栏),见 extract_prose_from_final_text。
+/// env TIANQUAN_SPAWN_PROSE_DIR 控制目录(未设跳过)。
 pub(crate) async fn record_spawn_terminal(
     pg_url: Option<&str>,
     record: &SpawnProvenanceRecord,
@@ -115,24 +156,31 @@ pub(crate) async fn record_spawn_terminal(
     }
 }
 
-/// 把子 agent final_text 原文落盘到 workspace 正文文件(引擎侧落盘,零 LLM 转抄)。
+/// 把子 agent 正文落盘到 workspace 正文文件(引擎侧落盘,零 LLM 转抄)。
 ///
+/// 2026-08-07 治本:落盘前经 [`extract_prose_from_final_text`] 提取正文
+/// (剥 ```json``` 围栏),落盘文件 = 纯正文 txt;无正文产物(汇报文本/无围栏/过短)
+/// → 不落盘 + final_text_hash=None → api validator hash 门 block。
 /// 路径:{TIANQUAN_SPAWN_PROSE_DIR}/{project_id}/chapters/ch24.txt
 /// project_id 固定 "iron-city"(子 agent scope.project_id 为 None,spawn 链路不传 project;
 /// 当前验证场景固定 iron-city,generalize 时需在 spawn 记录里带 project_id/chapter_no,见
 /// debt-register 落盘债)。env 未设/写失败 → warn 日志跳过(settle 路径不受影响)。
 fn persist_final_text_to_workspace(final_text: Option<&str>, record: &SpawnProvenanceRecord) {
-    let Some(prose) = final_text else {
-        return;
-    };
     let Some(prose_dir) = std::env::var("TIANQUAN_SPAWN_PROSE_DIR").ok() else {
         return;
     };
-    if prose.chars().count() < 100 {
-        return; // 空壳产出不落盘(与 api 100 字下限一致)
-    }
+    let Some(prose) = final_text.and_then(extract_prose_from_final_text) else {
+        tracing::warn!(
+            target: "tianquan_spawn_provenance",
+            child_run_id = %record.child_run_id,
+            "spawn final_text 无正文(无 ```json``` 围栏/无 prose 字段/过短),不落盘(validator 将按 hash None block)"
+        );
+        return;
+    };
     let project_id = record.project_id.as_deref().unwrap_or("iron-city");
-    let dir = std::path::Path::new(&prose_dir).join(project_id).join("chapters");
+    let dir = std::path::Path::new(&prose_dir)
+        .join(project_id)
+        .join("chapters");
     if let Err(error) = std::fs::create_dir_all(&dir) {
         tracing::warn!(
             target: "tianquan_spawn_provenance",
@@ -144,7 +192,7 @@ fn persist_final_text_to_workspace(final_text: Option<&str>, record: &SpawnProve
         return;
     }
     let path = dir.join("ch24.txt");
-    if let Err(error) = std::fs::write(&path, prose) {
+    if let Err(error) = std::fs::write(&path, &prose) {
         tracing::warn!(
             target: "tianquan_spawn_provenance",
             child_run_id = %record.child_run_id,
@@ -268,7 +316,8 @@ mod tests {
         );
     }
 
-    // 覆盖:§2.2 PH-IC-MAP-02 — final_text=None → final_text_hash=None;Some → sha256
+    // 覆盖:§2.2 PH-IC-MAP-02 — final_text=None → final_text_hash=None;
+    // Some → 提取正文(剥 ```json``` 围栏)后的 sha256(2026-08-07 治本)
     #[test]
     fn record_from_terminal_hashing() {
         let child_run_id = TurnRunId::new();
@@ -283,6 +332,7 @@ mod tests {
             spawned_at,
         );
         assert_eq!(rec.final_text_hash, None);
+        // 无围栏的纯文本(非协议产物)→ 无正文 → hash None
         let rec = SpawnProvenanceRecord::from_terminal(
             &child_run_id,
             &scope,
@@ -292,14 +342,77 @@ mod tests {
             spawned_at,
         );
         assert_eq!(
+            rec.final_text_hash, None,
+            "无 ```json``` 围栏 = 非协议产物,hash None"
+        );
+        // 协议形态(正文 + ```json``` 围栏,prose 字段)→ hash = 提取正文的 sha256
+        let prose = "夜色压城。".repeat(30); // >100 字
+        let final_text = format!(
+            "第24章 开头\n\n{prose}```json\n{{\"prose\": \"{prose}\", \"usedGraphFacts\": [\"F1\"]}}\n```"
+        );
+        let rec = SpawnProvenanceRecord::from_terminal(
+            &child_run_id,
+            &scope,
+            &kind("novelist"),
+            EdgeTerminalKind::Completed,
+            Some(&final_text),
+            spawned_at,
+        );
+        assert_eq!(
             rec.final_text_hash.as_deref(),
-            Some("cc1644bbac01797d12e4c7a82bef92b4b5924bee0d694fb49dd150ce3226eaed")
+            Some(sha256_hex(&prose).as_str()),
+            "hash = 提取正文的 sha256(非 raw final_text)"
         );
         assert_eq!(rec.child_run_id, child_run_id.to_string());
         assert_eq!(rec.subagent_type, "novelist");
         assert_eq!(rec.terminal_status, "Completed");
         assert_eq!(rec.spawned_at, spawned_at);
         assert_eq!(rec.layer, None);
+    }
+
+    // 覆盖:2026-08-07 治本——extract_prose_from_final_text 提取正文(剥围栏)
+    #[test]
+    fn extract_prose_from_fenced_final_text() {
+        let prose = "夜".repeat(200);
+        let ft = format!("```json\n{{\"prose\": \"{prose}\", \"usedGraphFacts\": [\"F1\"]}}\n```");
+        let got = extract_prose_from_final_text(&ft);
+        assert_eq!(got.as_deref(), Some(prose.as_str()));
+    }
+
+    #[test]
+    fn extract_prose_from_final_text_field_variant() {
+        // 子 agent 变体:围栏内用 final_text 字段名(2026-08-07 实测第一轮落盘形态)
+        let prose = "夜".repeat(150);
+        let ft = format!("```json\n{{\"final_text\": \"{prose}\"}}\n```");
+        assert_eq!(
+            extract_prose_from_final_text(&ft).as_deref(),
+            Some(prose.as_str())
+        );
+    }
+
+    #[test]
+    fn extract_prose_none_without_fence() {
+        // 无围栏 = 非协议产物(如"状态汇报"文本)→ None
+        assert_eq!(
+            extract_prose_from_final_text("当前状态汇报: spawn 被拒,fanout 超限"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_prose_none_when_prose_too_short() {
+        let ft = "```json\n{\"prose\": \"太短\"}\n```";
+        assert_eq!(
+            extract_prose_from_final_text(ft),
+            None,
+            "正文 <100 字 → None"
+        );
+    }
+
+    #[test]
+    fn extract_prose_none_when_json_invalid() {
+        let ft = "```json\n{这不是合法 JSON\n```";
+        assert_eq!(extract_prose_from_final_text(ft), None);
     }
 
     // 覆盖:§2.2 PH-IC-MAP-03 — project_id 从 scope 取,None → None(不硬编码)
@@ -346,7 +459,7 @@ mod tests {
         record_spawn_terminal(None, &rec, None).await;
     }
 
-    // 覆盖:2026-08-04 落盘标准——final_text 落盘到 workspace 正文文件(引擎侧,零 LLM 转抄)
+    // 覆盖:2026-08-04 落盘标准 + 2026-08-07 治本——正文落盘到 workspace(剥围栏纯正文)
     #[test]
     fn persist_final_text_writes_ch24_txt_when_env_set() {
         // 用一次性临时目录避免污染真实 workspace
@@ -365,18 +478,32 @@ mod tests {
             Some("x"),
             Utc::now(),
         );
-        // final_text 短(<100 字)不落盘
+        // 无围栏文本(非协议产物)→ 不落盘(2026-08-07 治本,原"短正文不落盘"语义扩展)
         persist_final_text_to_workspace(Some("短正文"), &rec);
         let short_path = tmp.join("iron-city").join("chapters").join("ch24.txt");
-        assert!(!short_path.exists(), "短正文不应落盘");
+        assert!(!short_path.exists(), "无围栏/过短不应落盘");
 
-        // 长正文落盘(project_id 为 None → fallback iron-city)
-        let long_prose = "夜".repeat(200);
-        persist_final_text_to_workspace(Some(&long_prose), &rec);
+        // 汇报文本(无围栏,≥100 字)→ 不落盘(2026-08-07 治本:非正文产物)
+        let report = "当前状态汇报: spawn 被拒 fanout 超限,等待配额释放。".repeat(6);
+        assert!(
+            report.chars().count() >= 100,
+            "汇报文本应 ≥100 字以测试非长度拦截"
+        );
+        persist_final_text_to_workspace(Some(&report), &rec);
+        assert!(!short_path.exists(), "汇报文本(无 ```json``` 围栏)不应落盘");
+
+        // 协议形态(正文 + ```json``` 围栏)→ 落盘 = 纯正文(剥围栏)
+        let prose = "夜".repeat(200);
+        let fenced =
+            format!("```json\n{{\"prose\": \"{prose}\", \"usedGraphFacts\": [\"F1\"]}}\n```");
+        persist_final_text_to_workspace(Some(&fenced), &rec);
         let long_path = tmp.join("iron-city").join("chapters").join("ch24.txt");
-        assert!(long_path.exists(), "长正文应落盘");
+        assert!(long_path.exists(), "围栏正文应落盘");
         let written = std::fs::read_to_string(&long_path).expect("读回");
-        assert_eq!(written, long_prose, "落盘内容=final_text 原文");
+        assert_eq!(
+            written, prose,
+            "落盘内容 = 提取正文(剥围栏),非 raw final_text"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
         unsafe {
             std::env::remove_var("TIANQUAN_SPAWN_PROSE_DIR");

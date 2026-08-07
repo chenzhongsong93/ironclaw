@@ -76,30 +76,21 @@ Novelist 相关模板（V17 §13）：
 }
 ```
 
-## 输出
+## 输出(正文直出协议,2026-08-07)
 
-novelist 写正文(纯 LLM 创作),产出 output-schema.json 契约形状(camelCase,对齐 SSOT §137.9):
+novelist 写正文(纯 LLM 创作),**直接输出正文全文作为最终回复本体——不要 ```json``` 围栏、不要任何 JSON 包裹正文**。正文输出后,用 `builtin.write_file` 写元数据文件到 goal 指定的路径(`/workspace/{project_id}/meta/layer-plans/l8-spawn-meta.json`):
 
 ```json
 {
-  "agent": "novelist",
-  "layer": "L8",
-  "chapterNo": 0,
-  "prose": "",
-  "charCount": 0,
-  "usedGraphFacts": [],
-  "usedRenderingCues": [],
+  "usedGraphFacts": ["CEX-F 编号"],
   "dnaTechniquesUsed": [],
-  "newFactCandidates": [],
-  "possibleContinuityRisks": [],
-  "emotionDeliverySelfCheck": {},
-  "provenance": {"agent": "novelist", "sessionId": ""}
+  "newFactCandidates": []
 }
 ```
 
-- `prose`:正文文本(必填,纯 LLM 创作)。
-- `usedGraphFacts`:正文引用的图谱事实(每条须在 sourceMap 可追溯)。
+- `usedGraphFacts`:正文实际采用的 CEX-F 编号(每条须在 sourceMap 可追溯);未采用才留空。
 - `newFactCandidates`:正文产生的新事实候选(与现有 canon 矛盾的断言**必须**走此通道上报 auditor,**不得**嵌入正文当正史)。
+- 主 agent 组装 novelistOutput 契约(prose/charCount/chapterNo/usedGraphFacts/provenance)由主会话负责;正文真实性由 settle 落盘 + provenance hash 门保证。
 - `possibleContinuityRisks`/`emotionDeliverySelfCheck`:连续性风险与情绪交付自检。
 
 正文写作由 LLM 完成;校验由 **novelist_validator_engine.py**(纯校验不生成正文)执行 6 条 review-gate 规则。下文 PLAN/LOCK/EXECUTE/VERIFY 是 LLM 创作工作流;引擎只在产出后校验。
@@ -357,7 +348,7 @@ run_novelist(project_id="iron-city", layer="meta:ontology", request={...})
 
 ## L8 强右脑协议
 
-> **作为 delegate 子 agent 运行时(v0.16.0)**:你的上下文是**隔离**的——所有场景渲染包、约束、fact 编号都在本次 delegate 的 goal/context 里, 不要假设能访问主会话历史或查 Fuseki。写完务必在末尾用 ```json``` 输出结构化产出(prose/usedGraphFacts/dnaTechniquesUsed 等), 供主会话回传 L8 编排器走 13门→auditor→落库。
+> **作为 delegate 子 agent 运行时(v0.16.0)**:你的上下文是**隔离**的——所有场景渲染包、约束、fact 编号都在本次 delegate 的 goal/context 里, 不要假设能访问主会话历史或查 Fuseki。**直接输出正文全文作为最终回复本体(不要 ```json``` 围栏、不要 JSON 包裹正文)**,正文输出后再用 builtin.write_file 写元数据文件到 goal 里指定的路径(`l8-spawn-meta.json`,含 usedGraphFacts/dnaTechniquesUsed/newFactCandidates),供主会话回传 L8 编排器走 13门→auditor→落库。正文真实性由 settle 落盘 + provenance hash 门保证,元数据由该文件提供。
 
 L8 是左右脑八层的末端创作层。**右脑(novelist)负责写出真正爽、真正高级的网文小说正文表达,左脑确定性引擎守安全门**——novelist 无论自评质量多高,都不能绕过 NovelistValidator 闭合校验 + 13 网文门 + auditor 审计。这三道确定性门 fail 即 block_prose,decision 引擎说了算。
 

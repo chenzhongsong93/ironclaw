@@ -302,11 +302,12 @@
     ],
     "protocol": "deep_seek",
     "default_base_url": "",
+    "base_url_env": "DEEPSEEK_BASE_URL",
     "api_key_env": "DEEPSEEK_API_KEY",
     "api_key_required": true,
     "model_env": "DEEPSEEK_MODEL",
     "default_model": "deepseek-chat",
-    "description": "DeepSeek inference API (preserves reasoning_content for thinking-mode models)",
+    "description": "DeepSeek inference API (preserves reasoning_content for thinking-mode models; base_url 可由 DEEPSEEK_BASE_URL env 覆盖,2026-08-14 天权走 opencode 代理)",
     "setup": {
       "kind": "api_key",
       "secret_name": "llm_deepseek_api_key",

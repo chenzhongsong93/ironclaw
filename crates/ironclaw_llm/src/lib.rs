@@ -473,7 +473,8 @@ fn create_anthropic_from_registry(
             base_url = if config.base_url.is_empty() { "default" } else { &config.base_url },
             "Using Anthropic OAuth API"
         );
-        let provider = anthropic_oauth::AnthropicOAuthProvider::new(config)?;
+        let provider =
+            anthropic_oauth::AnthropicOAuthProvider::new(config, request_timeout_secs)?;
         return Ok(Arc::new(provider));
     }
 

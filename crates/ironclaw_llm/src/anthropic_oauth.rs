@@ -100,7 +100,10 @@ pub(crate) struct AnthropicOAuthProvider {
 }
 
 impl AnthropicOAuthProvider {
-    pub(crate) fn new(config: &RegistryProviderConfig) -> Result<Self, LlmError> {
+    pub(crate) fn new(
+        config: &RegistryProviderConfig,
+        request_timeout_secs: u64,
+    ) -> Result<Self, LlmError> {
         let token = config
             .oauth_token
             .clone()
@@ -108,9 +111,11 @@ impl AnthropicOAuthProvider {
                 provider: "anthropic_oauth".to_string(),
             })?;
 
-        let client =
-            crate::config::hardened_client_builder(crate::config::DEFAULT_REQUEST_TIMEOUT_SECS)
-                .build()
+        // 2026-08-20 天权补丁:超时随链配置(LLM_REQUEST_TIMEOUT_SECS)而非硬编码默认 180s
+        // ——火山网关(Anthropic 协议)全量写手任务非流式生成实测 386s,180s 必超时致子 run
+        // 悬挂(spawn 后 provider 调用超时,child 卡非终态阻塞后续 spawn)。
+        let client = crate::config::hardened_client_builder(request_timeout_secs)
+            .build()
                 .map_err(|e| LlmError::RequestFailed {
                     provider: "anthropic_oauth".to_string(),
                     reason: format!("Failed to build HTTP client: {}", e),

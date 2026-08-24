@@ -929,10 +929,15 @@ pub(crate) struct GeminiOauthProvider {
 type GeminiParsedResponse = (CompletionResponse, Vec<ToolCall>, HashMap<String, String>);
 
 impl GeminiOauthProvider {
-    pub(crate) fn new(config: GeminiOauthConfig) -> Result<Self, LlmError> {
+    pub(crate) fn new(
+        config: GeminiOauthConfig,
+        request_timeout_secs: u64,
+    ) -> Result<Self, LlmError> {
         let cred_manager = CredentialManager::new(&config.credentials_path)?;
+        // 2026-08-24 天权补丁:超时随链配置(LLM_REQUEST_TIMEOUT_SECS)而非硬编码默认 180s
+        // ——同构于 anthropic_oauth 776b6248e 补丁;gemini_oauth 后端此前漏改,900s env 不生效。
         let http_client =
-            crate::config::hardened_client_builder(crate::config::DEFAULT_REQUEST_TIMEOUT_SECS)
+            crate::config::hardened_client_builder(request_timeout_secs)
                 .build()
                 .map_err(|e| LlmError::RequestFailed {
                     provider: "gemini_oauth".to_string(),

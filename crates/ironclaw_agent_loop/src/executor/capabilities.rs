@@ -342,6 +342,44 @@ impl ExecutorStage<CapabilityInput> for CapabilityStage {
                     .completed_turn(ctx, state, result_refs_start, capability_batch)
                     .await;
             }
+            // 2026-08-24 天权三债修复:InvalidInvocation(模型调了无效参数/不存在的能力)
+            // 不应终死 run——降为 model-visible 错误让模型自行修正,同 StaleSurface 路径。
+            Err(ref error)
+                if error.kind
+                    == ironclaw_turns::run_profile::AgentLoopHostErrorKind::InvalidInvocation =>
+            {
+                let invalid_summary = SanitizedStrategySummary::from_trusted_static(
+                    "capability invocation rejected as invalid; model must correct the call",
+                );
+                for call in visible_calls {
+                    push_call_signature_once(&mut state, &mut signatures, &call)?;
+                    state
+                        .recent_failure_kinds
+                        .push(LoopFailureKind::ModelError);
+                    let summary = CapabilityErrorSummary {
+                        class: CapabilityErrorClass::InputInvalid,
+                        safe_summary: invalid_summary.clone(),
+                        diagnostic_ref: None,
+                    };
+                    match self
+                        .handle_capability_error(
+                            ctx,
+                            state,
+                            call,
+                            summary,
+                            None,
+                            &mut capability_batch,
+                        )
+                        .await?
+                    {
+                        BatchStep::Continue(next) => state = *next,
+                        BatchStep::Exit(exit) => return Ok(TurnCompletedStep::Exit(exit)),
+                    }
+                }
+                return self
+                    .completed_turn(ctx, state, result_refs_start, capability_batch)
+                    .await;
+            }
             Err(error) => return Err(capability_host_error(error)),
         };
 
@@ -975,17 +1013,33 @@ impl CapabilityStage {
                             if error.kind
                                 == ironclaw_turns::run_profile::AgentLoopHostErrorKind::StaleSurface =>
                         {
-                            summary = CapabilityErrorSummary {
-                                class: CapabilityErrorClass::PolicyDenied,
-                                safe_summary: SanitizedStrategySummary::from_trusted_static(
-                                    "capability surface changed before execution; re-issue the call",
-                                ),
-                                diagnostic_ref: None,
-                            };
-                            model_observation = None;
-                            continue;
-                        }
-                        Err(error) => return Err(capability_host_error(error)),
+                        summary = CapabilityErrorSummary {
+                            class: CapabilityErrorClass::PolicyDenied,
+                            safe_summary: SanitizedStrategySummary::from_trusted_static(
+                                "capability surface changed before execution; re-issue the call",
+                            ),
+                            diagnostic_ref: None,
+                        };
+                        model_observation = None;
+                        continue;
+                    }
+                    // 2026-08-24 天权三债修复:InvalidInvocation 降为 model-visible,
+                    // 不终死(同 StaleSurface 路径)
+                    Err(ref error)
+                        if error.kind
+                            == ironclaw_turns::run_profile::AgentLoopHostErrorKind::InvalidInvocation =>
+                    {
+                        summary = CapabilityErrorSummary {
+                            class: CapabilityErrorClass::InputInvalid,
+                            safe_summary: SanitizedStrategySummary::from_trusted_static(
+                                "capability invocation rejected as invalid; model must correct the call",
+                            ),
+                            diagnostic_ref: None,
+                        };
+                        model_observation = None;
+                        continue;
+                    }
+                    Err(error) => return Err(capability_host_error(error)),
                     };
                     match retry {
                         Resolution::Done(outcome)

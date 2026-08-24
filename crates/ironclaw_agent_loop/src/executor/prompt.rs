@@ -410,25 +410,53 @@ impl<'a> PromptPlanningPipeline<'a> {
         &self,
         surface_filter: crate::strategies::CapabilityFilter,
     ) -> Result<VisibleCapabilitySurface, AgentLoopExecutorError> {
-        let map_capability_error = |error| {
-            debug_host_unavailable(HostStage::Capability, &error);
-            AgentLoopExecutorError::HostUnavailable {
-                stage: HostStage::Capability,
+        // 2026-08-24 天权三债修复:新线程首 prompt 的 capability 死亡根因——
+        // cache 和 port 的任何 host error(StaleSurface/Unavailable/InvalidInvocation)
+        // 都被 map_capability_error 一击终死。改:StaleSurface/Unavailable 不终死,
+        // cache 命中 StaleSurface → fallback 到 port 全链;port 命中 → 一次重试。
+        let cache_result = self.ctx.host.current_visible_capabilities();
+        let mut surface = match cache_result {
+            Ok(Some(surface)) => surface,
+            // cache 未命中或 StaleSurface → fallback 到 port 全链
+            Ok(None) | Err(_) => {
+                let port_result = self
+                    .ctx
+                    .host
+                    .visible_capabilities(VisibleCapabilityRequest)
+                    .await;
+                match port_result {
+                    Ok(surface) => surface,
+                    Err(ref error)
+                        if error.kind
+                            == ironclaw_turns::run_profile::AgentLoopHostErrorKind::StaleSurface
+                            || error.kind
+                                == ironclaw_turns::run_profile::AgentLoopHostErrorKind::Unavailable =>
+                    {
+                        // 一次重试:StaleSurface/Unavailable 可能是瞬态(capability 版本未就绪)
+                        debug_host_unavailable(HostStage::Capability, error);
+                        tracing::warn!(
+                            kind = error.kind.as_str(),
+                            "capability surface unavailable on first prompt; retrying once"
+                        );
+                        self.ctx
+                            .host
+                            .visible_capabilities(VisibleCapabilityRequest)
+                            .await
+                            .map_err(|retry_error| {
+                                debug_host_unavailable(HostStage::Capability, &retry_error);
+                                AgentLoopExecutorError::HostUnavailable {
+                                    stage: HostStage::Capability,
+                                }
+                            })?
+                    }
+                    Err(error) => {
+                        debug_host_unavailable(HostStage::Capability, &error);
+                        return Err(AgentLoopExecutorError::HostUnavailable {
+                            stage: HostStage::Capability,
+                        });
+                    }
+                }
             }
-        };
-        let mut surface = match self
-            .ctx
-            .host
-            .current_visible_capabilities()
-            .map_err(&map_capability_error)?
-        {
-            Some(surface) => surface,
-            None => self
-                .ctx
-                .host
-                .visible_capabilities(VisibleCapabilityRequest)
-                .await
-                .map_err(map_capability_error)?,
         };
         apply_capability_filter(&mut surface, &surface_filter);
         if tracing::enabled!(tracing::Level::DEBUG) {

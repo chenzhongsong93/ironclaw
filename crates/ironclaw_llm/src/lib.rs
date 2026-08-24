@@ -946,7 +946,7 @@ fn create_cheap_provider_for_backend(
         };
         let mut cheap_gemini_config = gemini_config.clone();
         cheap_gemini_config.model = cheap_model.to_string();
-        let provider = GeminiOauthProvider::new(cheap_gemini_config)?;
+        let provider = GeminiOauthProvider::new(cheap_gemini_config, config.request_timeout_secs)?;
         return Ok(Some(Arc::new(provider)));
     }
 
@@ -1234,7 +1234,8 @@ pub fn create_gemini_oauth_provider(config: &LlmConfig) -> Result<Arc<dyn LlmPro
         .ok_or_else(|| LlmError::AuthFailed {
             provider: "gemini_oauth".to_string(),
         })?;
-    let provider = gemini_oauth::GeminiOauthProvider::new(gemini_config)?;
+    let provider =
+        gemini_oauth::GeminiOauthProvider::new(gemini_config, config.request_timeout_secs)?;
     Ok(Arc::new(provider))
 }
 

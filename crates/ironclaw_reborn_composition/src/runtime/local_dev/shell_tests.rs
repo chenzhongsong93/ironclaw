@@ -89,6 +89,9 @@ async fn local_dev_yolo_shell_translates_workspace_workdir_without_scoped_mounts
     let input_resolver: Arc<dyn LoopCapabilityInputResolver> = capability_io.clone();
     let result_writer: Arc<dyn LoopCapabilityResultWriter> = capability_io.clone();
     let factory = RefreshingLoopCapabilityPortFactory {
+        provider_input_store: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
         runtime,
         fallback_user_id: UserId::new("local-dev-shell-user").expect("user id"),
         policy,

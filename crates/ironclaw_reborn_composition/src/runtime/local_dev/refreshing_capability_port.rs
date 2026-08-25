@@ -42,6 +42,11 @@ use super::{
 pub(crate) struct RefreshingCapabilityPortConfig {
     pub(super) runtime: Arc<dyn HostRuntime>,
     pub(super) run_context: LoopRunContext,
+    /// Factory-external shared provider tool-call input store(2026-08-24 天权
+    /// 修复):本 port 每次 refresh/claim 重建,build_inner 里新建的
+    /// HostRuntimeLoopCapabilityPortFactory 也随之重建——store 必须由 composition
+    /// 层创建并经此传入,跨重建存活(run 挂起恢复后 digest ref 仍可解析)。
+    pub(super) provider_input_store: ironclaw_loop_host::ProviderToolCallInputStore,
     pub(super) fallback_user_id: UserId,
     pub(super) policy: Arc<BuiltinCapabilityPolicy>,
     pub(super) workspace_mounts: MountView,
@@ -99,6 +104,7 @@ pub(crate) async fn create_refreshing_capability_port(
     let port = Arc::new(RefreshingCapabilityPort {
         runtime: config.runtime,
         run_context: config.run_context,
+        provider_input_store: config.provider_input_store,
         fallback_user_id: config.fallback_user_id,
         policy: config.policy,
         workspace_mounts: config.workspace_mounts,
@@ -139,6 +145,7 @@ pub(crate) async fn create_refreshing_capability_port(
 struct RefreshingCapabilityPort {
     runtime: Arc<dyn HostRuntime>,
     run_context: LoopRunContext,
+    provider_input_store: ironclaw_loop_host::ProviderToolCallInputStore,
     fallback_user_id: UserId,
     policy: Arc<BuiltinCapabilityPolicy>,
     workspace_mounts: MountView,
@@ -191,9 +198,7 @@ impl RefreshingCapabilityPort {
             })
             .transpose()
             .map_err(host_api_agent_loop_error)?;
-        let workspace_mounts = scoped_workspace
-            .as_ref()
-            .unwrap_or(&self.workspace_mounts);
+        let workspace_mounts = scoped_workspace.as_ref().unwrap_or(&self.workspace_mounts);
         let mut visible_request = visible_capability_request(
             &self.run_context,
             &self.fallback_user_id,
@@ -294,7 +299,8 @@ impl RefreshingCapabilityPort {
             self.trajectory_observer
                 .clone()
                 .map(crate::observability::trajectory_observer::as_capability_observer),
-        );
+        )
+        .with_provider_input_store(Arc::clone(&self.provider_input_store));
         for capability_id in self.policy.skill_management_capability_ids() {
             factory = factory
                 .with_capability_execution_mount(capability_id.clone(), self.skill_mounts.clone());
@@ -540,6 +546,9 @@ pub(crate) async fn create_refreshing_capability_port_for_test(
     create_refreshing_capability_port(RefreshingCapabilityPortConfig {
         runtime,
         run_context,
+        provider_input_store: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
         fallback_user_id,
         policy,
         workspace_mounts,

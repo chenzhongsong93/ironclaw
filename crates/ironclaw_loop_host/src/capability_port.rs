@@ -143,7 +143,7 @@ pub trait LoopCapabilityInputResolver: Send + Sync {
 /// scoped to this loop run" 终死(创作类 turn 100% 复现)。照抄 2da22c1fc 把
 /// spawn_authorizations 迁共享的同款论证:digest ref payload 已含 run_id,跨 run
 /// 隔离由 digest 构造保证,共享 map 不产生跨 run 泄漏。
-type ProviderToolCallInputStore = Arc<Mutex<HashMap<String, serde_json::Value>>>;
+pub type ProviderToolCallInputStore = Arc<Mutex<HashMap<String, serde_json::Value>>>;
 
 struct ProviderToolCallInputResolver {
     inner: Arc<dyn LoopCapabilityInputResolver>,
@@ -667,6 +667,16 @@ impl HostRuntimeLoopCapabilityPortFactory {
     /// unwired factory.
     pub fn with_replay_payload_store(mut self, store: Arc<dyn ReplayPayloadStore>) -> Self {
         self.replay_payload_store = store;
+        self
+    }
+
+    /// Wire a factory-external shared provider tool-call input store (2026-08-24
+    /// 天权修复)。The local-dev composition rebuilds this factory on every
+    /// port refresh (`RefreshingCapabilityPort::build_inner`), so the store must
+    /// outlive any single factory instance — composition creates one and passes
+    /// it down here; run 挂起恢复重建 port 后 digest ref 仍可解析。
+    pub fn with_provider_input_store(mut self, store: ProviderToolCallInputStore) -> Self {
+        self.provider_input_store = store;
         self
     }
 

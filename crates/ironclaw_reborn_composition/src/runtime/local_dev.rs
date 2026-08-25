@@ -170,6 +170,9 @@ pub(super) fn capability_wiring(
     );
     let capability_factory: Arc<dyn LoopCapabilityPortFactory> =
         Arc::new(RefreshingLoopCapabilityPortFactory {
+            provider_input_store: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             runtime,
             fallback_user_id,
             policy,
@@ -233,6 +236,11 @@ struct RefreshingLoopCapabilityPortFactory {
     /// all runs in this runtime so a parked external-tool call and its later
     /// client-submitted output (across a pause/resume) hit the same store.
     external_tool_catalog: Arc<dyn ExternalToolCatalog>,
+    /// Composition-level shared provider tool-call input store(2026-08-24 天权
+    /// 修复):factory 进程级存活但每次 claim 重建 port,且 build_inner 每次新建
+    /// HostRuntimeLoopCapabilityPortFactory——store 挂在这层才能跨 claim/refresh
+    /// 存活,治 resume 后 digest ref 解析 miss→scope_mismatch 终死。
+    provider_input_store: ironclaw_loop_host::ProviderToolCallInputStore,
 }
 
 #[async_trait::async_trait]
@@ -249,6 +257,7 @@ impl LoopCapabilityPortFactory for RefreshingLoopCapabilityPortFactory {
         create_refreshing_capability_port(RefreshingCapabilityPortConfig {
             runtime: Arc::clone(&self.runtime),
             run_context: run_context.clone(),
+            provider_input_store: std::sync::Arc::clone(&self.provider_input_store),
             fallback_user_id: self.fallback_user_id.clone(),
             policy: Arc::clone(&self.policy),
             workspace_mounts: self.workspace_mounts.clone(),

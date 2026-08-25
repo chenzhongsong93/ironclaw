@@ -67,8 +67,8 @@ pub use capability_port::{
     CapabilityResultWrite, CapabilityTrajectoryObserver, CapabilityWriteResult,
     DecoratingLoopCapabilityPortFactory, DurablePersistence, HostRuntimeLoopCapabilityPort,
     HostRuntimeLoopCapabilityPortFactory, LoopCapabilityInputResolver, LoopCapabilityPortDecorator,
-    LoopCapabilityPortFactory, LoopCapabilityResultWriter, concurrency_hint_from_effects,
-    loop_driver_execution_extension_id,
+    LoopCapabilityPortFactory, LoopCapabilityResultWriter, ProviderToolCallInputStore,
+    concurrency_hint_from_effects, loop_driver_execution_extension_id,
 };
 pub use capability_surface_filter::{
     CapabilitySurfaceDenyFilter, CapabilitySurfaceProfileFilter, CapabilitySurfaceVisibleFilter,

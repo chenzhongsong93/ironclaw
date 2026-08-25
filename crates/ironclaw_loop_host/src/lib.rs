@@ -2115,10 +2115,34 @@ fn provider_call_reference_to_envelope(
         provider_tool_name: provider_call.provider_tool_name,
         capability_id: provider_call.capability_id,
         arguments: provider_call.arguments,
-        response_reasoning: provider_call.response_reasoning,
-        reasoning: provider_call.reasoning,
+        // 2026-08-24 天权修复:reasoning 超 4096 字节时截断而非报错——原样透传会让
+        // envelope validate 报 TranscriptWriteFailed 终死整个 run(deepseek-v4-flash 长
+        // 思维链实测必现,greenlight 创作 turn 100% 复现)。reasoning 是辅助元数据,
+        // 截断不丢正文/工具参数;signature 是校验串不截(实际不超限)。
+        response_reasoning: provider_call
+            .response_reasoning
+            .map(|s| truncate_provider_text(&s, 4096)),
+        reasoning: provider_call
+            .reasoning
+            .map(|s| truncate_provider_text(&s, 4096)),
         signature: provider_call.signature,
     }
+}
+
+/// 按 UTF-8 字符边界截断到 max_bytes(超限末尾加省略标记)。
+fn truncate_provider_text(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for ch in s.chars() {
+        if out.len() + ch.len_utf8() > max_bytes - 3 {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
 }
 
 fn role_for_kind(kind: MessageKind) -> &'static str {
@@ -2271,6 +2295,25 @@ fn safe_model_summary(kind: HostManagedModelErrorKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    // 2026-08-24 天权修复锁定:reasoning 超 4096 截断(UTF-8 边界+省略标记),
+    // 不再让 envelope validate 终死 run
+    #[test]
+    fn truncate_provider_text_respects_utf8_boundary_and_limit() {
+        let short = "短文本";
+        assert_eq!(truncate_provider_text(short, 4096), short);
+        let long = "深".repeat(3000); // 9000 字节
+        let got = truncate_provider_text(&long, 4096);
+        assert!(got.len() <= 4096, "截断后须 <= 上限,实际 {}", got.len());
+        assert!(got.ends_with("..."));
+        assert!(got.starts_with('深'));
+        // ASCII 快速路径
+        let ascii = "a".repeat(5000);
+        let got2 = truncate_provider_text(&ascii, 4096);
+        assert_eq!(got2.len(), 4096);
+        assert!(got2.ends_with("..."));
+    }
+
     use super::*;
 
     #[test]

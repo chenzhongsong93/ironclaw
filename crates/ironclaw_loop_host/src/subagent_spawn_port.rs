@@ -555,6 +555,7 @@ impl SubagentSpawnCapabilityPort {
     /// 天权治本(2026-07-27):接收外部共享的 spawn_authorizations + spawned_this_turn。
     /// decorator 持有共享 Arc,decorate 时 clone 传给每个 port 实例,
     /// 确保 register/authorize 跨 port 重建读写同一 map(治 per-run 致 authorize 读空 map)。
+    #[allow(clippy::too_many_arguments)] // 与 new 同构+共享态注入,拆参数组遮蔽对称性
     pub fn new_with_shared_state(
         inner: Arc<dyn LoopCapabilityPort>,
         run_context: LoopRunContext,
@@ -834,7 +835,7 @@ impl SubagentSpawnCapabilityPort {
         &self,
         invocation: &CapabilityInvocation,
     ) -> Result<Option<Resolution>, AgentLoopHostError> {
-        let mut spawn_authorizations = self.spawn_authorizations.lock().map_err(|_| {
+        let spawn_authorizations = self.spawn_authorizations.lock().map_err(|_| {
             AgentLoopHostError::new(
                 AgentLoopHostErrorKind::Unavailable,
                 "subagent spawn authorization store is unavailable",

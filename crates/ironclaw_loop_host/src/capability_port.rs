@@ -136,16 +136,28 @@ pub trait LoopCapabilityInputResolver: Send + Sync {
     }
 }
 
+/// Shared provider tool-call input store (2026-08-24 天权修复:迁到 factory 共享)。
+/// 原实现 per-port 持有 `Mutex<HashMap>`——run 挂起(spawn 子 agent 等)后 resume 会
+/// 重建 port(loop_driver_host create_host 每次 claim 新建),map 清空→digest ref 解析
+/// miss→落到 ProductLiveCapabilityIo 的 run scope 校验→"capability input ref is not
+/// scoped to this loop run" 终死(创作类 turn 100% 复现)。照抄 2da22c1fc 把
+/// spawn_authorizations 迁共享的同款论证:digest ref payload 已含 run_id,跨 run
+/// 隔离由 digest 构造保证,共享 map 不产生跨 run 泄漏。
+type ProviderToolCallInputStore = Arc<Mutex<HashMap<String, serde_json::Value>>>;
+
 struct ProviderToolCallInputResolver {
     inner: Arc<dyn LoopCapabilityInputResolver>,
-    provider_inputs: Mutex<HashMap<String, serde_json::Value>>,
+    provider_inputs: ProviderToolCallInputStore,
 }
 
 impl ProviderToolCallInputResolver {
-    fn new(inner: Arc<dyn LoopCapabilityInputResolver>) -> Self {
+    fn with_store(
+        inner: Arc<dyn LoopCapabilityInputResolver>,
+        provider_inputs: ProviderToolCallInputStore,
+    ) -> Self {
         Self {
             inner,
-            provider_inputs: Mutex::new(HashMap::new()),
+            provider_inputs,
         }
     }
 }
@@ -601,6 +613,11 @@ pub struct HostRuntimeLoopCapabilityPortFactory {
     trajectory_observer: Option<Arc<dyn CapabilityTrajectoryObserver>>,
     gate_record_store: Arc<dyn GateRecordStore>,
     replay_payload_store: Arc<dyn ReplayPayloadStore>,
+    /// Factory 级共享 provider tool-call input store(2026-08-24 天权修复):
+    /// run 挂起恢复会重建 port,resume 后对旧 digest ref 的解析若落在 per-port
+    /// 空 map 上必炸 scope_mismatch;共享句柄跨 port 重建存活。同 2da22c1fc
+    /// 对 spawn_authorizations 的迁移论证。
+    provider_input_store: ProviderToolCallInputStore,
 }
 
 impl HostRuntimeLoopCapabilityPortFactory {
@@ -631,6 +648,7 @@ impl HostRuntimeLoopCapabilityPortFactory {
             // gate/auth resume that must reconstitute its replay input fails closed
             // (sanitized terminal failure) rather than dispatching empty input.
             replay_payload_store: Arc::new(NoopReplayPayloadStore),
+            provider_input_store: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -682,13 +700,14 @@ impl HostRuntimeLoopCapabilityPortFactory {
     }
 
     fn port_for_run_context(&self, run_context: LoopRunContext) -> HostRuntimeLoopCapabilityPort {
-        HostRuntimeLoopCapabilityPort::new(
+        HostRuntimeLoopCapabilityPort::new_with_provider_input_store(
             Arc::clone(&self.runtime),
             run_context,
             self.visible_request.clone(),
             Arc::clone(&self.input_resolver),
             Arc::clone(&self.result_writer),
             Arc::clone(&self.milestone_sink),
+            Some(Arc::clone(&self.provider_input_store)),
         )
         .with_gate_record_store(Arc::clone(&self.gate_record_store))
         .with_replay_payload_store(Arc::clone(&self.replay_payload_store))
@@ -1138,8 +1157,35 @@ impl HostRuntimeLoopCapabilityPort {
         result_writer: Arc<dyn LoopCapabilityResultWriter>,
         milestone_sink: Arc<dyn LoopHostMilestoneSink>,
     ) -> Self {
-        let input_resolver: Arc<dyn LoopCapabilityInputResolver> =
-            Arc::new(ProviderToolCallInputResolver::new(input_resolver));
+        Self::new_with_provider_input_store(
+            runtime,
+            run_context,
+            visible_request,
+            input_resolver,
+            result_writer,
+            milestone_sink,
+            None,
+        )
+    }
+
+    /// 同 [`Self::new`],但可注入 factory 共享的 provider tool-call input store。
+    /// factory(`port_for_run_context`)传共享 store,保证 run 挂起恢复重建 port 后
+    /// digest ref 仍可解析;直接构造路径(测试)不传=per-port 私有 store,行为不变。
+    #[allow(clippy::too_many_arguments)] // 与 new 同构+store 注入,拆参数组反而遮蔽对称性
+    fn new_with_provider_input_store(
+        runtime: Arc<dyn HostRuntime>,
+        run_context: LoopRunContext,
+        visible_request: ironclaw_host_runtime::VisibleCapabilityRequest,
+        input_resolver: Arc<dyn LoopCapabilityInputResolver>,
+        result_writer: Arc<dyn LoopCapabilityResultWriter>,
+        milestone_sink: Arc<dyn LoopHostMilestoneSink>,
+        provider_input_store: Option<ProviderToolCallInputStore>,
+    ) -> Self {
+        let resolver_store =
+            provider_input_store.unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
+        let input_resolver: Arc<dyn LoopCapabilityInputResolver> = Arc::new(
+            ProviderToolCallInputResolver::with_store(input_resolver, resolver_store),
+        );
         Self {
             runtime,
             run_context,
@@ -5349,7 +5395,10 @@ mod tests {
     #[tokio::test]
     async fn provider_tool_call_input_resolver_stages_arguments() {
         let run_context = loop_run_context(&execution_context("thread-provider-input")).await;
-        let resolver = ProviderToolCallInputResolver::new(Arc::new(FallbackInputResolver));
+        let resolver = ProviderToolCallInputResolver::with_store(
+            Arc::new(FallbackInputResolver),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
         let call = provider_tool_call();
 
         let input_ref = resolver
@@ -5375,7 +5424,10 @@ mod tests {
     async fn provider_tool_call_input_resolver_forwards_display_input_hook_with_capability_id() {
         let run_context = loop_run_context(&execution_context("thread-display-input")).await;
         let inner = Arc::new(DisplayInputRecordingResolver::default());
-        let resolver = ProviderToolCallInputResolver::new(inner.clone());
+        let resolver = ProviderToolCallInputResolver::with_store(
+            inner.clone(),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
         let call = provider_tool_call();
         let input_ref = provider_tool_call_input_ref(&run_context, &call).expect("ref");
         let capability_id = CapabilityId::new("nearai.web_search").expect("capability id");

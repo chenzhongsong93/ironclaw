@@ -1166,15 +1166,71 @@ impl CompletionStreamSink for ProviderStreamSink {
     }
 }
 
-#[tracing::instrument(
-    level = "debug",
-    skip(provider, completion, capabilities, stream_sink, replay_identity, cache_scope),
-    fields(
-        provider_id = %replay_identity.provider_id,
-        provider_model_id = %replay_identity.provider_model_id,
-        provider_turn_scope = provider_turn_scope.as_deref().unwrap_or("model_call=unknown"),
-    )
-)]
+/// 可观测性切片 1(2026-08-26):模型交换全文按 run 落 trace 文件。
+/// provider_turn_scope 形如 run=.../turn=.../model_call=n;request 事件在
+/// dispatch 前写(克隆序列化),response 事件在两个返回点旁写。best-effort。
+fn trace_model_request_event(
+    provider_turn_scope: Option<&str>,
+    provider_id: &str,
+    completion: &CompletionRequest,
+) {
+    use ironclaw_common::run_trace::append_trace_event;
+    let (run, turn) = parse_provider_turn_scope(provider_turn_scope);
+    let messages = serde_json::to_value(&completion.messages).unwrap_or(serde_json::json!([]));
+    append_trace_event(
+        "model_request",
+        &run,
+        None,
+        turn.as_deref(),
+        serde_json::json!({
+            "provider_id": provider_id,
+            "model": completion.model,
+            "messages": messages,
+            "max_tokens": completion.max_tokens,
+        }),
+    );
+}
+
+fn trace_model_response_event(
+    provider_turn_scope: Option<&str>,
+    provider_id: &str,
+    finish_reason: serde_json::Value,
+    content: &serde_json::Value,
+    tool_calls: serde_json::Value,
+) {
+    use ironclaw_common::run_trace::append_trace_event;
+    let (run, turn) = parse_provider_turn_scope(provider_turn_scope);
+    append_trace_event(
+        "model_response",
+        &run,
+        None,
+        turn.as_deref(),
+        serde_json::json!({
+            "provider_id": provider_id,
+            "finish_reason": finish_reason,
+            "content": content,
+            "tool_calls": tool_calls,
+        }),
+    );
+}
+
+fn parse_provider_turn_scope(scope: Option<&str>) -> (String, Option<String>) {
+    let Some(scope) = scope else {
+        return ("unknown-run".to_string(), None);
+    };
+    let mut run = "unknown-run".to_string();
+    let mut turn = None;
+    for line in scope.lines() {
+        if let Some(v) = line.strip_prefix("run=") {
+            run = v.to_string();
+        }
+        if let Some(v) = line.strip_prefix("turn=") {
+            turn = Some(v.to_string());
+        }
+    }
+    (run, turn)
+}
+
 async fn complete_model_request<P>(
     provider: &P,
     completion: CompletionRequest,
@@ -1188,6 +1244,11 @@ where
     P: LlmProvider + ?Sized,
 {
     let system_prompt_hash = system_prompt_cache_signature(&completion.messages);
+    trace_model_request_event(
+        provider_turn_scope.as_deref(),
+        &replay_identity.provider_id,
+        &completion,
+    );
     if let Some(capabilities) = capabilities {
         let tool_definitions = capabilities
             .tool_definitions()
@@ -1435,6 +1496,13 @@ where
         content_bytes = response.content.len(),
         "reborn model gateway received text-only provider response"
     );
+    trace_model_response_event(
+        provider_turn_scope.as_deref(),
+        &replay_identity.provider_id,
+        serde_json::json!(format!("{:?}", response.finish_reason)),
+        &serde_json::to_value(&response.content).unwrap_or(serde_json::json!(null)),
+        serde_json::json!([]),
+    );
     response_to_host_reply(response)
 }
 
@@ -1543,6 +1611,17 @@ async fn tool_response_to_host(
             tool_call_name_sample = ?tool_call_name_sample,
             content_bytes = response.content.as_ref().map(|content| content.len()).unwrap_or(0),
             "reborn model gateway received tool-capable provider response"
+        );
+        trace_model_response_event(
+            Some(provider_turn_scope),
+            &replay_identity.provider_id,
+            serde_json::json!(format!("{:?}", response.finish_reason)),
+            &response
+                .content
+                .as_ref()
+                .and_then(|c| serde_json::to_value(c).ok())
+                .unwrap_or(serde_json::json!(null)),
+            serde_json::to_value(&response.tool_calls).unwrap_or(serde_json::json!([])),
         );
     }
     if !response.tool_calls.is_empty()

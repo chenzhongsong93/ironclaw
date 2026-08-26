@@ -14,6 +14,7 @@ pub mod paths;
 pub mod pkce;
 mod platform;
 pub mod provider_transcript;
+pub mod run_trace;
 mod timezone;
 #[allow(dead_code)] // Trust-boundary scaffolding for the Reborn architecture; not yet consumed.
 mod trust_boundary;

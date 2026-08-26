@@ -310,6 +310,25 @@ where
         };
 
         debug!("capability dispatch starting");
+        // 天权 trace exporter(切片 1):工具调用入参全文落档(schema 真源=天权仓)
+        {
+            use ironclaw_common::run_trace::append_trace_event;
+            let thread_id_str = scope.thread_id.as_ref().map(|t| t.to_string());
+            append_trace_event(
+                "tool_request",
+                &request
+                    .context
+                    .run_id
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "non-loop".to_string()),
+                thread_id_str.as_deref(),
+                None,
+                serde_json::json!({
+                    "capability_id": request.capability_id.as_str(),
+                    "input": request.input,
+                }),
+            );
+        }
         let dispatch = match self
             .dispatcher
             .dispatch_json(CapabilityDispatchRequest {
@@ -330,6 +349,26 @@ where
                     runtime = ?dispatch.runtime,
                     "capability dispatch completed"
                 );
+                // 天权 trace exporter:工具调用出参全文落档
+                {
+                    use ironclaw_common::run_trace::append_trace_event;
+                    let thread_id_str = scope.thread_id.as_ref().map(|t| t.to_string());
+                    append_trace_event(
+                        "tool_response",
+                        &request
+                            .context
+                            .run_id
+                            .map(|r| r.to_string())
+                            .unwrap_or_else(|| "non-loop".to_string()),
+                        thread_id_str.as_deref(),
+                        None,
+                        serde_json::json!({
+                            "capability_id": dispatch.capability_id.as_str(),
+                            "provider": dispatch.provider.as_str(),
+                            "output": dispatch.output,
+                        }),
+                    );
+                }
                 dispatch
             }
             Err(error) => {

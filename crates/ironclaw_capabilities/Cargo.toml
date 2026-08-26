@@ -9,6 +9,8 @@ layer = "kernel"
 
 [dependencies]
 async-trait = "0.1"
+# 天权 trace exporter 落档(切片 1;薄依赖,换平台时随 exporter 重写)
+ironclaw_common = { path = "../ironclaw_common" }
 # Slice-C `authorize()` derives the provisional `Authorized` witness deadline
 # (`Timestamp = chrono::DateTime<Utc>`) via `Utc::now() + Duration::minutes(5)`.
 chrono = "0.4"

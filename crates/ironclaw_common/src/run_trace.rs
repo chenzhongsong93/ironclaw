@@ -54,7 +54,7 @@ pub fn append_trace_event(
         "turn_id": turn_id,
         "data": data,
     });
-    let path = trace_root().join(sanitize_run_id(run_id));
+    let path = trace_root().join(format!("{}.jsonl", sanitize_run_id(run_id)));
     // create_dir_all 幂等(首次事件时建 traces/;已存在零开销)
     if let Err(e) = std::fs::create_dir_all(trace_root()) {
         tracing_stub_debug(format!("run trace mkdir failed: {e}"));

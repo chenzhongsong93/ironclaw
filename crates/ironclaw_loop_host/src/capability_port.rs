@@ -48,7 +48,8 @@ use self::provider_input::{
     prepare_provider_arguments_with_detail, schema_contains_external_ref,
 };
 use self::provider_validation::{
-    PROVIDER_TOOL_NAME_MAX_BYTES, validate_provider_arguments, validate_provider_tool_call,
+    PROVIDER_TOOL_NAME_MAX_BYTES, truncate_bytes_utf8, validate_provider_arguments,
+    validate_provider_tool_call,
 };
 use self::surface_snapshot::{
     RuntimeSurfaceCapabilitySnapshot, SurfaceCapabilitySnapshot, SurfaceSnapshot,
@@ -1639,7 +1640,28 @@ impl HostRuntimeLoopCapabilityPort {
         tool_call: &ProviderToolCall,
     ) -> Result<PreparedProviderToolCall, AgentLoopHostError> {
         self.validate_visible_request_scope()?;
-        validate_provider_tool_call(tool_call)?;
+        // 2026-08-27 天权修复:reasoning 超 16KB 先截断再校验——novelist 长思维链
+        // 实测必死(v2.2 spawn 285ac20c:exceeds 16384 bytes → InvalidInvocation 终死)。
+        // reasoning 是辅助元数据,截断不丢正文/工具参数;同构于 envelope 4096 修复。
+        let mut owned = tool_call.clone();
+        let limit = ironclaw_safety::PROVIDER_METADATA_TEXT_MAX_BYTES;
+        if owned
+            .response_reasoning
+            .as_deref()
+            .is_some_and(|r| r.len() > limit)
+        {
+            owned.response_reasoning = Some(provider_validation::truncate_bytes_utf8(
+                owned.response_reasoning.as_deref().unwrap_or(""),
+                limit,
+            ));
+        }
+        if owned.reasoning.as_deref().is_some_and(|r| r.len() > limit) {
+            owned.reasoning = Some(provider_validation::truncate_bytes_utf8(
+                owned.reasoning.as_deref().unwrap_or(""),
+                limit,
+            ));
+        }
+        validate_provider_tool_call(&owned)?;
         let provider_turn_id = tool_call.turn_id.clone().ok_or_else(|| {
             AgentLoopHostError::new(
                 AgentLoopHostErrorKind::InvalidInvocation,

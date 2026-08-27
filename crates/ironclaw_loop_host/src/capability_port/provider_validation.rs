@@ -11,6 +11,8 @@ pub(super) use ironclaw_safety::PROVIDER_TOOL_NAME_MAX_BYTES;
 pub(super) fn validate_provider_tool_call(
     tool_call: &ProviderToolCall,
 ) -> Result<(), AgentLoopHostError> {
+    // 2026-08-27 天权修复:reasoning 超限截断在调用侧(capability_port
+    // prepare_provider_tool_call,owned clone 后截断)——本函数保持纯校验。
     validate_provider_identity(&tool_call.provider_id, "provider id", 512)
         .map_err(invalid_invocation)?;
     validate_provider_identity(&tool_call.provider_model_id, "provider model id", 512)
@@ -54,6 +56,19 @@ pub(super) fn validate_provider_arguments(
     arguments: &serde_json::Value,
 ) -> Result<(), AgentLoopHostError> {
     validate_safety_provider_arguments(arguments).map_err(invalid_invocation)
+}
+
+/// UTF-8 边界安全截断(末尾省略标记)。
+pub(super) fn truncate_bytes_utf8(s: &str, max_bytes: usize) -> String {
+    let mut out = String::new();
+    for ch in s.chars() {
+        if out.len() + ch.len_utf8() > max_bytes.saturating_sub(3) {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
 }
 
 fn invalid_invocation(error: ProviderValidationError) -> AgentLoopHostError {

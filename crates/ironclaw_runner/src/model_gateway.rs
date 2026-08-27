@@ -1169,26 +1169,82 @@ impl CompletionStreamSink for ProviderStreamSink {
 /// 可观测性切片 1(2026-08-26):模型交换全文按 run 落 trace 文件。
 /// provider_turn_scope 形如 run=.../turn=.../model_call=n;request 事件在
 /// dispatch 前写(克隆序列化),response 事件在两个返回点旁写。best-effort。
+/// 增量记录(2026-08-27 冗余治理:实测 22 次请求 94% 消息重复,全量存单 run 15MB):
+/// 每个 (run,model_call 序号) 只存与上次的 diff——新增消息全文 + 历史前缀引用
+/// (`messages_base_n`:引用同 run 内第 n 次 model_request 的事件序号,dossier
+/// 端点按引用链重建完整视图)。system 与首条消息每 run 首次全量。
 fn trace_model_request_event(
     provider_turn_scope: Option<&str>,
     provider_id: &str,
     completion: &CompletionRequest,
 ) {
     use ironclaw_common::run_trace::append_trace_event;
+    use std::cell::RefCell;
+    thread_local! {
+        /// (run_id → 上次请求的完整 messages JSON)——同 run 增量对比用
+        static LAST_MESSAGES: RefCell<Vec<(String, serde_json::Value, u32)>> =
+            RefCell::new(Vec::new());
+    }
     let (run, turn) = parse_provider_turn_scope(provider_turn_scope);
-    let messages = serde_json::to_value(&completion.messages).unwrap_or(serde_json::json!([]));
-    append_trace_event(
-        "model_request",
-        &run,
-        None,
-        turn.as_deref(),
-        serde_json::json!({
-            "provider_id": provider_id,
-            "model": completion.model,
-            "messages": messages,
-            "max_tokens": completion.max_tokens,
-        }),
-    );
+    let all = serde_json::to_value(&completion.messages).unwrap_or(serde_json::json!([]));
+    let seq = LAST_MESSAGES.with(|lm| {
+        let mut lm = lm.borrow_mut();
+        let seq = lm.len() as u32 + 1;
+        if let Some((_, prev, _)) = lm.iter().rev().find(|(r, _, _)| r == &run) {
+            // 增量:找公共前缀长度
+            let prev_arr = prev.as_array().cloned().unwrap_or_default();
+            let cur_arr = all.as_array().cloned().unwrap_or_default();
+            let mut common = 0;
+            for (a, b) in prev_arr.iter().zip(cur_arr.iter()) {
+                if a == b {
+                    common += 1;
+                } else {
+                    break;
+                }
+            }
+            let new_msgs: Vec<_> = cur_arr[common.min(cur_arr.len())..].to_vec();
+            let (prefix_ref, prev_seq) = lm
+                .iter()
+                .rev()
+                .find(|(r, _, _)| r == &run)
+                .map(|(_, _, s)| (common > 0, *s))
+                .unwrap_or((false, 0));
+            append_trace_event(
+                "model_request",
+                &run,
+                None,
+                turn.as_deref(),
+                serde_json::json!({
+                    "provider_id": provider_id,
+                    "model": completion.model,
+                    "max_tokens": completion.max_tokens,
+                    // 引用:同 run 第 prev_seq 次请求的前 common 条为历史前缀
+                    "messages_base_seq": if prefix_ref { prev_seq } else { 0 },
+                    "messages_base_count": common,
+                    "new_messages": new_msgs,
+                }),
+            );
+        } else {
+            // 该 run 首次请求:全量
+            append_trace_event(
+                "model_request",
+                &run,
+                None,
+                turn.as_deref(),
+                serde_json::json!({
+                    "provider_id": provider_id,
+                    "model": completion.model,
+                    "max_tokens": completion.max_tokens,
+                    "messages_base_seq": 0,
+                    "messages_base_count": 0,
+                    "new_messages": all,
+                }),
+            );
+        }
+        lm.push((run.clone(), all, seq));
+        seq
+    });
+    let _ = seq;
 }
 
 fn trace_model_response_event(

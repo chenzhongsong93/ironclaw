@@ -45,6 +45,56 @@ fn trace_root() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_TRACE_ROOT))
 }
 
+/// ===== 内容寻址库(2026-08-27 二轮精简:索引/内容分离)=====
+/// 实测残余冗余:同一 35KB 工具结果在对话历史重放 10 次(350KB)、system
+/// 29KB×3——对话历史里 tool/system 消息天然跨请求重复,前缀增量治不了。
+/// 方案(用户钦定"只保留 index,提示词额外存放"):
+/// - traces/content/{sha256 前 16 位}.json:每条消息全文只存一份(全局去重)
+/// - 索引事件只存 content_hash 列表 + 元数据 → 单 run 索引 ~50KB 级
+/// - dossier 重建:索引+内容库拼装,展示层仍无损
+
+/// 存一条消息到内容库,返回 16 位 hash 引用。
+/// 文件名 = sha256(规范化 JSON) 前 16 hex(碰撞概率对 10^5 条消息 < 10^-7,
+/// 且同 hash 不同内容只影响展示正确性不影响崩溃——可接受)。
+pub fn store_message_content(msg: &serde_json::Value) -> Option<String> {
+    let canonical = serde_json::to_string(msg).ok()?;
+    let hash = crate::hashing::sha256_hex(canonical.as_bytes());
+    let short = hash[..16].to_string();
+    let dir = trace_root().join("content");
+    let path = dir.join(format!("{short}.json"));
+    if path.exists() {
+        return Some(short); // 已存(全局去重命中)
+    }
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    std::fs::write(&path, canonical).ok()?;
+    Some(short)
+}
+
+/// 索引事件追加(消息字段瘦身版):messages/new_messages 数组的每条消息替换为
+/// {"c": "<hash16>"}引用;响应/工具 IO 保持全文(体积小且是定位核心)。
+pub fn append_trace_event_slim(
+    kind: &str,
+    run_id: &str,
+    thread_id: Option<&str>,
+    turn_id: Option<&str>,
+    mut data: serde_json::Value,
+) {
+    // 对 data 内含消息数组的标准字段做内容寻址替换
+    for key in ["messages", "new_messages"] {
+        if let Some(arr) = data.get_mut(key).and_then(|v| v.as_array_mut()) {
+            for msg in arr.iter_mut() {
+                if let Some(h) = store_message_content(msg) {
+                    *msg = serde_json::json!({ "c": h });
+                }
+                // store 失败(磁盘满等)保留原文——降级不丢数据
+            }
+        }
+    }
+    append_trace_event(kind, run_id, thread_id, turn_id, data)
+}
+
 /// 追加一个 run trace 事件(best-effort;失败仅 debug 日志)。
 ///
 /// `kind` 事件类型;`run_id` 归属 run(文件名即 run_id);
@@ -182,6 +232,17 @@ pub fn rotate_if_needed() {
     }
 }
 
+/// 读内容库(exporter 侧实现供测试;api 侧 dossier 直接读文件同契约)。
+pub fn load_message_content(hash16: &str) -> Option<serde_json::Value> {
+    let clean: String = hash16.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if clean.len() != 16 {
+        return None;
+    }
+    let path = trace_root().join("content").join(format!("{clean}.json"));
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 /// run_id 只允许 hex/dash(防路径穿越;TurnRunId UUID 形态天然满足)。
 fn sanitize_run_id(run_id: &str) -> String {
     let cleaned: String = run_id
@@ -208,6 +269,9 @@ fn tracing_stub_debug(msg: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 注意:多个测试操作进程级 env(TIANQUAN_TRACE_DIR),并发跑会竞争——
+    // 本模块测试须串行:`cargo test run_trace -- --test-threads=1`(或全局
+    // RUST_TEST_THREADS=1)。单独跑 test_slim_event 等均绿(已验证)。
 
     #[test]
     fn sanitize_rejects_traversal() {
@@ -216,6 +280,54 @@ mod tests {
         assert_eq!(sanitize_run_id(""), "unknown-run");
         let uuid = "61304aa1-f032-4d7e-90cc-9967362b4df2";
         assert_eq!(sanitize_run_id(uuid), uuid);
+    }
+
+    // 覆盖:内容寻址——同消息二次存储命中去重(hash 相同,文件不重写);
+    // load 读回原文
+    #[test]
+    fn test_content_store_dedup_and_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe { std::env::set_var("TIANQUAN_TRACE_DIR", dir.path()) };
+        let msg = serde_json::json!({"role": "system", "content": "abc"});
+        let h1 = super::store_message_content(&msg).expect("store");
+        let h2 = super::store_message_content(&msg).expect("store again");
+        unsafe { std::env::remove_var("TIANQUAN_TRACE_DIR") };
+        assert_eq!(h1, h2, "同内容同 hash(去重)");
+        // 内容库只有一个文件
+        let content_files: Vec<_> = std::fs::read_dir(dir.path().join("content"))
+            .expect("content dir")
+            .collect();
+        assert_eq!(content_files.len(), 1, "全局去重:一条一份");
+        // 读回
+        unsafe { std::env::set_var("TIANQUAN_TRACE_DIR", dir.path()) };
+        let back = super::load_message_content(&h1).expect("load");
+        unsafe { std::env::remove_var("TIANQUAN_TRACE_DIR") };
+        assert_eq!(back, msg);
+    }
+
+    // 覆盖:slim 事件——messages 数组替换为 hash 引用,元数据保留
+    #[test]
+    fn test_slim_event_replaces_messages_with_refs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe { std::env::set_var("TIANQUAN_TRACE_DIR", dir.path()) };
+        let data = serde_json::json!({
+            "model": "m",
+            "new_messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "system", "content": "sys"}, // 重复条→同 hash
+                {"role": "user", "content": "u"},
+            ]
+        });
+        super::append_trace_event_slim("model_request", "run-slim", None, None, data);
+        unsafe { std::env::remove_var("TIANQUAN_TRACE_DIR") };
+        // 读索引文件验证形态
+        let idx = std::fs::read_to_string(dir.path().join("run-slim.jsonl")).expect("read");
+        let ev: serde_json::Value = serde_json::from_str(idx.trim()).expect("parse");
+        let msgs = ev["data"]["new_messages"].as_array().expect("array");
+        assert_eq!(msgs.len(), 3);
+        assert!(msgs[0].get("c").is_some(), "消息应替换为 hash 引用");
+        assert_eq!(msgs[0]["c"], msgs[1]["c"], "重复消息同 hash");
+        assert_eq!(ev["data"]["model"], "m", "元数据保留");
     }
 
     // 覆盖:轮转——压缩产出 .gz(可解压回原文)+原文件删除

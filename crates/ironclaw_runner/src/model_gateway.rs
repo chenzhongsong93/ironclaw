@@ -1178,7 +1178,7 @@ fn trace_model_request_event(
     provider_id: &str,
     completion: &CompletionRequest,
 ) {
-    use ironclaw_common::run_trace::append_trace_event;
+    use ironclaw_common::run_trace::append_trace_event_slim;
     use std::cell::RefCell;
     thread_local! {
         /// (run_id → 上次请求的完整 messages JSON)——同 run 增量对比用
@@ -1209,7 +1209,7 @@ fn trace_model_request_event(
                 .find(|(r, _, _)| r == &run)
                 .map(|(_, _, s)| (common > 0, *s))
                 .unwrap_or((false, 0));
-            append_trace_event(
+            append_trace_event_slim(
                 "model_request",
                 &run,
                 None,
@@ -1226,7 +1226,7 @@ fn trace_model_request_event(
             );
         } else {
             // 该 run 首次请求:全量
-            append_trace_event(
+            append_trace_event_slim(
                 "model_request",
                 &run,
                 None,

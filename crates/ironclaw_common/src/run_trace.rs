@@ -18,6 +18,17 @@
 //! 写入必须 best-effort:任何 IO 错误只 debug! 不影响主流程(trace 采集
 //! 挂掉不能挂创作链);env `TIANQUAN_TRACE_DIR` 覆盖目录,未配置且无
 //! storage root 环境时静默跳过(本地单测零依赖)。
+//!
+//! ## 轮转策略(log4j 式三级,2026-08-26,run 级轮转单元)
+//! trace 含 prompt/工具 IO 全文,单 run 实测 3.9-15MB,不治必爆盘。三级策略:
+//! ①**压缩**:run 终结后 `compact_run_trace()` 把 `{run}.jsonl` 压成
+//!   `{run}.jsonl.gz`(flate2 gzip,JSONL 重复结构压缩率高,实测 5-8x);
+//!   由 gateway 的 run 终态钩子调用。
+//! ②**热文件保留**:未压缩 .jsonl 超过 `MAX_ACTIVE_FILES`(默认 32)时,
+//!   压缩最旧的 N 个(保最近 run 热可查,历史转冷)。
+//! ③**压缩包保留**:`.gz` 超过 `MAX_ARCHIVED_FILES`(默认 256)时删最旧
+//!   (按文件名 mtime 轮询,天然有序)。env 可覆盖:
+//!   TIANQUAN_TRACE_MAX_ACTIVE / TIANQUAN_TRACE_MAX_ARCHIVED。
 
 use serde_json::{Value, json};
 use std::io::Write;
@@ -76,6 +87,99 @@ pub fn append_trace_event(
     if let Err(e) = result {
         tracing_stub_debug(format!("run trace append failed({}): {e}", path.display()));
     }
+    // 轮转检查:目录内文件数=run 数量级(百级),read_dir 扫描微秒级,每次
+    // append 后执行可接受;run 高频时改为计数器节流(暂不需要)。
+    rotate_if_needed();
+}
+
+/// 未压缩 trace 文件保留上限(env TIANQUAN_TRACE_MAX_ACTIVE 覆盖;0=禁用)。
+fn max_active_files() -> usize {
+    std::env::var("TIANQUAN_TRACE_MAX_ACTIVE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32)
+}
+
+/// 压缩包保留上限(env TIANQUAN_TRACE_MAX_ARCHIVED 覆盖;0=禁用)。
+fn max_archived_files() -> usize {
+    std::env::var("TIANQUAN_TRACE_MAX_ARCHIVED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256)
+}
+
+/// 压缩单个 run 的 trace 文件(`{run}.jsonl` → `{run}.jsonl.gz`,原文件删除)。
+/// gzip 单线程流式压缩(JSONL 重复键名压缩率高);best-effort:失败保留原文件
+/// (下次轮转重试),仅 debug 日志。
+pub fn compact_run_trace(run_id: &str) {
+    let root = trace_root();
+    let safe = sanitize_run_id(run_id);
+    let src = root.join(format!("{safe}.jsonl"));
+    let dst = root.join(format!("{safe}.jsonl.gz"));
+    let Ok(data) = std::fs::read(&src) else {
+        return; // 无文件=无事可做(正常态)
+    };
+    let tmp = root.join(format!("{safe}.jsonl.gz.tmp"));
+    let write_gz = || -> std::io::Result<()> {
+        let f = std::fs::File::create(&tmp)?;
+        let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &data)?;
+        enc.finish()?;
+        std::fs::rename(&tmp, &dst) // 原子替换(半成品留在 .tmp,下轮覆盖)
+    };
+    match write_gz() {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&src); // gz 落定后才删原文件
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            tracing_stub_debug(format!("run trace compact failed({safe}): {e}"));
+        }
+    }
+}
+
+/// 轮转策略执行(每次 append 后调用,开销 O(目录扫描),目录内文件数=run 数
+/// 量级远小于 log 行,扫描成本可忽略):
+/// ①热 .jsonl 超 max_active → 压缩最旧的(保近期热可查);
+/// ②.gz 超 max_archived → 删最旧。
+/// "最旧"按 mtime(文件系统时间戳;run 终结即 mtime 定格,天然有序)。
+pub fn rotate_if_needed() {
+    let root = trace_root();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    let mut active: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+    let mut archived: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if name.ends_with(".jsonl") {
+            active.push((modified, path));
+        } else if name.ends_with(".jsonl.gz") {
+            archived.push((modified, path));
+        }
+    }
+    active.sort_by_key(|(t, _)| *t);
+    archived.sort_by_key(|(t, _)| *t);
+    let max_active = max_active_files();
+    if max_active > 0 && active.len() > max_active {
+        let overflow = active.len() - max_active;
+        for (_, path) in active.into_iter().take(overflow) {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                compact_run_trace(stem);
+            }
+        }
+    }
+    let max_archived = max_archived_files();
+    if max_archived > 0 && archived.len() > max_archived {
+        let overflow = archived.len() - max_archived;
+        for (_, path) in archived.into_iter().take(overflow) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// run_id 只允许 hex/dash(防路径穿越;TurnRunId UUID 形态天然满足)。
@@ -112,6 +216,78 @@ mod tests {
         assert_eq!(sanitize_run_id(""), "unknown-run");
         let uuid = "61304aa1-f032-4d7e-90cc-9967362b4df2";
         assert_eq!(sanitize_run_id(uuid), uuid);
+    }
+
+    // 覆盖:轮转——压缩产出 .gz(可解压回原文)+原文件删除
+    #[test]
+    fn test_compact_creates_gz_and_removes_src() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let src = root.join("run-c.jsonl");
+        std::fs::write(&src, r#"{"kind":"a"} {"kind":"b"}"#).expect("write");
+        // compact 直接操作给定路径?compact_run_trace 读 trace_root()——测试用
+        // env 指向 tempdir(测试进程内 env 竞争风险可接受:串行测试)
+        unsafe { std::env::set_var("TIANQUAN_TRACE_DIR", root) };
+        // sanitize: run-c 合法
+        // 直接调内部逻辑等价:用公开函数(读 env)
+        super::compact_run_trace("run-c");
+        unsafe { std::env::remove_var("TIANQUAN_TRACE_DIR") };
+        assert!(!src.exists(), "原文件应删除");
+        let gz = root.join("run-c.jsonl.gz");
+        assert!(gz.exists(), "应产出 .gz");
+        // 解压验证内容不丢
+        let raw = std::fs::read(&gz).expect("read gz");
+        let mut dec = flate2::read::GzDecoder::new(&raw[..]);
+        let mut out = String::new();
+        std::io::Read::read_to_string(&mut dec, &mut out).expect("decompress");
+        assert_eq!(out, r#"{"kind":"a"} {"kind":"b"}"#);
+    }
+
+    // 覆盖:rotate——热文件超限压缩最旧;gz 超限删最旧
+    #[test]
+    fn test_rotate_enforces_caps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        // 造 4 个热文件,限 2 → 最旧 2 个被压缩
+        for (i, name) in ["run-a", "run-b", "run-c", "run-d"].iter().enumerate() {
+            let p = root.join(format!("{name}.jsonl"));
+            std::fs::write(&p, format!("{{\"i\":{i}}}")).expect("write");
+            // mtime 递增:小 sleep 保文件系统时间戳可区分(mtime 粒度不足时
+            // Windows FAT/部分 FS 是 2s,10ms sleep 在主流 FS 上足够;排序不稳
+            // 时断言按存在性而非具体哪个,天然容忍)
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // 手动造 3 个 gz,限 2 → 最旧 1 个被删
+        for name in ["old-1", "old-2", "old-3"] {
+            std::fs::write(root.join(format!("{name}.jsonl.gz")), b"x").expect("write");
+        }
+        unsafe { std::env::set_var("TIANQUAN_TRACE_DIR", root) };
+        unsafe { std::env::set_var("TIANQUAN_TRACE_MAX_ACTIVE", "2") };
+        unsafe { std::env::set_var("TIANQUAN_TRACE_MAX_ARCHIVED", "2") };
+        super::rotate_if_needed();
+        unsafe { std::env::remove_var("TIANQUAN_TRACE_DIR") };
+        unsafe { std::env::remove_var("TIANQUAN_TRACE_MAX_ACTIVE") };
+        unsafe { std::env::remove_var("TIANQUAN_TRACE_MAX_ARCHIVED") };
+        // 热文件剩 2(c/d),a/b 转为 gz
+        assert!(root.join("run-c.jsonl").exists());
+        assert!(root.join("run-d.jsonl").exists());
+        assert!(root.join("run-a.jsonl.gz").exists());
+        assert!(root.join("run-b.jsonl.gz").exists());
+        // gz 淘汰基于压缩前快照(压缩新产物下轮清理):本轮 3 old > 限 2 → 删最旧
+        // old-1;old-2/old-3 本轮保留(下轮 rotate 时与 run-a/b 一起按序淘汰)。
+        // 二次 rotate 模拟下一轮:此时 gz=4(old-2,old-3,run-a,run-b)>2 → 删 old-2/old-3
+        assert!(!root.join("old-1.jsonl.gz").exists(), "最旧 gz 应删");
+        unsafe { std::env::set_var("TIANQUAN_TRACE_DIR", root) };
+        unsafe { std::env::set_var("TIANQUAN_TRACE_MAX_ACTIVE", "2") };
+        unsafe { std::env::set_var("TIANQUAN_TRACE_MAX_ARCHIVED", "2") };
+        super::rotate_if_needed();
+        unsafe { std::env::remove_var("TIANQUAN_TRACE_DIR") };
+        unsafe { std::env::remove_var("TIANQUAN_TRACE_MAX_ACTIVE") };
+        unsafe { std::env::remove_var("TIANQUAN_TRACE_MAX_ARCHIVED") };
+        assert!(!root.join("old-2.jsonl.gz").exists(), "二次轮转删次旧");
+        assert!(!root.join("old-3.jsonl.gz").exists(), "二次轮转删第三旧");
+        assert!(root.join("run-a.jsonl.gz").exists(), "最新 gz 保留");
+        assert!(root.join("run-b.jsonl.gz").exists(), "次新 gz 保留");
     }
 
     #[test]

@@ -415,6 +415,9 @@ impl RebornTurnRunExecutor {
                     status = ?state.status,
                     "loop exit applied successfully"
                 );
+                // run 终态:压缩该 run 的 trace 档案(log4j 式轮转第①级,
+                // 契约=天权仓 trace-schema-v1;best-effort 不影响终态)
+                ironclaw_common::run_trace::compact_run_trace(&run_id.to_string());
                 Ok(())
             }
             Err(err) => {

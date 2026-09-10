@@ -37,6 +37,25 @@ const DELTA_JOURNAL_FLUSH_COALESCE_DELAY: Duration = Duration::from_micros(500);
 const DELTA_JOURNAL_MATERIALIZE_IDLE_DELAY: Duration = Duration::from_millis(25);
 const MATERIALIZED_ROW_CAS_RETRIES: usize = 16;
 
+/// Backend contention (`FilesystemError::BackendBusy`) never commits the
+/// attempted append (the backend contract for the event plane is
+/// all-or-nothing), so retrying the identical batch cannot create a durable
+/// gap. The flusher retries busy appends with exponential backoff BEFORE
+/// latching the store degraded: a single transient contention window must not
+/// permanently wedge the whole turn engine (TianQuan ISSUE-IRONCLAW-002 — two
+/// production incidents where one busy append halted every subsequent
+/// mutation until a manual restart).
+const DELTA_JOURNAL_BUSY_RETRY_MAX_ATTEMPTS: u32 = 5;
+const DELTA_JOURNAL_BUSY_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+const DELTA_JOURNAL_BUSY_RETRY_MAX_DELAY: Duration = Duration::from_millis(1600);
+
+fn busy_backoff_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(4);
+    DELTA_JOURNAL_BUSY_RETRY_BASE_DELAY
+        .saturating_mul(1u32 << shift)
+        .min(DELTA_JOURNAL_BUSY_RETRY_MAX_DELAY)
+}
+
 pub(super) type DeltaAck = oneshot::Receiver<Result<(), TurnError>>;
 
 pub(super) struct DeltaJournal {
@@ -154,7 +173,30 @@ async fn run_delta_journal_flusher<F>(
                 }
             }
         }
-        let result = append_delta_journal_batch(filesystem.as_ref(), &requests).await;
+        let mut busy_attempt: u32 = 0;
+        let result = loop {
+            match append_delta_journal_batch(filesystem.as_ref(), &requests).await {
+                Ok(seqs) => break Ok(seqs),
+                Err(failure)
+                    if failure.retryable_busy
+                        && busy_attempt < DELTA_JOURNAL_BUSY_RETRY_MAX_ATTEMPTS =>
+                {
+                    busy_attempt += 1;
+                    let delay = busy_backoff_delay(busy_attempt);
+                    tracing::warn!(
+                        attempt = busy_attempt,
+                        max_attempts = DELTA_JOURNAL_BUSY_RETRY_MAX_ATTEMPTS,
+                        delay_ms = delay.as_millis() as u64,
+                        batch_len = requests.len(),
+                        "delta journal append hit retryable backend contention; \
+                         retrying the identical batch (busy appends never commit, \
+                         so no durable gap is possible)",
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(failure) => break Err(failure),
+            }
+        };
         match result {
             Ok(seqs) => {
                 let target_seq = seqs.iter().copied().max();
@@ -165,9 +207,9 @@ async fn run_delta_journal_flusher<F>(
                     let _ = materialize_sender.send(target_seq);
                 }
             }
-            Err(error) => {
+            Err(failure) => {
                 for request in requests {
-                    let _ = request.ack.send(Err(error.clone()));
+                    let _ = request.ack.send(Err(failure.error.clone()));
                 }
                 // Append-failure HALT. A non-critical op already returned `Ok`
                 // to its caller when it enqueued, so CONTINUING to the next
@@ -214,19 +256,44 @@ async fn run_delta_journal_materializer<F>(
     }
 }
 
+/// Why a delta-journal batch append failed, plus whether the flusher may
+/// safely retry the identical batch.
+struct JournalAppendFailure {
+    error: TurnError,
+    /// `true` only for [`FilesystemError::BackendBusy`]: the backend reported
+    /// retryable contention and did NOT commit the batch, so retrying cannot
+    /// create a durable gap. Every other failure keeps the conservative
+    /// halt-and-degrade behavior (its commit status is unknown).
+    retryable_busy: bool,
+}
+
+fn journal_append_failure(error: FilesystemError) -> JournalAppendFailure {
+    let retryable_busy = matches!(error, FilesystemError::BackendBusy { .. });
+    JournalAppendFailure {
+        error: fs_error(error),
+        retryable_busy,
+    }
+}
+
 async fn append_delta_journal_batch<F>(
     filesystem: &ScopedFilesystem<F>,
     requests: &[DeltaJournalRequest],
-) -> Result<Vec<SeqNo>, TurnError>
+) -> Result<Vec<SeqNo>, JournalAppendFailure>
 where
     F: RootFilesystem,
 {
-    let path = delta_log_path()?;
+    let path = delta_log_path().map_err(|error| JournalAppendFailure {
+        error,
+        retryable_busy: false,
+    })?;
     let mut payloads = Vec::with_capacity(requests.len());
     for request in requests {
         payloads.push(serde_json::to_vec(&request.delta).map_err(|error| {
-            TurnError::Unavailable {
-                reason: format!("turn-state delta serialization failed: {error}"),
+            JournalAppendFailure {
+                error: TurnError::Unavailable {
+                    reason: format!("turn-state delta serialization failed: {error}"),
+                },
+                retryable_busy: false,
             }
         })?);
     }
@@ -235,17 +302,21 @@ where
             filesystem
                 .append(&ResourceScope::system(), &path, payload.clone())
                 .await
-                .map_err(fs_error)?,
+                .map_err(journal_append_failure)?,
         ]
     } else {
         filesystem
             .append_batch(&ResourceScope::system(), &path, payloads)
             .await
-            .map_err(fs_error)?
+            .map_err(journal_append_failure)?
     };
     if seqs.len() != requests.len() {
-        return Err(TurnError::Unavailable {
-            reason: "turn-state delta batch append returned an unexpected ack count".to_string(),
+        return Err(JournalAppendFailure {
+            error: TurnError::Unavailable {
+                reason: "turn-state delta batch append returned an unexpected ack count"
+                    .to_string(),
+            },
+            retryable_busy: false,
         });
     }
     Ok(seqs)
@@ -612,9 +683,15 @@ fn delta_journal_halted() -> TurnError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
-    use ironclaw_filesystem::{InMemoryBackend, ScopedFilesystem};
+    use ironclaw_filesystem::{
+        BackendCapabilities, DirEntry, EventRecord, FileStat, FilesystemOperation, InMemoryBackend,
+        RecordVersion, ScopedFilesystem, VersionedEntry,
+    };
     use ironclaw_host_api::{MountAlias, MountGrant, MountPermissions, MountView, VirtualPath};
     use serde::{Deserialize, Serialize};
 
@@ -714,5 +791,275 @@ mod tests {
             .await
             .expect("write newer tombstone");
         assert_eq!(read_test_row(&filesystem, "row").await, None);
+    }
+
+    // ─── Busy-append retry behavior (ISSUE-IRONCLAW-002) ─────────────────────
+
+    /// Event-plane fault injection over the in-memory backend. Injected
+    /// appends fail WITHOUT committing, mirroring the real
+    /// [`FilesystemError::BackendBusy`] contract, so the journal's retry and
+    /// halt paths can be driven deterministically.
+    enum AppendInjection {
+        /// The first N appends report retryable busy contention.
+        BusyTimes(usize),
+        /// Every append reports retryable busy contention.
+        BusyForever,
+        /// Every append fails with a hard backend error.
+        BackendErrorForever,
+    }
+
+    struct InjectingAppendBackend {
+        inner: Arc<InMemoryBackend>,
+        injection: AppendInjection,
+        remaining_busy: AtomicUsize,
+    }
+
+    impl InjectingAppendBackend {
+        fn new(injection: AppendInjection) -> Arc<Self> {
+            let remaining_busy = match &injection {
+                AppendInjection::BusyTimes(count) => *count,
+                _ => usize::MAX,
+            };
+            Arc::new(Self {
+                inner: Arc::new(InMemoryBackend::new()),
+                injection,
+                remaining_busy: AtomicUsize::new(remaining_busy),
+            })
+        }
+
+        fn injected_error(&self, path: &VirtualPath) -> Option<FilesystemError> {
+            match &self.injection {
+                AppendInjection::BusyTimes(_) => {
+                    let current = self.remaining_busy.load(Ordering::SeqCst);
+                    if current == 0 {
+                        None
+                    } else {
+                        self.remaining_busy.store(current - 1, Ordering::SeqCst);
+                        Some(FilesystemError::BackendBusy {
+                            path: path.clone(),
+                            operation: FilesystemOperation::Append,
+                        })
+                    }
+                }
+                AppendInjection::BusyForever => Some(FilesystemError::BackendBusy {
+                    path: path.clone(),
+                    operation: FilesystemOperation::Append,
+                }),
+                AppendInjection::BackendErrorForever => Some(FilesystemError::Backend {
+                    path: path.clone(),
+                    operation: FilesystemOperation::Append,
+                    reason: "simulated permanent append failure".to_string(),
+                }),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RootFilesystem for InjectingAppendBackend {
+        fn capabilities(&self) -> BackendCapabilities {
+            self.inner.capabilities()
+        }
+
+        async fn put(
+            &self,
+            path: &VirtualPath,
+            entry: Entry,
+            cas: CasExpectation,
+        ) -> Result<RecordVersion, FilesystemError> {
+            self.inner.put(path, entry, cas).await
+        }
+
+        async fn get(&self, path: &VirtualPath) -> Result<Option<VersionedEntry>, FilesystemError> {
+            self.inner.get(path).await
+        }
+
+        async fn list_dir(&self, path: &VirtualPath) -> Result<Vec<DirEntry>, FilesystemError> {
+            self.inner.list_dir(path).await
+        }
+
+        async fn list_dir_bounded(
+            &self,
+            path: &VirtualPath,
+            max_entries: usize,
+        ) -> Result<Vec<DirEntry>, FilesystemError> {
+            self.inner.list_dir_bounded(path, max_entries).await
+        }
+
+        async fn stat(&self, path: &VirtualPath) -> Result<FileStat, FilesystemError> {
+            self.inner.stat(path).await
+        }
+
+        async fn delete(&self, path: &VirtualPath) -> Result<(), FilesystemError> {
+            self.inner.delete(path).await
+        }
+
+        async fn append(
+            &self,
+            path: &VirtualPath,
+            payload: Vec<u8>,
+        ) -> Result<SeqNo, FilesystemError> {
+            if let Some(error) = self.injected_error(path) {
+                return Err(error);
+            }
+            self.inner.append(path, payload).await
+        }
+
+        async fn append_batch(
+            &self,
+            path: &VirtualPath,
+            payloads: Vec<Vec<u8>>,
+        ) -> Result<Vec<SeqNo>, FilesystemError> {
+            if let Some(error) = self.injected_error(path) {
+                return Err(error);
+            }
+            self.inner.append_batch(path, payloads).await
+        }
+
+        async fn tail(
+            &self,
+            path: &VirtualPath,
+            from: SeqNo,
+        ) -> Result<Vec<EventRecord>, FilesystemError> {
+            self.inner.tail(path, from).await
+        }
+
+        async fn tail_bounded(
+            &self,
+            path: &VirtualPath,
+            from: SeqNo,
+            max_records: usize,
+        ) -> Result<Vec<EventRecord>, FilesystemError> {
+            self.inner.tail_bounded(path, from, max_records).await
+        }
+
+        async fn reserve_sequence(&self, path: &VirtualPath) -> Result<SeqNo, FilesystemError> {
+            self.inner.reserve_sequence(path).await
+        }
+    }
+
+    fn non_empty_delta(tag: &str) -> SnapshotDelta {
+        let mut delta = SnapshotDelta::default();
+        delta.turns_delete.push(format!("turn/{tag}"));
+        delta
+    }
+
+    fn journal_over(
+        backend: Arc<InjectingAppendBackend>,
+    ) -> (Arc<ScopedFilesystem<InjectingAppendBackend>>, DeltaJournal) {
+        let mounts = MountView::new(vec![MountGrant::new(
+            MountAlias::new("/turns").expect("create turns mount alias"),
+            VirtualPath::new("/turns").expect("create turns virtual path"),
+            MountPermissions::read_write_list_delete(),
+        )])
+        .expect("create turns mount view");
+        let filesystem = Arc::new(ScopedFilesystem::with_fixed_view(backend, mounts));
+        let journal = DeltaJournal::new(Arc::clone(&filesystem), Arc::new(AsyncMutex::new(())));
+        (filesystem, journal)
+    }
+
+    async fn durable_delta_records(
+        filesystem: &ScopedFilesystem<InjectingAppendBackend>,
+    ) -> Vec<EventRecord> {
+        filesystem
+            .tail_bounded(
+                &ResourceScope::system(),
+                &delta_log_path().expect("delta log path"),
+                SeqNo::from_backend(0),
+                usize::MAX,
+            )
+            .await
+            .expect("tail durable delta log")
+    }
+
+    #[tokio::test]
+    async fn busy_append_retries_identical_batch_without_degrading() {
+        // Two transient busy appends must be absorbed by retry: acks succeed,
+        // the store never degrades, and the durable log carries both deltas
+        // exactly once in order (busy appends never commit, so the retried
+        // batch cannot duplicate or leave a gap).
+        let backend = InjectingAppendBackend::new(AppendInjection::BusyTimes(2));
+        let (filesystem, journal) = journal_over(Arc::clone(&backend));
+
+        let ack = journal
+            .enqueue(non_empty_delta("one"))
+            .expect("enqueue first delta")
+            .expect("non-empty delta yields an ack");
+        DeltaJournal::await_ack(Some(ack))
+            .await
+            .expect("first delta acked after busy retries");
+        assert!(!journal.is_degraded());
+
+        let ack = journal
+            .enqueue(non_empty_delta("two"))
+            .expect("enqueue second delta")
+            .expect("non-empty delta yields an ack");
+        DeltaJournal::await_ack(Some(ack))
+            .await
+            .expect("second delta acked without contention");
+        assert!(!journal.is_degraded());
+
+        let records = durable_delta_records(filesystem.as_ref()).await;
+        assert_eq!(records.len(), 2, "both deltas durable exactly once");
+        let first = String::from_utf8(records[0].payload.clone()).expect("utf8 delta");
+        let second = String::from_utf8(records[1].payload.clone()).expect("utf8 delta");
+        assert!(first.contains("turn/one"), "first delta in order: {first}");
+        assert!(
+            second.contains("turn/two"),
+            "second delta in order: {second}"
+        );
+        assert_eq!(
+            backend.remaining_busy.load(Ordering::SeqCst),
+            0,
+            "both busy tickets consumed"
+        );
+        drop(journal);
+    }
+
+    #[tokio::test]
+    async fn busy_append_retry_exhaustion_still_degrades_and_halts() {
+        // Persistent contention beyond the retry budget keeps the
+        // conservative halt: acks fail retryably and the store latches
+        // degraded instead of appending behind an unknown commit state.
+        let (_filesystem, journal) =
+            journal_over(InjectingAppendBackend::new(AppendInjection::BusyForever));
+
+        let ack = journal
+            .enqueue(non_empty_delta("stuck"))
+            .expect("enqueue delta")
+            .expect("non-empty delta yields an ack");
+        let result = DeltaJournal::await_ack(Some(ack)).await;
+        assert!(result.is_err(), "exhausted busy retries must fail the ack");
+        assert!(
+            journal.is_degraded(),
+            "store must latch degraded after budget"
+        );
+        drop(journal);
+    }
+
+    #[tokio::test]
+    async fn permanent_backend_error_halts_without_retry() {
+        // A hard backend error is not busy-class: no retry, immediate halt —
+        // the pre-existing conservative behavior is preserved.
+        let (filesystem, journal) = journal_over(InjectingAppendBackend::new(
+            AppendInjection::BackendErrorForever,
+        ));
+
+        let ack = journal
+            .enqueue(non_empty_delta("doomed"))
+            .expect("enqueue delta")
+            .expect("non-empty delta yields an ack");
+        let result = DeltaJournal::await_ack(Some(ack)).await;
+        assert!(
+            result.is_err(),
+            "permanent append failure must fail the ack"
+        );
+        assert!(
+            journal.is_degraded(),
+            "store must latch degraded immediately"
+        );
+
+        let records = durable_delta_records(filesystem.as_ref()).await;
+        assert!(records.is_empty(), "nothing durable for the failed batch");
+        drop(journal);
     }
 }

@@ -102,6 +102,10 @@ const THREAD_IDEMPOTENCY_KIND: &str = "thread_idempotency";
 const INDEXED_RANGE_MESSAGE_READ_CONCURRENCY: usize = 8;
 /// Conservative fan-out for per-thread title derivation during sidebar listing.
 const TITLE_DERIVATION_READ_CONCURRENCY: usize = 8;
+/// 标题推导按序列索引升序扫描的窗口大小(条)。聊天线程的第一条 user
+/// 消息几乎总在最前几条;窗口内未命中即停止深扫,列表热路径不为
+/// 奇异线程(前 16 条皆无 user 消息)付全量 transcript 物化成本。
+const TITLE_DERIVATION_SEQUENCE_WINDOW: u64 = 16;
 /// One-shot first-turn context windows are a hot-path handoff from inbound
 /// accept to prompt construction; keep the cache bounded if a turn never runs.
 const ONE_SHOT_CONTEXT_WINDOW_CACHE_MAX_ENTRIES: usize = 4096;
@@ -925,8 +929,40 @@ where
         &self,
         scope: &ThreadScope,
         thread_id: &ThreadId,
-        _next_sequence: u64,
     ) -> Result<Option<ThreadMessageRecord>, SessionThreadError> {
+        // 侧栏标题只需要第一条 user 消息。旧实现为推导一个标题全量物化整段
+        // transcript(长创作线程单线程数百条/数 MB),会话列表每次调用都对
+        // 页内全部无标题线程重跑,是列表接口恒定秒级的主因。
+        //
+        // 改为探测序列索引前缀:原生路径计数器的线程 record.next_sequence
+        // 恒为 1(见 reserve_sequence 注释),不能用作上界,因此直接并发读
+        // 序列索引 1..=WINDOW,遇空洞即停;再按序读消息体,命中第一条 user
+        // 即返回(真实聊天线程通常 1-2 次读)。窗口内无 user 消息不再深扫,
+        // 列表热路径不为奇异线程付全量成本。完全没有序列索引的遗留线程
+        // 回退全量扫描,语义与旧实现一致。
+        let store = MessageSequenceIndexStore::new(self.filesystem.as_ref());
+        let probes = (1..=TITLE_DERIVATION_SEQUENCE_WINDOW)
+            .map(|sequence| store.read(scope, thread_id, sequence));
+        let mut probed_any = false;
+        for result in futures::future::join_all(probes).await {
+            let Some(index) = result? else {
+                // 索引空洞 = 已索引前缀的尽头,后面没有更多已索引消息。
+                break;
+            };
+            probed_any = true;
+            let Some((message, _)) = self
+                .read_message_versioned(scope, thread_id, index.message_id)
+                .await?
+            else {
+                continue;
+            };
+            if message.kind == MessageKind::User {
+                return Ok(Some(message));
+            }
+        }
+        if probed_any {
+            return Ok(None);
+        }
         Ok(self
             .list_thread_messages(scope, thread_id)
             .await?
@@ -2121,7 +2157,76 @@ where
             )
             .await?;
         if let Some(existing) = existing {
-            return Ok(existing);
+            let existing_preview = existing
+                .content
+                .as_deref()
+                .map(serde_json::from_str::<CapabilityDisplayPreviewEnvelope>)
+                .transpose()
+                .map_err(|error| SessionThreadError::Serialization(error.to_string()))?
+                .ok_or_else(|| {
+                    SessionThreadError::Serialization(
+                        "capability display preview content is missing".to_string(),
+                    )
+                })?;
+            if !request
+                .preview
+                .should_replace_existing(&existing_preview)
+                .map_err(SessionThreadError::Serialization)?
+            {
+                return Ok(existing);
+            }
+            let replacement = request.preview.clone();
+            let turn_run_id = request.turn_run_id.clone();
+            let thread_id = request.thread_id.clone();
+            let now = Utc::now();
+            let updated = self
+                .apply_message_update(
+                    &request.scope,
+                    &request.thread_id,
+                    existing.message_id,
+                    |message| {
+                        if message.kind != MessageKind::CapabilityDisplayPreview
+                            || message.status != MessageStatus::Finalized
+                            || message.turn_run_id.as_deref() != Some(turn_run_id.as_str())
+                        {
+                            return Err(SessionThreadError::UnknownMessage {
+                                message_id: message.message_id,
+                            });
+                        }
+                        let current = message
+                            .content
+                            .as_deref()
+                            .map(serde_json::from_str::<CapabilityDisplayPreviewEnvelope>)
+                            .transpose()
+                            .map_err(|error| SessionThreadError::Serialization(error.to_string()))?
+                            .ok_or_else(|| {
+                                SessionThreadError::Serialization(
+                                    "capability display preview content is missing".to_string(),
+                                )
+                            })?;
+                        if current.invocation_id != replacement.invocation_id {
+                            return Err(SessionThreadError::UnknownMessage {
+                                message_id: message.message_id,
+                            });
+                        }
+                        if replacement
+                            .should_replace_existing(&current)
+                            .map_err(SessionThreadError::Serialization)?
+                        {
+                            message.content =
+                                Some(serde_json::to_string(&replacement).map_err(|error| {
+                                    SessionThreadError::Serialization(error.to_string())
+                                })?);
+                            message.tool_result_ref = replacement.result_ref.clone();
+                            message.updated_at = Some(now);
+                        }
+                        Ok(())
+                    },
+                )
+                .await?;
+            self.touch_thread_updated_at_best_effort_at(&request.scope, &thread_id, now)
+                .await;
+            return Ok(updated);
         }
         let message_id = capability_display_preview_message_id(
             &request.scope,
@@ -2764,12 +2869,12 @@ where
         // derived from their first user message. We collect their page
         // indices here and fan-out the indexed first-user reads below so
         // we don't serialize N transcript probes inline.
-        let mut needs_title: Vec<(usize, ThreadId, u64)> = Vec::new();
+        let mut needs_title: Vec<(usize, ThreadId)> = Vec::new();
         for index in &listed[start_index..end_index] {
             let idx = page.len();
             let record = index.record.clone();
             if record.title.is_none() {
-                needs_title.push((idx, record.thread_id.clone(), index.next_sequence));
+                needs_title.push((idx, record.thread_id.clone()));
             }
             page.push(record);
         }
@@ -2786,12 +2891,10 @@ where
                 ThreadId,
                 Result<Option<ThreadMessageRecord>, SessionThreadError>,
             )> = futures::stream::iter(needs_title)
-                .map(|(idx, thread_id, next_sequence)| {
+                .map(|(idx, thread_id)| {
                     let scope = request.scope.clone();
                     async move {
-                        let result = self
-                            .first_user_message_for_title(&scope, &thread_id, next_sequence)
-                            .await;
+                        let result = self.first_user_message_for_title(&scope, &thread_id).await;
                         (idx, thread_id, result)
                     }
                 })
@@ -2806,7 +2909,21 @@ where
                             .and_then(|message| message.content.as_deref())
                             .and_then(derive_title_from_message)
                         {
-                            page[idx].title = Some(title);
+                            page[idx].title = Some(title.clone());
+                            // 推导结果回写索引记录:后续列表调用直接命中索引
+                            // (title_present=true),不再每页重读 transcript
+                            // 推导。回写失败只影响性能,不影响本次响应。
+                            if let Err(error) = self
+                                .persist_derived_thread_title(&request.scope, &thread_id, &title)
+                                .await
+                            {
+                                tracing::debug!(
+                                    thread_id = %thread_id.as_str(),
+                                    scope = ?request.scope,
+                                    ?error,
+                                    "failed to persist derived thread title during list_threads_for_scope",
+                                );
+                            }
                         }
                     }
                     Err(error) => {

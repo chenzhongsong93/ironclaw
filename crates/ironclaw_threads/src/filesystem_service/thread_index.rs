@@ -326,6 +326,57 @@ where
         Ok(())
     }
 
+    /// 将列表路径推导出的标题回写索引记录(CAS:仅在标题仍为空时写入,
+    /// 不覆盖调用方显式设置的标题),让后续列表调用直接命中索引,不再
+    /// 每次重读 transcript 推导。索引记录缺失时不从列表热路径建行。
+    pub(super) async fn persist_derived_thread_title(
+        &self,
+        scope: &ThreadScope,
+        thread_id: &ThreadId,
+        title: &str,
+    ) -> Result<(), SessionThreadError> {
+        let path = thread_index_record_path(scope, thread_id)?;
+        let resource_scope = scope.to_resource_scope();
+        let scope_for_retry = scope.clone();
+        let thread_id_for_retry = thread_id.clone();
+        let title_for_retry = title.to_string();
+        let written = cas_update(
+            self.filesystem.as_ref(),
+            &resource_scope,
+            &path,
+            |bytes: &[u8]| deserialize::<ThreadIndexRecord>(bytes),
+            |record: &ThreadIndexRecord| Self::thread_index_entry(record),
+            |current: Option<ThreadIndexRecord>| {
+                let scope = scope_for_retry.clone();
+                let thread_id = thread_id_for_retry.clone();
+                let title = title_for_retry.clone();
+                async move {
+                    let Some(mut index) = current else {
+                        return Ok(CasApply::no_op(
+                            no_op_thread_index_record(scope, thread_id),
+                            false,
+                        ));
+                    };
+                    if index.record.scope != scope || index.record.thread_id != thread_id {
+                        return Err(SessionThreadError::ThreadScopeMismatch { thread_id });
+                    }
+                    if index.record.title.is_some() {
+                        return Ok(CasApply::no_op(index, false));
+                    }
+                    index.record.title = Some(title);
+                    index.flags.title_present = true;
+                    Ok(CasApply::new(index, true))
+                }
+            },
+        )
+        .await
+        .map_err(map_cas_error)?;
+        if written {
+            self.invalidate_thread_index_cache(scope);
+        }
+        Ok(())
+    }
+
     async fn read_thread_index_record(
         &self,
         scope: &ThreadScope,

@@ -1273,6 +1273,28 @@ async fn filesystem_store_persists_preview_history_while_hiding_it_from_context(
         .unwrap();
     assert_eq!(first.message_id, duplicate.message_id);
 
+    let mut failed_preview = preview_envelope(invocation_id);
+    failed_preview.status = CapabilityDisplayPreviewStatus::Failed;
+    failed_preview.output_summary = Some("spawn aborted".to_string());
+    failed_preview.output_preview = Some("spawn aborted".to_string());
+    let failed = service
+        .append_capability_display_preview(AppendCapabilityDisplayPreviewRequest {
+            scope: scope.clone(),
+            thread_id: thread.thread_id.clone(),
+            turn_run_id: "run-1".into(),
+            preview: failed_preview,
+        })
+        .await
+        .unwrap();
+    assert_eq!(failed.message_id, first.message_id);
+    let final_preview: CapabilityDisplayPreviewEnvelope =
+        serde_json::from_str(failed.content.as_deref().unwrap()).unwrap();
+    assert_eq!(final_preview.status, CapabilityDisplayPreviewStatus::Failed);
+    assert_eq!(
+        final_preview.output_summary.as_deref(),
+        Some("spawn aborted")
+    );
+
     // A summary whose range contains only a CapabilityDisplayPreview (permanent
     // non-visible, never resurfaces) IS now applied: the preview kind is safe
     // to span.  The summary replaces seq 1 (User) through seq 2 (Preview) in
@@ -2696,6 +2718,146 @@ async fn filesystem_list_threads_for_scope_derives_title_from_first_user_message
         by_id.get("t-explicit").copied().flatten(),
         Some("Caller-supplied title"),
         "explicit EnsureThreadRequest.title must not be overwritten by derivation",
+    );
+}
+
+#[tokio::test]
+async fn filesystem_list_threads_for_scope_persists_derived_title_to_index() {
+    use ironclaw_threads::ListThreadsForScopeRequest;
+
+    let backend = Arc::new(InMemoryBackend::new());
+    let scoped = scoped_threads_fs_at(backend, "tenant-title-persist", "alice");
+    let service = FilesystemSessionThreadService::new(Arc::clone(&scoped));
+    let request_scope = scope("title-persist");
+
+    let thread = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: request_scope.clone(),
+            thread_id: Some(ThreadId::new("t-persist").unwrap()),
+            created_by_actor_id: "actor-a".into(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+    service
+        .accept_inbound_message(AcceptInboundMessageRequest {
+            scope: request_scope.clone(),
+            thread_id: thread.thread_id.clone(),
+            actor_id: "actor-a".into(),
+            source_binding_id: None,
+            reply_target_binding_id: None,
+            external_event_id: Some("evt-persist-1".into()),
+            content: MessageContent::text("persisted sidebar title"),
+        })
+        .await
+        .unwrap();
+
+    let listed = service
+        .list_threads_for_scope(ListThreadsForScopeRequest {
+            scope: request_scope.clone(),
+            limit: None,
+            cursor: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.threads[0].title.as_deref(),
+        Some("persisted sidebar title"),
+        "first list derives the title from the first user message",
+    );
+
+    // 推导结果必须回写索引记录,否则每次列表调用都会重读 transcript 推导
+    // (会话列表接口恒定秒级的根因)。直接读索引行验证。
+    let index_path = thread_index_record_path_for_test(&request_scope, thread.thread_id.as_str());
+    let index: serde_json::Value = serde_json::from_slice(
+        &scoped
+            .get(&request_scope.to_resource_scope(), &index_path)
+            .await
+            .unwrap()
+            .expect("ensure_thread writes derived index row")
+            .entry
+            .body,
+    )
+    .unwrap();
+    assert_eq!(
+        index["title"],
+        serde_json::json!("persisted sidebar title"),
+        "derived title must be persisted into the thread index record",
+    );
+    assert_eq!(
+        index["flags"]["title_present"],
+        serde_json::json!(true),
+        "title_present flag must flip so later listings skip derivation",
+    );
+
+    // 索引 overlay 让 read_thread 也能看到同一标题(此前只在列表响应里临时拼出)。
+    let read = service
+        .read_thread(ThreadHistoryRequest {
+            scope: request_scope.clone(),
+            thread_id: thread.thread_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(read.title.as_deref(), Some("persisted sidebar title"));
+}
+
+#[tokio::test]
+async fn filesystem_list_threads_for_scope_skips_deep_scan_beyond_title_window() {
+    use ironclaw_threads::ListThreadsForScopeRequest;
+
+    let backend = Arc::new(InMemoryBackend::new());
+    let scoped = scoped_threads_fs_at(backend, "tenant-title-window", "alice");
+    let service = FilesystemSessionThreadService::new(scoped);
+    let request_scope = scope("title-window");
+
+    let thread = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: request_scope.clone(),
+            thread_id: Some(ThreadId::new("t-deep").unwrap()),
+            created_by_actor_id: "actor-a".into(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+    // 前 17 条全是 assistant,第一条 user 消息落在序列 18(超出窗口 16):
+    // 列表热路径不得为它全量物化 transcript,标题留空回退线程 ID 标签。
+    for turn in 0..17 {
+        service
+            .append_assistant_draft(AppendAssistantDraftRequest {
+                scope: request_scope.clone(),
+                thread_id: thread.thread_id.clone(),
+                turn_run_id: format!("run-deep-{turn}"),
+                content: MessageContent::text(format!("assistant filler {turn}")),
+            })
+            .await
+            .unwrap();
+    }
+    service
+        .accept_inbound_message(AcceptInboundMessageRequest {
+            scope: request_scope.clone(),
+            thread_id: thread.thread_id.clone(),
+            actor_id: "actor-a".into(),
+            source_binding_id: None,
+            reply_target_binding_id: None,
+            external_event_id: Some("evt-deep-1".into()),
+            content: MessageContent::text("user message beyond the derivation window"),
+        })
+        .await
+        .unwrap();
+
+    let listed = service
+        .list_threads_for_scope(ListThreadsForScopeRequest {
+            scope: request_scope,
+            limit: None,
+            cursor: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        listed.threads[0].title.is_none(),
+        "first user message beyond the derivation window must not trigger a full transcript scan",
     );
 }
 

@@ -1899,6 +1899,40 @@ impl RebornRuntime {
         self.services.read_write_workspace_filesystem()
     }
 
+    /// Read-only, scope-aligned workspace view backing the WebUI v2 thread
+    /// files API (list/stat/content). Resolves `/workspace` per request scope
+    /// to the same per-user directory the agent's own file tools write through
+    /// ([`scoped_workspace_mount_view`](crate::local_dev_mounts::scoped_workspace_mount_view)),
+    /// so the files surface shows what the agent at that scope actually
+    /// produced. The fixed read-write view ([`Self::webui_workspace_filesystem`])
+    /// points at the ambient shared `/projects/workspace` agents never write
+    /// to in per-user-scoped deployments — wiring the files reader to it left
+    /// listings empty and artifact reads 404 (ISSUE-IRONCLAW-004). Scopes with
+    /// no real owning user (system-reserved) fall back to that shared view.
+    /// `None` only when no local runtime is composed.
+    pub(crate) fn webui_scoped_workspace_filesystem(
+        &self,
+    ) -> Option<
+        Arc<ironclaw_filesystem::ScopedFilesystem<ironclaw_filesystem::CompositeRootFilesystem>>,
+    > {
+        let rt = self.services.local_runtime.as_ref()?;
+        let fallback = crate::local_dev_mounts::workspace_mount_view(
+            ironclaw_host_api::MountPermissions::read_only(),
+            &[],
+        )
+        .ok()?;
+        Some(Arc::new(ironclaw_filesystem::ScopedFilesystem::new(
+            Arc::clone(&rt.extension_filesystem),
+            move |scope: &ironclaw_host_api::ResourceScope| {
+                crate::local_dev_mounts::scope_aligned_workspace_mount_view(
+                    scope,
+                    &fallback,
+                    ironclaw_host_api::MountPermissions::read_only(),
+                )
+            },
+        )))
+    }
+
     /// Read-only scoped filesystem spanning every mount the standalone WebUI
     /// filesystem viewer can browse (workspace files + persistent memory), over
     /// the same composite root the agent's tools resolve through. `None` only
@@ -3335,14 +3369,46 @@ pub async fn build_reborn_runtime(
     // gateway builds the router with the correct dispatch key before the first
     // reload swaps the real mission chain in. `None` when unconfigured →
     // single-provider (default slot only).
+    //
+    // Read failures and a present-but-model-less `[llm.mission]` slot are
+    // surfaced with `warn!` instead of being silently swallowed: a silently
+    // missing mission model leaves the gateway without the `mission_model`
+    // profile, so every run bound to it (e.g. the novelist subagent) is denied
+    // with "model profile is not permitted" — a configuration fault that must
+    // be visible to operators, not discoverable only by absent model calls.
     let mission_model = boot.as_ref().and_then(|boot_config| {
-        let config_file =
-            ironclaw_reborn_config::RebornConfigFile::load(&boot_config.home().config_file_path())
-                .ok()
-                .flatten()?;
-        config_file
-            .mission_llm_slot()
-            .and_then(|slot| slot.model.clone())
+        let config_path = boot_config.home().config_file_path();
+        match ironclaw_reborn_config::RebornConfigFile::load(&config_path) {
+            Ok(Some(config_file)) => match config_file.mission_llm_slot() {
+                Some(slot) => match slot.model.clone() {
+                    Some(model) => Some(model),
+                    None => {
+                        tracing::warn!(
+                            config_path = %config_path.display(),
+                            "[llm.mission] slot has no `model`; dual-model routing stays disabled \
+                             and runs bound to the mission model profile will be denied",
+                        );
+                        None
+                    }
+                },
+                None => None,
+            },
+            Ok(None) => {
+                tracing::warn!(
+                    config_path = %config_path.display(),
+                    "config.toml not found at boot; dual-model mission slot cannot be resolved",
+                );
+                None
+            }
+            Err(error) => {
+                tracing::warn!(
+                    config_path = %config_path.display(),
+                    %error,
+                    "config.toml failed to load at boot; dual-model mission slot cannot be resolved",
+                );
+                None
+            }
+        }
     });
     #[cfg(any(test, feature = "test-support"))]
     let (model_gateway, llm_cost_table, llm_reload) = match model_gateway_override {

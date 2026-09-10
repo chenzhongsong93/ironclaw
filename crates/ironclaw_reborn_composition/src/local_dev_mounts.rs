@@ -1,7 +1,8 @@
 use std::{collections::HashSet, path::Path};
 
 use ironclaw_host_api::{
-    HostApiError, MountAlias, MountGrant, MountPermissions, MountView, ResourceScope, VirtualPath,
+    HostApiError, MountAlias, MountGrant, MountPermissions, MountView, ResourceScope,
+    SYSTEM_RESERVED_ID, VirtualPath,
 };
 use ironclaw_memory::MemoryDocumentScope;
 
@@ -54,6 +55,14 @@ pub(crate) fn ambient_workspace_mount_view(
     MountView::new(mounts)
 }
 
+/// Per-user workspace 挂载目标(虚拟路径,经 `/projects` mount 映射到物理
+/// `{storage_root}/tenants/{tenant}/users/{user}/workspace`)。
+/// 写入侧(agent capability grants)与读取侧(WebUI files API/浏览视图)
+/// 必须共用同一 target,否则两侧物理目录错位。
+fn scoped_workspace_target(tenant_id: &str, user_id: &str) -> String {
+    format!("/projects/tenants/{tenant_id}/users/{user_id}/workspace")
+}
+
 /// Per-user workspace mount view(隔离:每 tenant/user 独享 workspace 目录)。
 ///
 /// 仿 `scoped_skill_context_mount_view` 模式:grant `/workspace`(read_write)
@@ -67,8 +76,28 @@ pub(crate) fn scoped_workspace_mount_view(
 ) -> Result<MountView, HostApiError> {
     MountView::new(vec![grant(
         WORKSPACE_ALIAS,
-        &format!("/projects/tenants/{tenant_id}/users/{user_id}/workspace"),
+        &scoped_workspace_target(tenant_id, user_id),
         MountPermissions::read_write(),
+    )?])
+}
+
+/// 与 agent 写入侧([`scoped_workspace_mount_view`])同一 target 的 scope 感知
+/// workspace 视图:scope 带真实属主用户 → `/workspace` 映射到该用户私有目录;
+/// 系统保留用户(无属主的系统线程)→ `fallback` 全局视图,保持 ambient 部署兼容。
+/// WebUI 读取侧(files API / 附件)必须用本视图,否则读到 agent 从不写入的
+/// 共享 `/projects/workspace`,列表恒空、读产物恒 404。
+pub(crate) fn scope_aligned_workspace_mount_view(
+    scope: &ResourceScope,
+    fallback: &MountView,
+    permissions: MountPermissions,
+) -> Result<MountView, HostApiError> {
+    if scope.user_id.as_str() == SYSTEM_RESERVED_ID {
+        return Ok(fallback.clone());
+    }
+    MountView::new(vec![grant(
+        WORKSPACE_ALIAS,
+        &scoped_workspace_target(scope.tenant_id.as_str(), scope.user_id.as_str()),
+        permissions,
     )?])
 }
 
@@ -151,7 +180,10 @@ pub(crate) fn system_extensions_lifecycle_mount_view() -> Result<MountView, Host
 /// Spans every mount the read-only browser can navigate — the workspace
 /// (project working files + landed attachments) and the persistent memory store
 /// — over the same targets the agent's own tools resolve through, so the viewer
-/// shows exactly what the agent sees. Read-only by construction: the viewer is a
+/// shows exactly what the agent sees. The workspace target is scope-aligned
+/// (per-user when the scope carries a real owner, matching
+/// [`scoped_workspace_mount_view`]; the ambient shared target only for
+/// system-reserved scopes). Read-only by construction: the viewer is a
 /// navigation + preview/download surface, never a write path. The aliases here
 /// are the contract the browse reader confines against; keep them aligned with
 /// [`BROWSE_MEMORY_ALIAS`]/[`WORKSPACE_ALIAS`].
@@ -159,10 +191,15 @@ pub(crate) const BROWSE_MEMORY_ALIAS: &str = MEMORY_ALIAS;
 
 pub(crate) fn scoped_browse_mount_view(scope: &ResourceScope) -> Result<MountView, HostApiError> {
     let memory_target = scoped_memory_target(scope)?;
+    let workspace_target = if scope.user_id.as_str() == SYSTEM_RESERVED_ID {
+        WORKSPACE_TARGET.to_string()
+    } else {
+        scoped_workspace_target(scope.tenant_id.as_str(), scope.user_id.as_str())
+    };
     MountView::new(vec![
         grant(
             WORKSPACE_ALIAS,
-            WORKSPACE_TARGET,
+            workspace_target.as_str(),
             MountPermissions::read_only(),
         )?,
         grant(
@@ -229,6 +266,73 @@ fn push_raw_alias_mounts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn user_scope(user_id: &str) -> ResourceScope {
+        ResourceScope {
+            tenant_id: ironclaw_host_api::TenantId::new("tenant-test").unwrap(),
+            user_id: ironclaw_host_api::UserId::new(user_id).unwrap(),
+            agent_id: Some(ironclaw_host_api::AgentId::new("agent-test").unwrap()),
+            project_id: None,
+            mission_id: None,
+            thread_id: None,
+            invocation_id: ironclaw_host_api::InvocationId::new(),
+        }
+    }
+
+    fn mount_target(view: &MountView, alias: &str) -> String {
+        view.mounts
+            .iter()
+            .find(|mount| mount.alias.as_str() == alias)
+            .unwrap_or_else(|| panic!("mount {alias} missing"))
+            .target
+            .as_str()
+            .to_string()
+    }
+
+    #[test]
+    fn scope_aligned_workspace_view_maps_real_user_to_per_user_target() {
+        let fallback = workspace_mount_view(MountPermissions::read_only(), &[]).unwrap();
+        let view = scope_aligned_workspace_mount_view(
+            &user_scope("alice"),
+            &fallback,
+            MountPermissions::read_only(),
+        )
+        .expect("real-user scope resolves per-user workspace view");
+
+        assert_eq!(
+            mount_target(&view, WORKSPACE_ALIAS),
+            "/projects/tenants/tenant-test/users/alice/workspace",
+            "files API 读取侧必须与 agent 写入侧同一 per-user target"
+        );
+    }
+
+    #[test]
+    fn scope_aligned_workspace_view_falls_back_for_system_reserved_user() {
+        let mut scope = user_scope("alice");
+        scope.user_id = ironclaw_host_api::UserId::from_trusted(SYSTEM_RESERVED_ID.to_string());
+        let fallback = workspace_mount_view(MountPermissions::read_only(), &[]).unwrap();
+        let view =
+            scope_aligned_workspace_mount_view(&scope, &fallback, MountPermissions::read_only())
+                .expect("system-reserved scope falls back to ambient view");
+
+        assert_eq!(
+            mount_target(&view, WORKSPACE_ALIAS),
+            WORKSPACE_TARGET,
+            "无属主系统线程保持全局共享 workspace 视图"
+        );
+    }
+
+    #[test]
+    fn browse_view_workspace_target_is_scope_aligned() {
+        let view = scoped_browse_mount_view(&user_scope("bob"))
+            .expect("browse view resolves for real-user scope");
+
+        assert_eq!(
+            mount_target(&view, WORKSPACE_ALIAS),
+            "/projects/tenants/tenant-test/users/bob/workspace",
+            "独立浏览视图必须与 agent 可见的 per-user workspace 一致"
+        );
+    }
 
     #[test]
     fn ambient_workspace_mount_rejects_invalid_workspace_alias() {

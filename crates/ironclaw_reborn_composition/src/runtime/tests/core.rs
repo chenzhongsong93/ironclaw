@@ -5067,6 +5067,126 @@ async fn webui_workspace_filesystem_lands_attachment_with_read_write_mount() {
     runtime.shutdown().await.expect("runtime shutdown");
 }
 
+/// ISSUE-IRONCLAW-004 回归:WebUI files API 的 scope 对齐 workspace 视图必须读到
+/// agent 写入侧(`scoped_workspace_mount_view`,per-user 目录)的产物。旧的固定
+/// 共享 `/projects/workspace` 视图与 per-user 写入物理错位——列表恒空、读产物
+/// 恒 404。本测试用 agent 写入 recipe 落一份产物,再经生产 files API 同一个
+/// reader 读回,并锚定旧固定视图确实读不到(否则对齐修复失去意义)。
+#[tokio::test]
+async fn webui_scoped_workspace_filesystem_reads_agent_per_user_workspace() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let gateway = Arc::new(RecordingGateway {
+        reply: "scoped workspace ok".to_string(),
+        requests: Arc::new(StdMutex::new(Vec::new())),
+    });
+    let input = RebornRuntimeInput::from_services(
+        RebornBuildInput::local_dev("runtime-files-scope-owner", root.path().join("local-dev"))
+            .with_runtime_policy(local_dev_runtime_policy()),
+    )
+    .with_identity(RebornRuntimeIdentity {
+        tenant_id: "runtime-files-scope-tenant".to_string(),
+        agent_id: "runtime-files-scope-agent".to_string(),
+        source_binding_id: "runtime-files-scope-source".to_string(),
+        reply_target_binding_id: "runtime-files-scope-reply".to_string(),
+    })
+    .with_poll_settings(PollSettings {
+        interval: Duration::from_millis(10),
+        max_total: Duration::from_secs(3),
+    })
+    .with_model_gateway_override(gateway);
+
+    let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+    let local_runtime = runtime
+        .services()
+        .local_runtime
+        .as_ref()
+        .expect("local-dev runtime substrate");
+
+    let thread_scope = ThreadScope {
+        tenant_id: TenantId::new("runtime-files-scope-tenant").unwrap(),
+        agent_id: AgentId::new("runtime-files-scope-agent").unwrap(),
+        project_id: None,
+        owner_user_id: Some(UserId::new("runtime-files-scope-owner").unwrap()),
+        mission_id: None,
+    };
+
+    // agent 写入侧 recipe:与 RefreshingCapabilityPort 运行时 grant 同一 target。
+    let agent_view = crate::local_dev_mounts::scoped_workspace_mount_view(
+        "runtime-files-scope-tenant",
+        "runtime-files-scope-owner",
+    )
+    .expect("per-user workspace view");
+    let agent_fs = ironclaw_filesystem::ScopedFilesystem::with_fixed_view(
+        Arc::clone(&local_runtime.extension_filesystem),
+        agent_view,
+    );
+    agent_fs
+        .write_bytes(
+            &thread_scope.to_resource_scope(),
+            &ironclaw_host_api::ScopedPath::new("/workspace/proj-x/ch1.txt").unwrap(),
+            b"chapter one".to_vec(),
+        )
+        .await
+        .expect("agent-side per-user workspace write succeeds");
+
+    // files API 读取侧:生产 reader + scope 对齐只读视图,必须读到 agent 产物。
+    let scoped_fs = runtime
+        .webui_scoped_workspace_filesystem()
+        .expect("scope-aligned workspace filesystem composes");
+    let reader = crate::support::fs::ProjectScopedFilesystemReader::new(scoped_fs);
+    let entries = ironclaw_product_workflow::ProjectFilesystemReader::list_dir(
+        &reader,
+        &thread_scope,
+        "/workspace",
+    )
+    .await
+    .expect("listing the per-user workspace succeeds");
+    assert!(
+        entries.iter().any(|entry| entry.name == "proj-x"),
+        "files API 必须列出 agent 写入的项目目录: {entries:?}"
+    );
+    let file = ironclaw_product_workflow::ProjectFilesystemReader::read_file(
+        &reader,
+        &thread_scope,
+        "/workspace/proj-x/ch1.txt",
+    )
+    .await
+    .expect("reading the agent artifact succeeds");
+    assert_eq!(file.bytes, b"chapter one".to_vec());
+
+    // 回归锚点:旧固定共享视图与 per-user 写入物理错位,同一 reader 读不到。
+    let fixed_reader = crate::support::fs::ProjectScopedFilesystemReader::new(
+        runtime
+            .webui_workspace_filesystem()
+            .expect("fixed read-write workspace filesystem composes"),
+    );
+    let err = ironclaw_product_workflow::ProjectFilesystemReader::stat(
+        &fixed_reader,
+        &thread_scope,
+        "/workspace/proj-x/ch1.txt",
+    )
+    .await
+    .expect_err("固定共享视图必须读不到 per-user 产物(错位实证)");
+    assert_eq!(err, ironclaw_product_workflow::ProjectFsError::NotFound);
+
+    // 无属主系统 scope:fallback 到共享 ambient 视图(向后兼容),同样读不到
+    // per-user 产物,但错误型不漂移——仍是 NotFound 而非授权错误。
+    let system_thread_scope = ThreadScope {
+        owner_user_id: None,
+        ..thread_scope.clone()
+    };
+    let err = ironclaw_product_workflow::ProjectFilesystemReader::stat(
+        &reader,
+        &system_thread_scope,
+        "/workspace/proj-x/ch1.txt",
+    )
+    .await
+    .expect_err("系统保留 scope fallback 到共享视图,读不到 per-user 产物");
+    assert_eq!(err, ironclaw_product_workflow::ProjectFsError::NotFound);
+
+    runtime.shutdown().await.expect("runtime shutdown");
+}
+
 #[tokio::test]
 async fn local_dev_webui_bundle_uses_local_lifecycle_facade_for_setup_extension() {
     let root = tempfile::tempdir().expect("tempdir");

@@ -258,16 +258,22 @@ pub(crate) fn build_webui_services_with_connectable_channels(
             .with_inbound_attachments(Arc::new(ProjectScopedAttachmentLander::new(Arc::clone(
                 &workspace_filesystem,
             ))))
-            // Read-only project filesystem backing directory listing and file
-            // download chips, over the same workspace mount.
-            .with_project_filesystem_reader(Arc::new(ProjectScopedFilesystemReader::new(
-                Arc::clone(&workspace_filesystem),
-            )))
             // Read counterpart: serves landed attachment bytes back to the
             // browser (image thumbnails) through the same workspace mount.
             .with_inbound_attachment_reader(Arc::new(ProjectScopedAttachmentReader::new(
                 workspace_filesystem,
             )));
+    }
+    // Read-only project filesystem backing directory listing and file download
+    // chips: wired to the scope-aligned per-user workspace view (NOT the fixed
+    // ambient handle above) so the files surface reads the same directory the
+    // agent's file tools write through — the fixed handle left listings empty
+    // and artifact reads 404 in per-user-scoped deployments
+    // (ISSUE-IRONCLAW-004).
+    if let Some(scoped_workspace_filesystem) = runtime.webui_scoped_workspace_filesystem() {
+        api = api.with_project_filesystem_reader(Arc::new(ProjectScopedFilesystemReader::new(
+            scoped_workspace_filesystem,
+        )));
     }
     // Standalone read-only filesystem viewer: browses memory + workspace over a
     // dedicated read-only multi-mount view (not the read-write workspace handle

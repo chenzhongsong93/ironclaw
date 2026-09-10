@@ -518,19 +518,49 @@ impl SessionThreadService for InMemorySessionThreadService {
             .map_err(SessionThreadError::Serialization)?;
         let mut state = self.state.lock().await;
         let thread = get_thread_mut(&mut state, &request.scope, &request.thread_id)?;
-        for message in thread.messages.iter() {
+        for message in &mut thread.messages {
             if message.kind != MessageKind::CapabilityDisplayPreview
                 || message.status != MessageStatus::Finalized
                 || message.turn_run_id.as_deref() != Some(request.turn_run_id.as_str())
             {
                 continue;
             }
-            if CapabilityDisplayPreviewEnvelope::invocation_id_from_json(message.content.as_deref())
-                .map_err(SessionThreadError::Serialization)?
-                == Some(request.preview.invocation_id)
-            {
-                return Ok(message.clone());
+            let existing = message
+                .content
+                .as_deref()
+                .map(serde_json::from_str::<CapabilityDisplayPreviewEnvelope>)
+                .transpose()
+                .map_err(|error| SessionThreadError::Serialization(error.to_string()))?;
+            let Some(existing) = existing else {
+                continue;
+            };
+            if existing.invocation_id != request.preview.invocation_id {
+                continue;
             }
+            if request
+                .preview
+                .should_replace_existing(&existing)
+                .map_err(SessionThreadError::Serialization)?
+            {
+                let content = serde_json::to_string(&request.preview)
+                    .map_err(|error| SessionThreadError::Serialization(error.to_string()))?;
+                let now = Utc::now();
+                let before_created_at = message.created_at;
+                let before_updated_at = message.updated_at;
+                message.content = Some(content);
+                message.tool_result_ref = request.preview.result_ref.clone();
+                message.updated_at = Some(now);
+                crate::contract::validate_message_timestamp_fields_not_cleared(
+                    message.message_id,
+                    before_created_at,
+                    before_updated_at,
+                    message.created_at,
+                    message.updated_at,
+                    "append_capability_display_preview",
+                )?;
+                thread.record.updated_at = Some(now);
+            }
+            return Ok(message.clone());
         }
         let content = serde_json::to_string(&request.preview)
             .map_err(|error| SessionThreadError::Serialization(error.to_string()))?;

@@ -106,6 +106,26 @@ impl CapabilityDisplayPreviewEnvelope {
         preview.validate()?;
         Ok(Some(preview.invocation_id))
     }
+
+    pub(crate) fn should_replace_existing(&self, existing: &Self) -> Result<bool, String> {
+        if self.invocation_id != existing.invocation_id {
+            return Err("capability display preview invocation identity conflicts".to_string());
+        }
+        if self.capability_id != existing.capability_id {
+            return Err("capability display preview capability identity conflicts".to_string());
+        }
+        Ok(match (existing.status, self.status) {
+            (CapabilityDisplayPreviewStatus::Completed, CapabilityDisplayPreviewStatus::Failed)
+            | (CapabilityDisplayPreviewStatus::Completed, CapabilityDisplayPreviewStatus::Killed) => {
+                true
+            }
+            (CapabilityDisplayPreviewStatus::Failed, CapabilityDisplayPreviewStatus::Completed)
+            | (CapabilityDisplayPreviewStatus::Killed, CapabilityDisplayPreviewStatus::Completed) => {
+                false
+            }
+            _ => self.status != existing.status && self.updated_at > existing.updated_at,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

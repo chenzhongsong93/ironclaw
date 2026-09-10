@@ -604,6 +604,28 @@ async fn append_capability_display_preview_is_history_visible_and_model_hidden()
     assert_eq!(first.status, MessageStatus::Finalized);
     assert_eq!(first.sequence, 2);
 
+    let mut failed_preview = preview_envelope(invocation_id);
+    failed_preview.status = CapabilityDisplayPreviewStatus::Failed;
+    failed_preview.output_summary = Some("spawn aborted".to_string());
+    failed_preview.output_preview = Some("spawn aborted".to_string());
+    let failed = service
+        .append_capability_display_preview(AppendCapabilityDisplayPreviewRequest {
+            scope: scope.clone(),
+            thread_id: thread.thread_id.clone(),
+            turn_run_id: "run-1".into(),
+            preview: failed_preview,
+        })
+        .await
+        .unwrap();
+    assert_eq!(failed.message_id, first.message_id);
+    let final_preview: CapabilityDisplayPreviewEnvelope =
+        serde_json::from_str(failed.content.as_deref().unwrap()).unwrap();
+    assert_eq!(final_preview.status, CapabilityDisplayPreviewStatus::Failed);
+    assert_eq!(
+        final_preview.output_summary.as_deref(),
+        Some("spawn aborted")
+    );
+
     let history = service
         .list_thread_history(ThreadHistoryRequest {
             scope: scope.clone(),

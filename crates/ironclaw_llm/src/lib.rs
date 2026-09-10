@@ -1181,6 +1181,23 @@ pub async fn build_static_provider_chain(
     })
 }
 
+/// Build the decorated primary chain with no wrapper layers: no
+/// [`SwappableLlmProvider`], no recording wrapper.
+///
+/// For callers that own their own swappable handle and swap the *bare* chain
+/// into it on reload (e.g. the dual-model mission slot in the Reborn
+/// composition). Swapping the output of [`build_provider_chain`] instead
+/// stacks a second swappable (and a second recording wrapper when enabled)
+/// under the existing handle on every reload — a wrapper leak that grows the
+/// delegation chain without bound across repeated reloads.
+pub async fn build_bare_provider_chain(
+    config: &LlmConfig,
+    session: Arc<SessionManager>,
+) -> Result<Arc<dyn LlmProvider>, LlmError> {
+    let components = build_provider_chain_components_with_options(config, session, false).await?;
+    Ok(components.primary)
+}
+
 /// Build the full provider chain and wrap the primary (and cheap, if any)
 /// in hot-swap capable [`SwappableLlmProvider`] handles. The returned
 /// [`LlmReloadHandle`] can rebuild the chain later from a fresh config.
@@ -1320,6 +1337,30 @@ mod tests {
         let result = create_cheap_llm_provider(&config, session);
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    /// The bare chain is the decorated primary with no swappable/recording
+    /// wrappers. Callers that own their own swappable handle swap this output
+    /// in directly; the contract under test is that the bare chain is a
+    /// usable, identity-preserving provider (model name carried through the
+    /// decorator stack), unlike `build_provider_chain`, whose output is
+    /// additionally wrapped in its own swappable (nesting under the caller's
+    /// handle on every reload).
+    #[tokio::test]
+    async fn build_bare_provider_chain_returns_usable_identity_preserving_primary() {
+        let config = test_llm_config();
+        let session = Arc::new(SessionManager::new(SessionConfig::default()));
+
+        let bare = build_bare_provider_chain(&config, session)
+            .await
+            .expect("bare chain should build");
+
+        assert_eq!(
+            bare.model_name(),
+            "test-model",
+            "bare chain must preserve the configured model identity through decorators"
+        );
+        assert_eq!(bare.active_model_name(), "test-model");
     }
 
     #[test]

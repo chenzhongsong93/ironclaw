@@ -4017,6 +4017,7 @@ dependencies = [
  "chrono",
  "ironclaw_approvals",
  "ironclaw_authorization",
+ "ironclaw_common",
  "ironclaw_dispatcher",
  "ironclaw_events",
  "ironclaw_extensions",
@@ -4090,8 +4091,10 @@ name = "ironclaw_common"
 version = "0.4.2"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "chrono-tz",
  "dirs",
+ "flate2",
  "hex",
  "rand 0.10.1",
  "rust_decimal",
@@ -4099,6 +4102,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
 ]

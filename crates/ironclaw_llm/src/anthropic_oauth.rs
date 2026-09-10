@@ -116,10 +116,10 @@ impl AnthropicOAuthProvider {
         // 悬挂(spawn 后 provider 调用超时,child 卡非终态阻塞后续 spawn)。
         let client = crate::config::hardened_client_builder(request_timeout_secs)
             .build()
-                .map_err(|e| LlmError::RequestFailed {
-                    provider: "anthropic_oauth".to_string(),
-                    reason: format!("Failed to build HTTP client: {}", e),
-                })?;
+            .map_err(|e| LlmError::RequestFailed {
+                provider: "anthropic_oauth".to_string(),
+                reason: format!("Failed to build HTTP client: {}", e),
+            })?;
 
         let active_model = std::sync::RwLock::new(config.model.clone());
         let base_url = if config.base_url.is_empty() {
@@ -176,13 +176,87 @@ impl AnthropicOAuthProvider {
         }
     }
 
+    /// 流式发送请求并聚合为完整响应(2026-08-28 天权补丁,治子 agent 长生成死循环)。
+    ///
+    /// 实测根因:Anthropic 协议兼容网关(火山)对**非流式**长生成请求(≥2500 字正文)
+    /// 返回慢(136s+)且 content 为空;**流式**首 token 1.9s 正常。子 agent(novelist)
+    /// 走 complete_with_tools 非流式 → 永远拿不到可用响应,重试死循环。
+    /// 修法:tool-capable 请求改走 stream + SSE 聚合,与 Anthropic 官方流式协议对齐
+    /// (message_start/content_block_start/content_block_delta/message_delta 聚合回
+    /// AnthropicResponse,调用方零改动)。
+    async fn send_request_streaming(
+        &self,
+        body: &AnthropicRequest,
+    ) -> Result<AnthropicResponse, LlmError> {
+        let url = self.api_url();
+        let mut streamed = body.clone();
+        streamed.stream = Some(true);
+
+        tracing::warn!(
+            url = %url,
+            "Sending STREAMING request to Anthropic OAuth"
+        );
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(self.current_token())
+            .header("anthropic-version", ANTHROPIC_API_VERSION)
+            .header("anthropic-beta", ANTHROPIC_OAUTH_BETA)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
+            .json(&streamed)
+            .send()
+            .await
+            .map_err(|e| LlmError::RequestFailed {
+                provider: "anthropic_oauth".to_string(),
+                reason: format!("streaming request failed: {e}"),
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let response_text = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
+            return Err(LlmError::RequestFailed {
+                provider: "anthropic_oauth".to_string(),
+                reason: format!("streaming HTTP {status}: {response_text}"),
+            });
+        }
+
+        use futures::StreamExt;
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
+        let mut aggregator = SseAggregator::default();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| LlmError::RequestFailed {
+                provider: "anthropic_oauth".to_string(),
+                reason: format!("streaming body read failed: {e}"),
+            })?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(line_end) = buffer.find('\n') {
+                let line: String = buffer.drain(..=line_end).collect();
+                let line = line.trim_end();
+                if let Some(payload) = line.strip_prefix("data:") {
+                    if let Ok(event) = serde_json::from_str::<SseEvent>(payload.trim()) {
+                        aggregator.absorb(event);
+                    }
+                }
+            }
+        }
+        tracing::debug!(
+            blocks = aggregator.blocks.len(),
+            "Anthropic OAuth streaming aggregation complete"
+        );
+        aggregator.finish()
+    }
+
     async fn send_request<R: for<'de> Deserialize<'de>>(
         &self,
         body: &AnthropicRequest,
     ) -> Result<R, LlmError> {
         let url = self.api_url();
 
-        tracing::debug!("Sending request to Anthropic OAuth: {}", url);
+        tracing::warn!("Sending request to Anthropic OAuth: {}", url);
 
         let response = self
             .client
@@ -318,6 +392,7 @@ impl LlmProvider for AnthropicOAuthProvider {
         let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
         let request = AnthropicRequest {
+            stream: None,
             thinking: thinking_for_request(&model, max_tokens, req.temperature, false),
             model,
             messages,
@@ -398,6 +473,7 @@ impl LlmProvider for AnthropicOAuthProvider {
         let opt_tools = if has_tools { Some(tools) } else { None };
 
         let request = AnthropicRequest {
+            stream: None,
             thinking: if has_tools {
                 None
             } else {
@@ -412,7 +488,9 @@ impl LlmProvider for AnthropicOAuthProvider {
             tool_choice,
         };
 
-        let response: AnthropicResponse = self.send_request(&request).await?;
+        // 2026-08-28 天权补丁:tool-capable 请求走流式聚合(非流式长生成在兼容
+        // 网关上慢且空,见 send_request_streaming 注释)。
+        let response: AnthropicResponse = self.send_request_streaming(&request).await?;
         let extracted = extract_response_content(&response);
 
         let finish_reason = match response.stop_reason.as_deref() {
@@ -472,10 +550,13 @@ impl LlmProvider for AnthropicOAuthProvider {
 
 // --- Anthropic Messages API types ---
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct AnthropicRequest {
     model: String,
     messages: Vec<AnthropicMessage>,
+    /// 流式开关(send_request_streaming 设 true;None=非流式,序列化省略)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
     max_tokens: u32,
@@ -489,21 +570,21 @@ struct AnthropicRequest {
     tool_choice: Option<AnthropicToolChoice>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct AnthropicMessage {
     role: String,
     content: AnthropicContent,
 }
 
 /// Anthropic content can be a simple string or a list of content blocks.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 enum AnthropicContent {
     Text(String),
     Blocks(Vec<AnthropicContentBlock>),
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 enum AnthropicContentBlock {
     #[serde(rename = "text")]
@@ -524,7 +605,7 @@ enum AnthropicContentBlock {
 }
 
 /// Inline base64 image source for an Anthropic `image` content block.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct AnthropicImageSource {
     #[serde(rename = "type")]
     source_type: &'static str,
@@ -532,14 +613,14 @@ struct AnthropicImageSource {
     data: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct AnthropicTool {
     name: String,
     description: String,
     input_schema: serde_json::Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct AnthropicToolChoice {
     #[serde(rename = "type")]
     choice_type: String,
@@ -553,6 +634,187 @@ struct AnthropicResponse {
     #[serde(default)]
     stop_reason: Option<String>,
     usage: AnthropicUsage,
+}
+
+/// SSE 流事件(Anthropic Messages streaming 协议子集,仅取聚合所需字段)。
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum SseEvent {
+    #[serde(rename = "message_start")]
+    MessageStart {
+        #[serde(default)]
+        message: SseMessageUsage,
+    },
+    #[serde(rename = "content_block_start")]
+    ContentBlockStart {
+        index: usize,
+        content_block: SseBlockStart,
+    },
+    #[serde(rename = "content_block_delta")]
+    ContentBlockDelta { index: usize, delta: SseDelta },
+    #[serde(rename = "message_delta")]
+    MessageDelta {
+        #[serde(default)]
+        delta: SseStopDelta,
+        #[serde(default)]
+        usage: SseUsageDelta,
+    },
+    #[serde(rename = "message_stop")]
+    MessageStop,
+    #[serde(other)]
+    Ignored,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SseMessageUsage {
+    #[serde(default)]
+    usage: SseUsageDelta,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SseUsageDelta {
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    output_tokens: u32,
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: u32,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SseStopDelta {
+    #[serde(default)]
+    stop_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SseBlockStart {
+    #[serde(rename = "type")]
+    block_type: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum SseDelta {
+    #[serde(rename = "text_delta")]
+    TextDelta { text: String },
+    #[serde(rename = "thinking_delta")]
+    ThinkingDelta { thinking: String },
+    #[serde(rename = "input_json_delta")]
+    InputJsonDelta { partial_json: String },
+    #[serde(other)]
+    Ignored,
+}
+
+/// SSE 聚合器:事件流 → AnthropicResponse(纯逻辑,单测覆盖)。
+#[derive(Default)]
+struct SseAggregator {
+    blocks: std::collections::BTreeMap<usize, AggregatingBlock>,
+    stop_reason: Option<String>,
+    usage: AnthropicUsage,
+}
+
+enum AggregatingBlock {
+    Text(String),
+    Thinking(String),
+    ToolUse {
+        id: String,
+        name: String,
+        json: String,
+    },
+}
+
+impl SseAggregator {
+    fn absorb(&mut self, event: SseEvent) {
+        match event {
+            SseEvent::MessageStart { message } => {
+                self.usage.input_tokens = message.usage.input_tokens;
+                self.usage.cache_creation_input_tokens = message.usage.cache_creation_input_tokens;
+                self.usage.cache_read_input_tokens = message.usage.cache_read_input_tokens;
+            }
+            SseEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => {
+                let block = match content_block.block_type.as_str() {
+                    "tool_use" => AggregatingBlock::ToolUse {
+                        id: content_block.id.unwrap_or_default(),
+                        name: content_block.name.unwrap_or_default(),
+                        json: String::new(),
+                    },
+                    "thinking" => AggregatingBlock::Thinking(String::new()),
+                    _ => AggregatingBlock::Text(String::new()),
+                };
+                self.blocks.insert(index, block);
+            }
+            SseEvent::ContentBlockDelta { index, delta } => match delta {
+                SseDelta::TextDelta { text } => {
+                    if let Some(AggregatingBlock::Text(buf)) = self.blocks.get_mut(&index) {
+                        buf.push_str(&text);
+                    }
+                }
+                SseDelta::ThinkingDelta { thinking } => {
+                    if let Some(AggregatingBlock::Thinking(buf)) = self.blocks.get_mut(&index) {
+                        buf.push_str(&thinking);
+                    }
+                }
+                SseDelta::InputJsonDelta { partial_json } => {
+                    if let Some(AggregatingBlock::ToolUse { json, .. }) =
+                        self.blocks.get_mut(&index)
+                    {
+                        json.push_str(&partial_json);
+                    }
+                }
+                SseDelta::Ignored => {}
+            },
+            SseEvent::MessageDelta { delta, usage } => {
+                if delta.stop_reason.is_some() {
+                    self.stop_reason = delta.stop_reason;
+                }
+                if usage.output_tokens > 0 {
+                    self.usage.output_tokens = usage.output_tokens;
+                }
+            }
+            SseEvent::MessageStop | SseEvent::Ignored => {}
+        }
+    }
+
+    fn finish(self) -> Result<AnthropicResponse, LlmError> {
+        if self.blocks.is_empty() {
+            return Err(LlmError::RequestFailed {
+                provider: "anthropic_oauth".to_string(),
+                reason: "streaming response contained no content blocks".to_string(),
+            });
+        }
+        let content = self
+            .blocks
+            .into_values()
+            .map(|block| match block {
+                AggregatingBlock::Text(text) => AnthropicResponseBlock::Text { text },
+                AggregatingBlock::Thinking(thinking) => AnthropicResponseBlock::Thinking {
+                    thinking: Some(thinking),
+                    summary: None,
+                    _signature: None,
+                },
+                AggregatingBlock::ToolUse { id, name, json } => AnthropicResponseBlock::ToolUse {
+                    id,
+                    name,
+                    input: serde_json::from_str(&json).unwrap_or(serde_json::Value::Null),
+                },
+            })
+            .collect();
+        Ok(AnthropicResponse {
+            content,
+            stop_reason: self.stop_reason,
+            usage: self.usage,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -581,7 +843,7 @@ enum AnthropicResponseBlock {
     Other,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct AnthropicUsage {
     #[serde(default)]
     input_tokens: u32,
@@ -1030,5 +1292,101 @@ mod tests {
 
         // Subsequent reads see the updated token
         assert_eq!(token.read().unwrap().expose_secret(), "new_token");
+    }
+}
+
+// 覆盖:2026-08-28 天权补丁——SSE 流式聚合(治子 agent 长生成非流式死循环)
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    fn feed(aggregator: &mut SseAggregator, json_line: &str) {
+        let event: SseEvent = serde_json::from_str(json_line).expect("测试事件应可解析");
+        aggregator.absorb(event);
+    }
+
+    #[test]
+    fn sse_text_and_tool_use_aggregate() {
+        let mut agg = SseAggregator::default();
+        feed(
+            &mut agg,
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":120,"cache_read_input_tokens":30}}}"#,
+        );
+        feed(
+            &mut agg,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text"}}"#,
+        );
+        feed(
+            &mut agg,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"正文"}}"#,
+        );
+        feed(
+            &mut agg,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"续写"}}"#,
+        );
+        feed(
+            &mut agg,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tu_1","name":"write_file"}}"#,
+        );
+        feed(
+            &mut agg,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
+        );
+        feed(
+            &mut agg,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"/tmp/a\"}"}}"#,
+        );
+        feed(
+            &mut agg,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":456}}"#,
+        );
+        feed(&mut agg, r#"{"type":"message_stop"}"#);
+        let resp = agg.finish().expect("聚合应成功");
+        assert_eq!(resp.usage.input_tokens, 120);
+        assert_eq!(resp.usage.cache_read_input_tokens, 30);
+        assert_eq!(resp.usage.output_tokens, 456);
+        assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
+        match &resp.content[0] {
+            AnthropicResponseBlock::Text { text } => assert_eq!(text, "正文续写"),
+            other => panic!("块 0 应为 Text: {other:?}"),
+        }
+        match &resp.content[1] {
+            AnthropicResponseBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "tu_1");
+                assert_eq!(name, "write_file");
+                assert_eq!(input["path"], "/tmp/a");
+            }
+            other => panic!("块 1 应为 ToolUse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sse_thinking_block_aggregates() {
+        let mut agg = SseAggregator::default();
+        feed(
+            &mut agg,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}"#,
+        );
+        feed(
+            &mut agg,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"推理"}}"#,
+        );
+        feed(
+            &mut agg,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}"#,
+        );
+        let resp = agg.finish().expect("聚合应成功");
+        match &resp.content[0] {
+            AnthropicResponseBlock::Thinking { thinking, .. } => {
+                assert_eq!(thinking.as_deref(), Some("推理"))
+            }
+            other => panic!("应为 Thinking: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sse_empty_stream_errors() {
+        let agg = SseAggregator::default();
+        assert!(agg.finish().is_err(), "空流应报错(端点空响应铁证形态)");
     }
 }

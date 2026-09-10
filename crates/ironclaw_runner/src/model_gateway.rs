@@ -348,7 +348,14 @@ pub struct LlmProviderModelGateway<P>
 where
     P: LlmProvider + ?Sized,
 {
-    provider_id: String,
+    /// Explicit provider identity for replay/trace, when the caller pinned one
+    /// (tests, routed pools). `None` → resolved per request from the live
+    /// provider (`provider.model_name()`), so a hot-swapped chain (boot
+    /// placeholder → real provider via the LLM reload seam) is reflected in
+    /// replay identities, trace events, and latency telemetry instead of
+    /// permanently reporting the boot-time placeholder id (`"unconfigured"`),
+    /// which made reloaded deployments undiagnosable in traces.
+    provider_id_override: Option<String>,
     provider: Arc<P>,
     policy: LlmModelProfilePolicy,
     provider_turn_sequence: Arc<AtomicU64>,
@@ -360,8 +367,22 @@ where
     P: LlmProvider + ?Sized,
 {
     pub fn new(provider: Arc<P>, policy: LlmModelProfilePolicy) -> Self {
-        let provider_id = provider.model_name().to_string();
-        Self::with_provider_identity(provider_id, provider, policy)
+        Self::with_dynamic_provider_identity(provider, policy)
+    }
+
+    /// Builds a gateway whose provider identity is resolved from the live
+    /// provider on every request. Pairs with hot-swappable providers
+    /// (`SwappableLlmProvider`), whose `model_name()` snapshot refreshes on
+    /// every swap, so trace/latency events track the active provider across
+    /// reloads.
+    pub fn with_dynamic_provider_identity(provider: Arc<P>, policy: LlmModelProfilePolicy) -> Self {
+        Self {
+            provider_id_override: None,
+            provider,
+            policy,
+            provider_turn_sequence: Arc::new(AtomicU64::new(1)),
+            prompt_cache_activity: Arc::new(PromptCacheActivityLog::default()),
+        }
     }
 
     pub fn with_provider_identity(
@@ -370,12 +391,21 @@ where
         policy: LlmModelProfilePolicy,
     ) -> Self {
         Self {
-            provider_id: provider_id.into(),
+            provider_id_override: Some(provider_id.into()),
             provider,
             policy,
             provider_turn_sequence: Arc::new(AtomicU64::new(1)),
             prompt_cache_activity: Arc::new(PromptCacheActivityLog::default()),
         }
+    }
+
+    /// The provider identity used for replay/trace: the pinned override when
+    /// one was supplied, otherwise the live provider's current
+    /// `model_name()`.
+    fn replay_provider_id(&self) -> String {
+        self.provider_id_override
+            .clone()
+            .unwrap_or_else(|| self.provider.model_name().to_string())
     }
 
     fn prompt_cache_scope(&self, run_id: TurnRunId) -> PromptCacheCallScope {
@@ -412,7 +442,8 @@ where
         let model_profile_id = request.model_profile_id.clone();
         let run_id = request.run_id;
         let turn_id = request.turn_id;
-        let replay_identity = ProviderReplayIdentity::new(&self.provider_id, &model_override)?;
+        let replay_identity =
+            ProviderReplayIdentity::new(&self.replay_provider_id(), &model_override)?;
         let mut completion =
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(model_override);
@@ -455,7 +486,8 @@ where
         let model_profile_id = request.model_profile_id.clone();
         let run_id = request.run_id;
         let turn_id = request.turn_id;
-        let replay_identity = ProviderReplayIdentity::new(&self.provider_id, &model_override)?;
+        let replay_identity =
+            ProviderReplayIdentity::new(&self.replay_provider_id(), &model_override)?;
         let mut completion =
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(model_override);
@@ -498,7 +530,8 @@ where
         let model_profile_id = request.model_profile_id.clone();
         let run_id = request.run_id;
         let turn_id = request.turn_id;
-        let replay_identity = ProviderReplayIdentity::new(&self.provider_id, &model_override)?;
+        let replay_identity =
+            ProviderReplayIdentity::new(&self.replay_provider_id(), &model_override)?;
         let mut completion =
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(model_override);
@@ -546,7 +579,8 @@ where
         let model_profile_id = request.model_profile_id.clone();
         let run_id = request.run_id;
         let turn_id = request.turn_id;
-        let replay_identity = ProviderReplayIdentity::new(&self.provider_id, &model_override)?;
+        let replay_identity =
+            ProviderReplayIdentity::new(&self.replay_provider_id(), &model_override)?;
         let mut completion =
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(model_override);
@@ -2414,13 +2448,25 @@ fn convert_messages(
                     continue;
                 };
                 if !provider_replay_matches_identity(&provider_call, replay_identity) {
+                    // 2026-08-29 天权补丁(治子 agent 重试死循环):身份 mismatch 的
+                    // replay 消息降级纯文本而非走 validate 短路——replay 元数据是
+                    // 历史 run 写入的,provider 热替换/重启后身份必然漂移(实测
+                    // "unconfigured"→"deepseek-v4-flash"),mismatch 曾把整轮转成
+                    // PolicyDenied → run 重试 → 再撞同元数据 → 永久循环。
+                    // 历史 tool_result 的正文本身 provider 无关,降级安全。
                     converted.push(ChatMessage::user(tool_summary_message(
                         replay.plain_fallback_content(),
                     )));
                     index += 1;
                     continue;
                 }
-                validate_provider_replay_identity(&provider_call, replay_identity)?;
+                if validate_provider_replay_identity(&provider_call, replay_identity).is_err() {
+                    converted.push(ChatMessage::user(tool_summary_message(
+                        replay.plain_fallback_content(),
+                    )));
+                    index += 1;
+                    continue;
+                }
                 let provider_turn_id = provider_call.provider_turn_id.clone();
                 let mut provider_results = vec![(provider_call, replay.model_content)];
                 let mut plain_tool_results = Vec::new();
@@ -2439,7 +2485,13 @@ fn convert_messages(
                         index += 1;
                         continue;
                     }
-                    validate_provider_replay_identity(&next_provider_call, replay_identity)?;
+                    if validate_provider_replay_identity(&next_provider_call, replay_identity)
+                        .is_err()
+                    {
+                        plain_tool_results.push(next.plain_fallback_content());
+                        index += 1;
+                        continue;
+                    }
                     if next_provider_call.provider_turn_id != provider_turn_id {
                         break;
                     }
@@ -2690,6 +2742,116 @@ fn is_credit_exhaustion_error(error: &LlmError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal provider stub whose identity is its `model_name`.
+    struct NamedStubProvider {
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for NamedStubProvider {
+        fn model_name(&self) -> &str {
+            self.name
+        }
+        fn cost_per_token(&self) -> (rust_decimal::Decimal, rust_decimal::Decimal) {
+            (rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO)
+        }
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            Ok(CompletionResponse {
+                content: self.name.to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+                finish_reason: FinishReason::Stop,
+                reasoning: None,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+        async fn complete_with_tools(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, LlmError> {
+            Ok(ToolCompletionResponse {
+                content: Some(self.name.to_string()),
+                tool_calls: Vec::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                finish_reason: FinishReason::Stop,
+                reasoning: None,
+                reasoning_details: None,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+    }
+
+    fn interactive_policy() -> LlmModelProfilePolicy {
+        let profile_id =
+            ironclaw_turns::run_profile::ModelProfileId::new("interactive_model").unwrap();
+        LlmModelProfilePolicy::new().allow_model_profile(profile_id, None)
+    }
+
+    /// Regression for the boot-snapshot identity bug: a gateway built with
+    /// `new` must report the *live* provider identity on every request, not
+    /// the boot-time placeholder. Before the fix, a cold boot wired a
+    /// placeholder provider whose `model_name()` is `"unconfigured"`, and the
+    /// gateway pinned that as its replay/trace provider id forever — every
+    /// trace event kept reporting `provider_id: "unconfigured"` even after a
+    /// reload swapped a real provider in, making reloaded deployments
+    /// undiagnosable (observed in production: successful runs and failing
+    /// runs alike all traced as "unconfigured").
+    #[test]
+    fn dynamic_provider_identity_follows_hot_swap() {
+        use ironclaw_llm::LlmProvider as _;
+        use ironclaw_llm::SwappableLlmProvider;
+
+        let swappable = Arc::new(SwappableLlmProvider::new(Arc::new(NamedStubProvider {
+            name: "unconfigured",
+        })));
+        let gateway = LlmProviderModelGateway::new(
+            swappable.clone() as Arc<dyn LlmProvider>,
+            interactive_policy(),
+        );
+
+        // Boot state: the placeholder identity is reported.
+        assert_eq!(gateway.replay_provider_id(), "unconfigured");
+
+        // After a reload swaps a real provider in, the identity follows.
+        swappable.swap(Arc::new(NamedStubProvider { name: "anthropic" }));
+        assert_eq!(
+            gateway.replay_provider_id(),
+            "anthropic",
+            "replay identity must track the live provider across hot swaps"
+        );
+    }
+
+    /// A pinned identity (`with_provider_identity`) must keep winning over the
+    /// live provider identity — tests and routed pools rely on the explicit id.
+    #[test]
+    fn pinned_provider_identity_is_stable_across_hot_swap() {
+        use ironclaw_llm::LlmProvider as _;
+        use ironclaw_llm::SwappableLlmProvider;
+
+        let swappable = Arc::new(SwappableLlmProvider::new(Arc::new(NamedStubProvider {
+            name: "unconfigured",
+        })));
+        let gateway = LlmProviderModelGateway::with_provider_identity(
+            "pinned-id",
+            swappable.clone() as Arc<dyn LlmProvider>,
+            interactive_policy(),
+        );
+
+        assert_eq!(gateway.replay_provider_id(), "pinned-id");
+        swappable.swap(Arc::new(NamedStubProvider { name: "anthropic" }));
+        assert_eq!(
+            gateway.replay_provider_id(),
+            "pinned-id",
+            "pinned identity must not be overridden by the live provider"
+        );
+    }
 
     #[derive(Default)]
     struct RecordingSafeTextSink {

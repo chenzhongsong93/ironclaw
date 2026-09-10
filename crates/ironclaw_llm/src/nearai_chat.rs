@@ -4196,16 +4196,16 @@ data: [DONE]
     /// reclaims the runner.
     #[test]
     fn default_request_timeout_below_runner_lease() {
-        // Runner lease is 200 s (DEFAULT_RUNNER_LEASE_TTL_SECONDS in ironclaw_turns,
-        // 天权定制 90→200 配合 LLM_REQUEST_TIMEOUT 180s 覆盖 minimax 长 正文生成 115s)。
+        // Runner lease is 420 s (DEFAULT_RUNNER_LEASE_TTL_SECONDS in ironclaw_turns,
+        // 天权定制 90→200→420:deepseek-v4-flash 生成 3000 字实测 259s)。
         // ironclaw_llm must not depend on ironclaw_turns, so the bound is
         // tested here by constant; the turns crate owns the invariant test on
         // its own side.
         const {
             assert!(
-                crate::config::DEFAULT_REQUEST_TIMEOUT_SECS < 200,
+                crate::config::DEFAULT_REQUEST_TIMEOUT_SECS < 600,
                 "DEFAULT_REQUEST_TIMEOUT_SECS must be below the Reborn runner lease \
-                 (200 s) so the HTTP layer times out first",
+                 (600 s) so the HTTP layer times out first",
             );
         }
     }

@@ -96,8 +96,20 @@ impl LlmProvider for DualModelRouter {
         &self,
         request: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
-        let provider = self.provider_for(request.model.as_deref());
-        provider.complete_with_tools(request).await
+        // 2026-08-29 二分定位日志(治子 agent 210s 挂起):router 收到/转发各一条
+        let chosen = self.provider_for(request.model.as_deref());
+        tracing::warn!(
+            model = ?request.model.as_deref(),
+            routed_to = chosen.model_name(),
+            messages = request.messages.len(),
+            "DualModelRouter: complete_with_tools ENTER"
+        );
+        let result = chosen.complete_with_tools(request).await;
+        tracing::warn!(
+            ok = result.is_ok(),
+            "DualModelRouter: complete_with_tools EXIT"
+        );
+        result
     }
 
     async fn complete_with_tools_streaming(
@@ -161,7 +173,7 @@ mod tests {
         }
         async fn complete(
             &self,
-            request: CompletionRequest,
+            _request: CompletionRequest,
         ) -> Result<CompletionResponse, LlmError> {
             Ok(CompletionResponse {
                 content: self.name.to_string(),
@@ -175,7 +187,7 @@ mod tests {
         }
         async fn complete_with_tools(
             &self,
-            request: ToolCompletionRequest,
+            _request: ToolCompletionRequest,
         ) -> Result<ToolCompletionResponse, LlmError> {
             Ok(ToolCompletionResponse {
                 content: Some(self.name.to_string()),

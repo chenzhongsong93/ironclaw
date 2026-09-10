@@ -1600,10 +1600,12 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
                 .join("users")
                 .join(ws_owner.as_str())
                 .join("workspace");
-            std::fs::create_dir_all(&scoped_ws).map_err(|error| RebornBuildError::InvalidConfig {
-                reason: format!(
-                    "local-dev per-user workspace root could not be initialized: {error}"
-                ),
+            std::fs::create_dir_all(&scoped_ws).map_err(|error| {
+                RebornBuildError::InvalidConfig {
+                    reason: format!(
+                        "local-dev per-user workspace root could not be initialized: {error}"
+                    ),
+                }
             })?;
         }
         Ok::<(), RebornBuildError>(())
@@ -2562,8 +2564,8 @@ async fn build_local_runtime_store_graph(
     }
     // 天权定制(2026-07-22):local-dev 用 InMemoryResourceGovernor(ComposedResourceGovernor
     // type alias 已改为 InMemory),绕开 FilesystemResourceGovernor journal 写入失败致 poison。
-    let resource_governor = InMemoryResourceGovernor::new()
-        .with_event_sink(Arc::clone(&budget_event_sink));
+    let resource_governor =
+        InMemoryResourceGovernor::new().with_event_sink(Arc::clone(&budget_event_sink));
     let resource_governor: Arc<ComposedResourceGovernor> = Arc::new(resource_governor);
     let skill_mounts =
         skill_management_mount_view().map_err(|error| RebornBuildError::InvalidConfig {

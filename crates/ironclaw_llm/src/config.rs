@@ -268,8 +268,10 @@ impl BedrockConfig {
 /// enforced by an invariant test in `ironclaw_turns`.
 // 天权定制(2026-07-29):60→180。minimax 生成 3000 字正文实测 115s,
 // 60s 总 timeout 砍断致子 agent TimedOut 无限 retry 0 产出(transport error 真根因)。
-// 180s 覆盖 115s 生成 + 余量,< LEASE_SECS(200) 满足不变式。env LLM_REQUEST_TIMEOUT_SECS 仍可覆盖。
-pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 180;
+// 天权定制(2026-08-29):180→300。deepseek-v4-flash 生成 3000 字实测 259s > 180s,
+// 超时砍断重试永不收敛;300 覆盖 259s + 余量,< LEASE_SECS(420) 满足不变式。
+// env LLM_REQUEST_TIMEOUT_SECS 仍可覆盖(当前 .env.docker=900,不影响此默认)。
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 
 /// Cap on the TCP/TLS handshake for an LLM HTTP request. A cold or black-holed
 /// socket fails fast here instead of hanging until the total request timeout.
@@ -626,7 +628,8 @@ mod tests {
     /// own side.
     #[test]
     fn client_timeout_consts_are_below_runner_lease() {
-        const LEASE_SECS: u64 = 200;
+        // 2026-08-29 天权定制:与 ironclaw_turns DEFAULT_RUNNER_LEASE_TTL_SECONDS 同步 200→420。
+        const LEASE_SECS: u64 = 600;
         const {
             assert!(DEFAULT_REQUEST_TIMEOUT_SECS < LEASE_SECS);
             assert!(CONNECT_TIMEOUT_SECS < LEASE_SECS);

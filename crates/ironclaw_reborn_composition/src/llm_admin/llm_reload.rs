@@ -11,6 +11,17 @@ use crate::llm_admin::llm_catalog::{
 use crate::llm_admin::llm_config_service::LlmReloadTrigger;
 use crate::runtime_input::ResolvedRebornLlm;
 
+/// Read the boot-time `[llm.mission] model`, tolerating a missing config file
+/// or slot (`None`). Mirrors the runtime assembly's boot-time read so drift
+/// detection compares like with like.
+fn boot_mission_model_from_config(boot: &RebornBootConfig) -> Option<String> {
+    ironclaw_reborn_config::RebornConfigFile::load(&boot.home().config_file_path())
+        .ok()
+        .flatten()?
+        .mission_llm_slot()
+        .and_then(|slot| slot.model.clone())
+}
+
 /// Live-reload adapter wired by the runtime. Re-resolves the LLM config from
 /// `config.toml` + `providers.json` + the stored key, then hot-swaps the
 /// running provider's inner backend via the `ironclaw_llm` reload handle.
@@ -24,6 +35,11 @@ pub(crate) struct RebornLlmReloadAdapter {
     session: Arc<ironclaw_llm::SessionManager>,
     keys: LlmKeyStore,
     mission_swappable: Option<Arc<ironclaw_llm::SwappableLlmProvider>>,
+    /// The `[llm.mission] model` as read at boot — the value the gateway's
+    /// DualModelRouter dispatch key and `mission_model` profile override were
+    /// pinned from. Kept so reloads can detect (and surface) mission-model
+    /// drift, which a hot reload cannot apply to the running gateway.
+    boot_mission_model: Option<String>,
 }
 
 impl RebornLlmReloadAdapter {
@@ -35,6 +51,7 @@ impl RebornLlmReloadAdapter {
         mission_swappable: Option<Arc<ironclaw_llm::SwappableLlmProvider>>,
     ) -> Self {
         Self {
+            boot_mission_model: boot_mission_model_from_config(&boot),
             boot,
             reload_handle,
             session,
@@ -138,6 +155,24 @@ impl LlmReloadTrigger for RebornLlmReloadAdapter {
                     .map_err(|error| error.to_string())?
             {
                 let mission_provider_id = mission_resolved.provider_id().to_string();
+                // The gateway's DualModelRouter dispatch key and the
+                // `mission_model` profile override were pinned at boot from
+                // the then-current `[llm.mission] model`. A changed mission
+                // model cannot be hot-applied to them — surface the drift so
+                // operators know a restart is required instead of silently
+                // routing mission-profile runs to a chain under a stale key.
+                let reloaded_mission_model = mission_resolved.config.active_model_name();
+                if self.boot_mission_model.as_deref()
+                    != Some(reloaded_mission_model.as_str())
+                {
+                    tracing::warn!(
+                        mission_provider_id = %mission_provider_id,
+                        boot_mission_model = self.boot_mission_model.as_deref().unwrap_or(""),
+                        reloaded_mission_model = %reloaded_mission_model,
+                        "[llm.mission] model changed since boot; the running gateway still routes \
+                         the mission model profile by the boot-time model name — restart to apply",
+                    );
+                }
                 let mut mission_config = mission_resolved.config;
                 if let Some(stored) = self
                     .keys
@@ -147,10 +182,19 @@ impl LlmReloadTrigger for RebornLlmReloadAdapter {
                 {
                     apply_stored_api_key(&mut mission_config, stored);
                 }
-                match ironclaw_llm::build_provider_chain(&mission_config, Arc::clone(&self.session))
-                    .await
+                // Swap the *bare* chain: `build_bare_provider_chain` returns
+                // the decorated primary without its own swappable/recording
+                // wrappers, so repeated reloads do not stack wrapper layers
+                // under this handle (the old path swapped the wrapped output
+                // of `build_provider_chain`, adding one nested swappable —
+                // plus a recording wrapper when enabled — per reload).
+                match ironclaw_llm::build_bare_provider_chain(
+                    &mission_config,
+                    Arc::clone(&self.session),
+                )
+                .await
                 {
-                    Ok((mission_chain, _, _, _)) => {
+                    Ok(mission_chain) => {
                         mission_swappable.swap(mission_chain);
                         tracing::debug!(
                             mission_provider_id = %mission_provider_id,
@@ -168,5 +212,55 @@ impl LlmReloadTrigger for RebornLlmReloadAdapter {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ironclaw_reborn_config::{RebornHome, RebornProfile};
+
+    fn boot_for_home(reborn_home: &std::path::Path) -> RebornBootConfig {
+        let home = RebornHome::resolve_from_env_parts(
+            Some(reborn_home.as_os_str().to_os_string()),
+            None,
+            None,
+        )
+        .expect("valid reborn home");
+        RebornBootConfig::new(home, RebornProfile::LocalDev)
+    }
+
+    #[test]
+    fn boot_mission_model_reads_configured_mission_slot_model() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "[llm.default]\nprovider_id = \"anthropic\"\nmodel = \"deepseek-v4-flash\"\n\n[llm.mission]\nprovider_id = \"anthropic\"\nmodel = \"MiniMax-M3\"\n",
+        )
+        .expect("write config");
+        let boot = boot_for_home(temp.path());
+        assert_eq!(
+            boot_mission_model_from_config(&boot).as_deref(),
+            Some("MiniMax-M3")
+        );
+    }
+
+    #[test]
+    fn boot_mission_model_is_none_without_mission_slot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "[llm.default]\nprovider_id = \"anthropic\"\nmodel = \"deepseek-v4-flash\"\n",
+        )
+        .expect("write config");
+        let boot = boot_for_home(temp.path());
+        assert_eq!(boot_mission_model_from_config(&boot), None);
+    }
+
+    #[test]
+    fn boot_mission_model_tolerates_missing_config_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let boot = boot_for_home(temp.path());
+        assert_eq!(boot_mission_model_from_config(&boot), None);
     }
 }

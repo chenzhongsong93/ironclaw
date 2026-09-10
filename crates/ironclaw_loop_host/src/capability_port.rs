@@ -48,8 +48,7 @@ use self::provider_input::{
     prepare_provider_arguments_with_detail, schema_contains_external_ref,
 };
 use self::provider_validation::{
-    PROVIDER_TOOL_NAME_MAX_BYTES, truncate_bytes_utf8, validate_provider_arguments,
-    validate_provider_tool_call,
+    PROVIDER_TOOL_NAME_MAX_BYTES, validate_provider_arguments, validate_provider_tool_call,
 };
 use self::surface_snapshot::{
     RuntimeSurfaceCapabilitySnapshot, SurfaceCapabilitySnapshot, SurfaceSnapshot,

@@ -122,7 +122,11 @@ const MAX_IDEMPOTENCY_RECORDS: usize = 10_000;
 // 天权定制(2026-07-29):90→200。minimax 生成 3000 字正文实测 115s,
 // 原 90s lease + 60s request_timeout 致子 agent 长 正文生成被砍断 TimedOut 无限 retry。
 // 调 LLM_REQUEST_TIMEOUT_SECS=180(覆盖 115s 生成)+ lease 200(>180 满足 request<lease 不变式)。
-pub(crate) const DEFAULT_RUNNER_LEASE_TTL_SECONDS: i64 = 200;
+// 天权定制(2026-08-29):200→420。deepseek-v4-flash(火山)生成 3000 字实测 259s
+// > 200s lease → 模型请求在 lease 到期时被砍断,子 agent 每 210s 重试一轮,
+// 永远差一截(宿主机同请求 259s 正常产文铁证)。420 = 259s × 1.5 余量 + 10s 回收间隔,
+// 仍 > request timeout(见下 anthropic_oauth DEFAULT_REQUEST_TIMEOUT_SECS 300)。
+pub(crate) const DEFAULT_RUNNER_LEASE_TTL_SECONDS: i64 = 600;
 
 /// Default crash-retry bound for lease recovery of a checkpointless run (#6284).
 /// Small and consistent with the crate's other bounded-retry counters — a

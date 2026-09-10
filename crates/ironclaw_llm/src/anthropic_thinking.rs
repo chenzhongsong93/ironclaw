@@ -2,7 +2,7 @@ use serde::Serialize;
 
 const THINKING_BUDGET_TOKENS: u32 = 1024;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub(crate) enum AnthropicThinking {
     #[serde(rename = "enabled")]

@@ -49,6 +49,21 @@ pub trait AwaitEdgeWriter: Send + Sync {
         Ok(())
     }
 
+    /// Reconcile every durable scope currently present in the await-edge
+    /// roster. The in-memory/test writer has no durable recovery work and uses
+    /// this default no-op; production's filesystem-backed recovery driver
+    /// overrides it. Runner boot and its periodic recovery tick call this same
+    /// seam so terminal events lost before a parent parks are re-driven.
+    async fn recover_all_await_edges(&self) -> ResolveReport {
+        ResolveReport::default()
+    }
+
+    /// Stop and join any recovery work this writer started outside the
+    /// scheduler's own task set. The scheduler invokes this during shutdown
+    /// after cancelling its periodic pass, so implementations must prevent
+    /// late recovery completions from mutating scope admission state.
+    async fn shutdown_await_edge_recovery(&self) {}
+
     /// Idempotently opens the edge (+ scope-roster touch before it, §4.5
     /// write-before-first-edge ordering) for this parent/child pair. No-ops
     /// if an edge for this exact pair is already recorded.

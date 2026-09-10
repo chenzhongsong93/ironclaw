@@ -17,7 +17,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use ironclaw_host_api::CapabilityId;
+use ironclaw_host_api::{CapabilityId, InvocationId};
 use ironclaw_loop_host::{
     CapabilityResultWrite, CapabilityWriteResult, LoopCapabilityInputResolver,
     LoopCapabilityResultWriter,
@@ -76,10 +76,33 @@ impl LoopCapabilityResultWriter for RecordingCapabilityResultWriter {
         let output = write.output.clone();
         let write_result = self.result_writer.write_capability_result(write).await?;
         self.results.lock().unwrap().push(RecordedCapabilityResult {
+            result_ref: write_result.result_ref.as_str().to_string(),
             capability_id,
             output,
         });
         Ok(write_result)
+    }
+
+    fn record_running_invocation(
+        &self,
+        run_context: &LoopRunContext,
+        invocation_id: InvocationId,
+        input_ref: &CapabilityInputRef,
+    ) {
+        self.result_writer
+            .record_running_invocation(run_context, invocation_id, input_ref);
+    }
+
+    async fn stage_capability_failure_preview(
+        &self,
+        run_context: &LoopRunContext,
+        invocation_id: InvocationId,
+        capability_id: &CapabilityId,
+        summary: &str,
+    ) {
+        self.result_writer
+            .stage_capability_failure_preview(run_context, invocation_id, capability_id, summary)
+            .await;
     }
 
     async fn update_capability_result(
@@ -92,15 +115,17 @@ impl LoopCapabilityResultWriter for RecordingCapabilityResultWriter {
             .result_writer
             .update_capability_result(run_context, result_ref, output.clone())
             .await?;
-        self.results.lock().unwrap().push(RecordedCapabilityResult {
-            capability_id: CapabilityId::new(
-                ironclaw_loop_host::DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID,
-            )
-            .map_err(|error| {
-                AgentLoopHostError::new(AgentLoopHostErrorKind::Internal, error.to_string())
-            })?,
-            output,
-        });
+        let mut results = self.results.lock().unwrap();
+        let Some(existing) = results
+            .iter_mut()
+            .find(|record| record.result_ref == result_ref.as_str())
+        else {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::InvalidInvocation,
+                "capability result update is missing its original recorded result",
+            ));
+        };
+        existing.output = output;
         Ok(byte_len)
     }
 }

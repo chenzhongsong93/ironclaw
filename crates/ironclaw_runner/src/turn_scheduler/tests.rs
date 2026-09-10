@@ -8,7 +8,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -16,6 +16,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
+use ironclaw_loop_host::{AwaitEdgeWriter, AwaitedChildSetRecord, ResolveReport};
 use ironclaw_turns::{
     AcceptedMessageRef, EventCursor, InMemoryRunProfileResolver, ReplyTargetBindingRef,
     RunProfileId, RunProfileResolutionRequest, RunProfileResolver, RunProfileVersion,
@@ -105,6 +106,82 @@ impl TurnRunTransitionPort for NoopTransitionPort {
 
 /// A `TurnRunExecutor` that never executes (claim_next_run always returns None).
 struct NoopExecutor;
+
+#[derive(Default)]
+struct CountingAwaitEdgeRecovery {
+    calls: AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl AwaitEdgeWriter for CountingAwaitEdgeRecovery {
+    async fn recover_all_await_edges(&self) -> ResolveReport {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.notify.notify_waiters();
+        ResolveReport::default()
+    }
+
+    async fn record_awaited_child(
+        &self,
+        _record: AwaitedChildSetRecord,
+    ) -> Result<(), ironclaw_turns::run_profile::AgentLoopHostError> {
+        Ok(())
+    }
+
+    async fn abandon_awaited_child(
+        &self,
+        _child_scope: &TurnScope,
+        _parent_run_id: TurnRunId,
+        _child_run_id: TurnRunId,
+    ) -> Result<(), ironclaw_turns::run_profile::AgentLoopHostError> {
+        Ok(())
+    }
+}
+
+struct BlockingAwaitEdgeRecovery {
+    started: AtomicBool,
+    started_notify: tokio::sync::Notify,
+    shutdown_called: AtomicBool,
+}
+
+impl BlockingAwaitEdgeRecovery {
+    fn new() -> Self {
+        Self {
+            started: AtomicBool::new(false),
+            started_notify: tokio::sync::Notify::new(),
+            shutdown_called: AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl AwaitEdgeWriter for BlockingAwaitEdgeRecovery {
+    async fn recover_all_await_edges(&self) -> ResolveReport {
+        self.started.store(true, Ordering::SeqCst);
+        self.started_notify.notify_waiters();
+        std::future::pending().await
+    }
+
+    async fn shutdown_await_edge_recovery(&self) {
+        self.shutdown_called.store(true, Ordering::SeqCst);
+    }
+
+    async fn record_awaited_child(
+        &self,
+        _record: AwaitedChildSetRecord,
+    ) -> Result<(), ironclaw_turns::run_profile::AgentLoopHostError> {
+        Ok(())
+    }
+
+    async fn abandon_awaited_child(
+        &self,
+        _child_scope: &TurnScope,
+        _parent_run_id: TurnRunId,
+        _child_run_id: TurnRunId,
+    ) -> Result<(), ironclaw_turns::run_profile::AgentLoopHostError> {
+        Ok(())
+    }
+}
 
 #[async_trait]
 impl TurnRunExecutor for NoopExecutor {
@@ -531,6 +608,103 @@ async fn heartbeat_does_not_deadlock_executor_holding_transition_lock() {
         transitions.heartbeat_count() > 0,
         "test must exercise at least one heartbeat while the executor is running"
     );
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn scheduler_shutdown_cancels_lazy_await_edge_recovery() {
+    let recovery = Arc::new(BlockingAwaitEdgeRecovery::new());
+    let config = TurnRunSchedulerConfig::default()
+        .with_poll_interval(Duration::from_secs(3600))
+        .with_lease_recovery_interval(Duration::from_secs(3600));
+    let scheduler =
+        TurnRunScheduler::new(Arc::new(NoopTransitionPort), Arc::new(NoopExecutor), config)
+            .with_await_edge_recovery(
+                Arc::clone(&recovery) as Arc<dyn AwaitEdgeWriter>,
+                Duration::from_secs(3600),
+            );
+    let handle = scheduler.start();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !recovery.started.load(Ordering::SeqCst) {
+            recovery.started_notify.notified().await;
+        }
+    })
+    .await
+    .expect("boot recovery should start before shutdown");
+
+    tokio::time::timeout(Duration::from_secs(2), handle.shutdown())
+        .await
+        .expect("scheduler shutdown must not wait forever on recovery");
+    assert!(
+        recovery.shutdown_called.load(Ordering::SeqCst),
+        "scheduler shutdown must cancel and join recovery-owned lazy tasks"
+    );
+}
+
+#[tokio::test]
+async fn scheduler_drain_command_triggers_await_edge_recovery_without_waiting_for_timer() {
+    let recovery = Arc::new(CountingAwaitEdgeRecovery::default());
+    let config = TurnRunSchedulerConfig::default()
+        .with_poll_interval(Duration::from_secs(3600))
+        .with_lease_recovery_interval(Duration::from_secs(3600));
+    let scheduler =
+        TurnRunScheduler::new(Arc::new(NoopTransitionPort), Arc::new(NoopExecutor), config)
+            .with_await_edge_recovery(
+                Arc::clone(&recovery) as Arc<dyn AwaitEdgeWriter>,
+                Duration::from_secs(3600),
+            );
+    let handle = scheduler.start();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while recovery.calls.load(Ordering::SeqCst) < 1 {
+            recovery.notify.notified().await;
+        }
+    })
+    .await
+    .expect("boot recovery must finish");
+    handle
+        .notifier
+        .command_tx
+        .send(super::SchedulerCommand::Drain)
+        .await
+        .expect("drain command should reach scheduler");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while recovery.calls.load(Ordering::SeqCst) < 2 {
+            recovery.notify.notified().await;
+        }
+    })
+    .await
+    .expect("drain command must trigger recovery before the long periodic interval");
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn scheduler_wires_boot_and_periodic_await_edge_recovery() {
+    let recovery = Arc::new(CountingAwaitEdgeRecovery::default());
+    let config = TurnRunSchedulerConfig::default()
+        .with_poll_interval(Duration::from_secs(3600))
+        .with_lease_recovery_interval(Duration::from_secs(3600));
+    let scheduler =
+        TurnRunScheduler::new(Arc::new(NoopTransitionPort), Arc::new(NoopExecutor), config)
+            .with_await_edge_recovery(
+                Arc::clone(&recovery) as Arc<dyn AwaitEdgeWriter>,
+                Duration::from_millis(20),
+            );
+    let handle = scheduler.start();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if recovery.calls.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            recovery.notify.notified().await;
+        }
+    })
+    .await
+    .expect("boot recovery and at least one periodic pass must run");
 
     handle.shutdown().await;
 }

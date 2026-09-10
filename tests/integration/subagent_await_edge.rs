@@ -30,8 +30,9 @@ use ironclaw_runner::subagent::await_edge::{
 use ironclaw_threads::{InMemorySessionThreadService, SessionThreadService, ThreadScope};
 use ironclaw_turns::test_support::in_memory_turn_state_store;
 use ironclaw_turns::{
-    DefaultTurnCoordinator, TurnCoordinator, TurnRunId, TurnScope, TurnSpawnTreePort,
-    runner::TurnRunTransitionPort,
+    DefaultTurnCoordinator, DefaultTurnLifecycleEventBus, LifecyclePublicationErrorPort,
+    LifecyclePublishingTurnStateStore, TurnCommittedEventObserver, TurnCoordinator,
+    TurnLifecycleEventBus, TurnRunId, TurnScope, TurnSpawnTreePort, runner::TurnRunTransitionPort,
 };
 
 fn scope(tenant: &str, user: &str, agent: Option<&str>, project: Option<&str>) -> TurnScope {
@@ -149,17 +150,25 @@ async fn stale_roster_marker_with_empty_edge_dir_is_pruned_by_boot_pass() {
         .expect("seed a roster marker with no corresponding edge");
     assert_eq!(roster::walk_roster_shards(&fs).await, vec![key.clone()]);
 
-    // The boot pass drives every roster-listed scope through recovery; a
-    // scope with an empty edge dir has nothing to recover and its marker
-    // gets pruned via the close-path's own opportunistic-prune helper
-    // (§4.5 round-7 reuses the same CAS'd sequence for both callers).
-    roster::prune_roster_marker(&fs, &key)
-        .await
-        .expect("prune stale marker with no edges");
+    let store = Arc::new(FilesystemAwaitEdgeStore::new(Arc::clone(&fs)));
+    let goal_store: Arc<dyn ironclaw_loop_host::SubagentSpawnGoalStore> =
+        Arc::new(ironclaw_runner::subagent::goal_store::InMemoryBoundedSubagentGoalStore::new());
+    let turn_state_store: Arc<dyn ironclaw_turns::TurnSpawnTreeStateStore> =
+        Arc::new(in_memory_turn_state_store());
+    let resolver = Arc::new(AwaitEdgeResolver::new_unbound_deferred_result_writer(
+        Arc::clone(&store),
+        goal_store,
+        turn_state_store,
+        Arc::new(InMemorySessionThreadService::default()),
+    ));
+    let driver = ScopeRecoveryDriver::new(resolver, store);
 
+    let report = driver.recover_all_await_edges().await;
+
+    assert_eq!(report.failed, 0);
     assert!(
         roster::walk_roster_shards(&fs).await.is_empty(),
-        "stale marker is gone; the post-delete re-list found no edges to restore it for"
+        "the real boot recovery pass must prune a stale marker whose edge tree is empty"
     );
 }
 
@@ -280,12 +289,12 @@ async fn roster_shard_walk_enumerates_scopes_across_distinct_shards() {
     );
 }
 
-// Required test (§5.3, P1.9 extension), integration-tier: lazy-recovery
-// admission — a scope with unclosed edges is gated behind
-// `ScopeRecoveryInProgress` on first touch, then admitted once recovery
-// completes.
+// Lazy-recovery admission for the edge-before-child-submit crash window: an
+// Open edge whose child record is still absent remains gated before its
+// deadline. Recovery failures must not mark the scope booted and admit a new
+// spawn over unresolved state.
 #[tokio::test]
-async fn scope_with_unclosed_edge_is_recovered_before_new_spawns_are_admitted() {
+async fn scope_with_open_missing_child_stays_gated_before_deadline() {
     let store = real_store();
     let scope = scope(
         "tenant-recover",
@@ -295,8 +304,9 @@ async fn scope_with_unclosed_edge_is_recovered_before_new_spawns_are_admitted() 
     );
     let parent = TurnRunId::new();
     let child = TurnRunId::new();
-    // Seed an unclosed (Settled, undrained) edge directly through the
-    // store — simulating a prior process leaving one behind.
+    // `record_awaited_child` creates an Open edge with a fresh deadline. No
+    // child record is inserted, exactly modeling a crash after edge write but
+    // before child submission commits.
     store
         .record_awaited_child(test_record(&scope, parent, child))
         .await
@@ -322,20 +332,13 @@ async fn scope_with_unclosed_edge_is_recovered_before_new_spawns_are_admitted() 
         "first touch against a scope with an unclosed edge starts recovery and rejects admission"
     );
 
-    // Recovery runs as a background task; poll until it completes (the
-    // production contract is "retryable", not "instant" — callers back
-    // off and retry, exactly like `ThreadBusy`).
-    let mut admitted = false;
-    for _ in 0..200 {
-        if driver.check_scope_recovered(&scope).await.is_ok() {
-            admitted = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    // Let the first background pass finish, then retry. Because the child is
+    // still absent and the deadline is fresh, every pass remains retryable and
+    // the scope must not be cached as booted.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(
-        admitted,
-        "scope becomes admissible once its recovery task completes"
+        driver.check_scope_recovered(&scope).await.is_err(),
+        "an Open edge with a missing child must stay gated until its deadline"
     );
 }
 
@@ -365,6 +368,294 @@ async fn brand_new_scope_with_no_unclosed_edges_is_admitted_immediately() {
         driver.check_scope_recovered(&scope).await.is_ok(),
         "a scope with nothing to recover must never be rejected on first touch"
     );
+}
+
+// Deterministic fast-child stress: force the child terminal commit to publish
+// before the parent commits BlockedDependentRun 100 times. The first resume
+// attempt must defer (Running is not benign) while preserving the Settled edge
+// and goal without failing the already-committed child terminal transition; the
+// production-wired recovery entry point then re-drives drain after the parent
+// commits its blocked state.
+#[tokio::test]
+async fn fast_child_terminal_before_parent_block_recovers_without_lost_wakeup_100_times() {
+    use ironclaw_runner::subagent::goal_store::{InMemoryBoundedSubagentGoalStore, SubagentGoal};
+
+    let store = real_store();
+    let state_store = Arc::new(in_memory_turn_state_store());
+    let thread_service = Arc::new(InMemorySessionThreadService::default());
+    let goal_store = Arc::new(InMemoryBoundedSubagentGoalStore::new());
+    let goal_store_dyn: Arc<dyn ironclaw_loop_host::SubagentSpawnGoalStore> = goal_store.clone();
+    let turn_state_store: Arc<dyn ironclaw_turns::TurnSpawnTreeStateStore> = state_store.clone();
+    let resolver = Arc::new(AwaitEdgeResolver::new_unbound(
+        Arc::clone(&store),
+        goal_store_dyn,
+        turn_state_store,
+        Arc::new(AllowResultWriter),
+        Arc::clone(&thread_service),
+    ));
+    let recovery_driver = ScopeRecoveryDriver::new(Arc::clone(&resolver), Arc::clone(&store));
+    let lifecycle_bus = Arc::new(DefaultTurnLifecycleEventBus::new());
+    lifecycle_bus
+        .subscribe_required(Arc::clone(&resolver) as Arc<dyn TurnCommittedEventObserver>)
+        .unwrap();
+    let publishing_store = Arc::new(LifecyclePublishingTurnStateStore::new(
+        Arc::clone(&state_store),
+        lifecycle_bus,
+    ));
+    let publication_error_port: Arc<dyn LifecyclePublicationErrorPort> = publishing_store.clone();
+    let coordinator = Arc::new(
+        DefaultTurnCoordinator::new(Arc::clone(&publishing_store))
+            .with_lifecycle_publication_error_port(publication_error_port),
+    );
+    let coordinator_dyn: Arc<dyn TurnCoordinator> = coordinator.clone();
+    resolver.bind_coordinator(coordinator_dyn).unwrap();
+
+    for iteration in 0..100 {
+        let tenant = TenantId::new("fast-child-tenant").unwrap();
+        let user = UserId::new("fast-child-user").unwrap();
+        let agent = AgentId::new("fast-child-agent").unwrap();
+        let parent_thread_id = ThreadId::new(format!("fast-parent-{iteration}")).unwrap();
+        let child_thread_id = ThreadId::new(format!("fast-child-{iteration}")).unwrap();
+        let parent_scope = TurnScope::new_with_owner(
+            tenant.clone(),
+            Some(agent.clone()),
+            None,
+            parent_thread_id.clone(),
+            Some(user.clone()),
+        );
+        let child_scope = TurnScope::new_with_owner(
+            tenant.clone(),
+            Some(agent.clone()),
+            None,
+            child_thread_id.clone(),
+            Some(user.clone()),
+        );
+        let actor = ironclaw_turns::TurnActor::new(user.clone());
+        let ironclaw_turns::SubmitTurnResponse::Accepted {
+            run_id: parent_run_id,
+            ..
+        } = coordinator
+            .submit_turn(ironclaw_turns::SubmitTurnRequest {
+                requested_model: None,
+                scope: parent_scope.clone(),
+                actor: actor.clone(),
+                accepted_message_ref: ironclaw_turns::AcceptedMessageRef::new(format!(
+                    "msg:fast-parent-{iteration}"
+                ))
+                .unwrap(),
+                source_binding_ref: ironclaw_turns::SourceBindingRef::new(format!(
+                    "source:fast-parent-{iteration}"
+                ))
+                .unwrap(),
+                reply_target_binding_ref: ironclaw_turns::ReplyTargetBindingRef::new(format!(
+                    "reply:fast-parent-{iteration}"
+                ))
+                .unwrap(),
+                requested_run_profile: None,
+                idempotency_key: ironclaw_turns::IdempotencyKey::new(format!(
+                    "idem:fast-parent-{iteration}"
+                ))
+                .unwrap(),
+                received_at: chrono::Utc::now(),
+                requested_run_id: None,
+                parent_run_id: None,
+                subagent_depth: 0,
+                spawn_tree_root_run_id: None,
+                product_context: None,
+            })
+            .await
+            .unwrap();
+        let parent_runner_id = ironclaw_turns::TurnRunnerId::new();
+        let parent_lease = ironclaw_turns::TurnLeaseToken::new();
+        publishing_store
+            .claim_next_run(ironclaw_turns::runner::ClaimRunRequest {
+                runner_id: parent_runner_id,
+                lease_token: parent_lease,
+                scope_filter: Some(parent_scope.clone()),
+            })
+            .await
+            .unwrap()
+            .expect("parent run claimable");
+
+        let ironclaw_turns::SubmitTurnResponse::Accepted {
+            run_id: child_run_id,
+            ..
+        } = coordinator
+            .submit_child_run(ironclaw_turns::SubmitChildRunRequest {
+                parent_scope: parent_scope.clone(),
+                parent_run_id,
+                child_scope: child_scope.clone(),
+                actor: actor.clone(),
+                accepted_message_ref: ironclaw_turns::AcceptedMessageRef::new(format!(
+                    "msg:fast-child-{iteration}"
+                ))
+                .unwrap(),
+                source_binding_ref: ironclaw_turns::SourceBindingRef::new(format!(
+                    "source:fast-child-{iteration}"
+                ))
+                .unwrap(),
+                reply_target_binding_ref: ironclaw_turns::ReplyTargetBindingRef::new(format!(
+                    "reply:fast-child-{iteration}"
+                ))
+                .unwrap(),
+                requested_run_profile: None,
+                idempotency_key: ironclaw_turns::IdempotencyKey::new(format!(
+                    "idem:fast-child-{iteration}"
+                ))
+                .unwrap(),
+                received_at: chrono::Utc::now(),
+                requested_run_id: None,
+                spawn_tree_descendant_cap: 16,
+            })
+            .await
+            .unwrap();
+        let gate_ref =
+            ironclaw_turns::GateRef::new(format!("gate:fast-child-{iteration}")).unwrap();
+        let result_ref =
+            ironclaw_turns::LoopResultRef::new(format!("result:fast-child-{iteration}")).unwrap();
+        let mut parent_run_context =
+            ironclaw_agent_loop::test_support::test_run_context("fast-child-parent");
+        parent_run_context.scope = parent_scope.clone();
+        parent_run_context.thread_id = parent_thread_id.clone();
+        parent_run_context.run_id = parent_run_id;
+        parent_run_context.actor = Some(actor.clone());
+        store
+            .record_awaited_child(mixed_batch_record(
+                &child_scope,
+                child_thread_id.clone(),
+                parent_run_id,
+                child_run_id,
+                gate_ref.clone(),
+                result_ref.clone(),
+                parent_run_context,
+            ))
+            .await
+            .unwrap();
+        goal_store
+            .put(
+                &child_scope,
+                child_run_id,
+                SubagentGoal {
+                    task: format!("fast child {iteration}"),
+                    handoff: None,
+                },
+            )
+            .unwrap();
+
+        let thread_scope = ThreadScope {
+            tenant_id: tenant.clone(),
+            agent_id: agent.clone(),
+            project_id: None,
+            owner_user_id: Some(user.clone()),
+            mission_id: None,
+        };
+        for thread_id in [&parent_thread_id, &child_thread_id] {
+            thread_service
+                .ensure_thread(ironclaw_threads::EnsureThreadRequest {
+                    scope: thread_scope.clone(),
+                    thread_id: Some(thread_id.clone()),
+                    created_by_actor_id: "test".to_string(),
+                    title: None,
+                    metadata_json: None,
+                })
+                .await
+                .unwrap();
+        }
+        thread_service
+            .append_tool_result_reference(ironclaw_threads::AppendToolResultReferenceRequest {
+                scope: thread_scope,
+                thread_id: parent_thread_id,
+                turn_run_id: parent_run_id.to_string(),
+                result_ref: result_ref.as_str().to_string(),
+                safe_summary: ironclaw_threads::ToolResultSafeSummary::new("subagent spawned")
+                    .unwrap(),
+                provider_call: None,
+                model_observation: None,
+            })
+            .await
+            .unwrap();
+
+        let child_runner_id = ironclaw_turns::TurnRunnerId::new();
+        let child_lease = ironclaw_turns::TurnLeaseToken::new();
+        publishing_store
+            .claim_next_run(ironclaw_turns::runner::ClaimRunRequest {
+                runner_id: child_runner_id,
+                lease_token: child_lease,
+                scope_filter: Some(child_scope.clone()),
+            })
+            .await
+            .unwrap()
+            .expect("child run claimable");
+        let terminal_publish = publishing_store
+            .complete_run(ironclaw_turns::runner::CompleteRunRequest {
+                run_id: child_run_id,
+                runner_id: child_runner_id,
+                lease_token: child_lease,
+            })
+            .await;
+        assert!(
+            terminal_publish.is_ok(),
+            "iteration {iteration}: child terminal commit must succeed while the durable edge defers its wake: {terminal_publish:?}"
+        );
+        let retained = store
+            .peek(&child_scope, parent_run_id, child_run_id)
+            .await
+            .unwrap()
+            .expect("early terminal must retain edge");
+        assert_eq!(
+            retained.state,
+            ironclaw_runner::subagent::await_edge::AwaitEdgeState::Settled
+        );
+        assert!(
+            goal_store.get(&child_scope, child_run_id).is_ok(),
+            "iteration {iteration}: goal must survive until recovery drain succeeds"
+        );
+
+        publishing_store
+            .block_run(ironclaw_turns::runner::BlockRunRequest {
+                run_id: parent_run_id,
+                runner_id: parent_runner_id,
+                lease_token: parent_lease,
+                checkpoint_id: ironclaw_turns::TurnCheckpointId::new(),
+                state_ref: ironclaw_turns::run_profile::LoopCheckpointStateRef::new(format!(
+                    "checkpoint:fast-parent-{iteration}"
+                ))
+                .unwrap(),
+                reason: ironclaw_turns::BlockedReason::AwaitDependentRun { gate_ref },
+            })
+            .await
+            .unwrap();
+        let recovery_report = recovery_driver.recover_all_await_edges().await;
+        assert_eq!(
+            recovery_report.failed, 0,
+            "iteration {iteration}: periodic recovery must drain the settled edge"
+        );
+
+        let parent_state = coordinator
+            .get_run_state(ironclaw_turns::GetRunStateRequest {
+                scope: parent_scope,
+                run_id: parent_run_id,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            parent_state.status,
+            ironclaw_turns::TurnStatus::Queued,
+            "iteration {iteration}: recovery reconciler must recover the lost wakeup"
+        );
+        assert!(
+            store
+                .peek(&child_scope, parent_run_id, child_run_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "iteration {iteration}: edge closes only after successful recovery drain"
+        );
+        assert!(
+            goal_store.get(&child_scope, child_run_id).is_err(),
+            "iteration {iteration}: goal deletes only after successful recovery drain"
+        );
+    }
 }
 
 // Required test (FIX A backstop, design doc §2): the real lost-edge window

@@ -5,6 +5,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::FutureExt;
+use ironclaw_loop_host::AwaitEdgeWriter;
 use ironclaw_observability::live_latency_started_at;
 use ironclaw_turns::{
     SanitizedFailure, TurnError, TurnLeaseToken, TurnRunId, TurnRunWake, TurnRunWakeNotifier,
@@ -17,7 +18,7 @@ use ironclaw_turns::{
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     task::{JoinHandle, JoinSet},
-    time::{MissedTickBehavior, interval, sleep},
+    time::{Instant, MissedTickBehavior, interval, interval_at, sleep},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -211,6 +212,14 @@ pub struct TurnRunScheduler {
     executor: Arc<dyn TurnRunExecutor>,
     config: TurnRunSchedulerConfig,
     runner_id: TurnRunnerId,
+    await_edge_recovery: Option<Arc<dyn AwaitEdgeWriter>>,
+    await_edge_recovery_interval: Duration,
+}
+
+struct SchedulerLoopWiring {
+    runner_id: TurnRunnerId,
+    await_edge_recovery: Option<Arc<dyn AwaitEdgeWriter>>,
+    await_edge_recovery_interval: Duration,
 }
 
 impl TurnRunScheduler {
@@ -224,7 +233,19 @@ impl TurnRunScheduler {
             executor,
             config,
             runner_id: TurnRunnerId::new(),
+            await_edge_recovery: None,
+            await_edge_recovery_interval: Duration::from_secs(1),
         }
+    }
+
+    pub fn with_await_edge_recovery(
+        mut self,
+        recovery: Arc<dyn AwaitEdgeWriter>,
+        interval: Duration,
+    ) -> Self {
+        self.await_edge_recovery = Some(recovery);
+        self.await_edge_recovery_interval = non_zero_duration(interval);
+        self
     }
 
     pub fn start(self) -> TurnRunSchedulerHandle {
@@ -253,7 +274,11 @@ impl TurnRunScheduler {
             self.transitions,
             self.executor,
             self.config,
-            self.runner_id,
+            SchedulerLoopWiring {
+                runner_id: self.runner_id,
+                await_edge_recovery: self.await_edge_recovery,
+                await_edge_recovery_interval: self.await_edge_recovery_interval,
+            },
             shutdown_token.clone(),
         ));
         TurnRunSchedulerHandle {
@@ -447,9 +472,14 @@ async fn run_scheduler_loop(
     transitions: Arc<dyn TurnRunTransitionPort>,
     executor: Arc<dyn TurnRunExecutor>,
     config: TurnRunSchedulerConfig,
-    runner_id: TurnRunnerId,
+    wiring: SchedulerLoopWiring,
     shutdown_token: CancellationToken,
 ) {
+    let SchedulerLoopWiring {
+        runner_id,
+        await_edge_recovery,
+        await_edge_recovery_interval,
+    } = wiring;
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent_runs()));
     let mut executor_tasks: JoinSet<TurnRunId> = JoinSet::new();
     // Tracks every in-flight run so we can relinquish on shutdown.
@@ -458,6 +488,12 @@ async fn run_scheduler_loop(
     poll_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut recovery_tick = interval(config.lease_recovery_interval());
     recovery_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut await_edge_recovery_tick = interval_at(
+        Instant::now() + await_edge_recovery_interval,
+        await_edge_recovery_interval,
+    );
+    await_edge_recovery_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut await_edge_recovery_task: Option<JoinHandle<()>> = None;
     let context = SchedulerDrainContext {
         transitions,
         executor,
@@ -468,11 +504,46 @@ async fn run_scheduler_loop(
     };
     let mut claim_retry_pending = false;
 
+    if let Some(recovery) = await_edge_recovery.as_ref() {
+        let boot_recovery = recovery.recover_all_await_edges();
+        tokio::pin!(boot_recovery);
+        tokio::select! {
+            _ = shutdown_token.cancelled() => {
+                if let Some(recovery) = await_edge_recovery.as_ref() {
+                    recovery.shutdown_await_edge_recovery().await;
+                }
+                shutdown_scheduler(&context, &mut executor_tasks, active_runs).await;
+                return;
+            }
+            report = &mut boot_recovery => {
+                if report.failed > 0 {
+                    debug!(
+                        failures = report.failed,
+                        resumed = report.resumed,
+                        drained = report.drained,
+                        "await-edge boot recovery completed with retryable failures"
+                    );
+                }
+            }
+        }
+    }
+
     loop {
         tokio::select! {
             // CancellationToken arm: bypasses the command queue entirely so
             // shutdown is never blocked by back-pressure or a parked await.
             _ = shutdown_token.cancelled() => {
+                if let Some(task) = await_edge_recovery_task.take() {
+                    task.abort();
+                    if let Err(error) = task.await
+                        && !error.is_cancelled()
+                    {
+                        debug!(error = %error, "await-edge recovery task failed during shutdown");
+                    }
+                }
+                if let Some(recovery) = await_edge_recovery.as_ref() {
+                    recovery.shutdown_await_edge_recovery().await;
+                }
                 shutdown_scheduler(&context, &mut executor_tasks, active_runs).await;
                 break;
             }
@@ -528,6 +599,10 @@ async fn run_scheduler_loop(
                                 context.config.claim_error_backoff(),
                             );
                         }
+                        start_await_edge_recovery_if_idle(
+                            await_edge_recovery.as_ref(),
+                            &mut await_edge_recovery_task,
+                        ).await;
                     }
                     SchedulerCommand::RetryDrain => {
                         claim_retry_pending = false;
@@ -577,8 +652,45 @@ async fn run_scheduler_loop(
             _ = recovery_tick.tick() => {
                 recover_expired_leases(Arc::clone(&context.transitions)).await;
             }
+            _ = await_edge_recovery_tick.tick(), if await_edge_recovery.is_some() => {
+                start_await_edge_recovery_if_idle(
+                    await_edge_recovery.as_ref(),
+                    &mut await_edge_recovery_task,
+                ).await;
+            }
         }
     }
+}
+
+async fn start_await_edge_recovery_if_idle(
+    recovery: Option<&Arc<dyn AwaitEdgeWriter>>,
+    task: &mut Option<JoinHandle<()>>,
+) {
+    if task.as_ref().is_some_and(|task| !task.is_finished()) {
+        return;
+    }
+    if let Some(finished) = task.take()
+        && let Err(error) = finished.await
+    {
+        debug!(error = %error, "await-edge recovery task failed");
+    }
+    if let Some(recovery) = recovery {
+        *task = Some(spawn_await_edge_recovery(Arc::clone(recovery)));
+    }
+}
+
+fn spawn_await_edge_recovery(recovery: Arc<dyn AwaitEdgeWriter>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let report = recovery.recover_all_await_edges().await;
+        if report.failed > 0 {
+            debug!(
+                failures = report.failed,
+                resumed = report.resumed,
+                drained = report.drained,
+                "await-edge recovery pass completed with retryable failures"
+            );
+        }
+    })
 }
 
 /// Drains the queue of pending runs, spawning executor tasks until the semaphore

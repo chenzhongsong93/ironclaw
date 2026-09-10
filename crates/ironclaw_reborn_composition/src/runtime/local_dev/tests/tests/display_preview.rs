@@ -105,6 +105,101 @@ async fn capability_io_writes_display_preview_to_durable_history() {
 // durable timeline (status Failed) so the rendered detail survives
 // refresh/replay, not just the live stream.
 #[tokio::test]
+async fn capability_io_replaces_spawned_placeholder_with_failed_result_and_preview() {
+    let run_context = run_context("durable-spawn-rollback-preview").await;
+    let fallback_user_id =
+        UserId::new("durable-spawn-rollback-preview-owner").expect("fallback user id");
+    let thread_scope = local_dev_thread_scope_for_run(&run_context, &fallback_user_id)
+        .expect("run scope has an agent");
+    let thread_service = Arc::new(InMemorySessionThreadService::default());
+    thread_service
+        .ensure_thread(EnsureThreadRequest {
+            scope: thread_scope.clone(),
+            thread_id: Some(run_context.thread_id.clone()),
+            created_by_actor_id: "actor-a".to_string(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .expect("thread exists");
+    let capability_io = StagedCapabilityIo::new_with_durable_previews(
+        Arc::new(CapabilityDisplayPreviewStore::default()),
+        thread_service.clone(),
+        fallback_user_id,
+    );
+    let input_ref = capability_io
+        .register_provider_tool_call_input(
+            &run_context,
+            &provider_tool_call(serde_json::json!({"subagent_type": "general"})),
+        )
+        .await
+        .expect("input stages");
+    let invocation_id = InvocationId::new();
+    let capability_id = CapabilityId::new("builtin.spawn_subagent").expect("capability id");
+    let write_result = capability_io
+        .write_capability_result(CapabilityResultWrite {
+            run_context: &run_context,
+            input_ref: &input_ref,
+            invocation_id,
+            capability_id: &capability_id,
+            output: serde_json::json!({"status": "spawned", "output_available": false}),
+            display_preview: None,
+            durable_persistence: DurablePersistence::Persist,
+        })
+        .await
+        .expect("spawned placeholder stages");
+
+    capability_io
+        .update_capability_result(
+            &run_context,
+            &write_result.result_ref,
+            serde_json::json!({
+                "status": "failed",
+                "output_available": false,
+                "failure_summary": "subagent spawn aborted before setup completed"
+            }),
+        )
+        .await
+        .expect("placeholder updates in place");
+    capability_io
+        .stage_capability_failure_preview(
+            &run_context,
+            invocation_id,
+            &capability_id,
+            "subagent spawn aborted before setup completed",
+        )
+        .await;
+
+    let result = capability_io
+        .result_output(write_result.result_ref.as_str())
+        .expect("result store is readable")
+        .expect("result remains available");
+    assert_eq!(result["status"], "failed");
+
+    let history = thread_service
+        .list_thread_history(ThreadHistoryRequest {
+            scope: thread_scope,
+            thread_id: run_context.thread_id.clone(),
+        })
+        .await
+        .expect("history loads");
+    let previews = history
+        .messages
+        .iter()
+        .filter(|message| message.kind == MessageKind::CapabilityDisplayPreview)
+        .collect::<Vec<_>>();
+    assert_eq!(previews.len(), 1, "preview dedup keeps one audit record");
+    let envelope: CapabilityDisplayPreviewEnvelope =
+        serde_json::from_str(previews[0].content.as_deref().expect("preview content"))
+            .expect("preview envelope parses");
+    assert_eq!(envelope.status, CapabilityDisplayPreviewStatus::Failed);
+    assert_eq!(
+        envelope.output_summary.as_deref(),
+        Some("subagent spawn aborted before setup completed")
+    );
+}
+
+#[tokio::test]
 async fn capability_io_writes_failure_display_preview_to_durable_history() {
     let run_context = run_context("durable-failure-preview").await;
     let fallback_user_id = UserId::new("durable-failure-preview-owner").expect("fallback user id");

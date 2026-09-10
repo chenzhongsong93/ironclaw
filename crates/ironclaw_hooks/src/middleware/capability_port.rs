@@ -41,7 +41,7 @@ use crate::middleware::resolver::{
     CapabilityInputResolver, CapabilityProviderResolver, NullCapabilityInputResolver,
     NullCapabilityProviderResolver,
 };
-use crate::points::{BeforeCapabilityHookContext, SanitizedArguments};
+use crate::points::{BeforeCapabilityHookContext, ObservedCapabilityOutcome, SanitizedArguments};
 
 /// Maximum byte length of a capability input that the middleware will
 /// hand to predicate evaluation. When [`CapabilityInputResolver::size_hint`]
@@ -159,6 +159,7 @@ impl HookedLoopCapabilityPort {
             arguments,
             provider,
         )
+        .with_activity_id(invocation.activity_id)
     }
 
     /// Resolve capability arguments with a streaming size pre-check.
@@ -226,6 +227,39 @@ impl HookedLoopCapabilityPort {
         let ctx = self.hook_context(invocation, provider).await;
         self.dispatcher.dispatch_before_capability(&ctx).await
     }
+
+    async fn observe_capability_result(
+        &self,
+        invocation: &CapabilityInvocation,
+        provider: Option<ironclaw_host_api::ExtensionId>,
+        result: &Result<Resolution, AgentLoopHostError>,
+    ) {
+        let outcome = match result {
+            Ok(resolution) if resolution.parks() => ObservedCapabilityOutcome::Parked,
+            Ok(_) => ObservedCapabilityOutcome::Returned,
+            Err(_) => ObservedCapabilityOutcome::Errored,
+        };
+        self.observe_capability_outcome(invocation, provider, outcome)
+            .await;
+    }
+
+    async fn observe_capability_outcome(
+        &self,
+        invocation: &CapabilityInvocation,
+        provider: Option<ironclaw_host_api::ExtensionId>,
+        outcome: ObservedCapabilityOutcome,
+    ) {
+        let _ = self
+            .dispatcher
+            .dispatch_after_capability(
+                self.tenant_id.clone(),
+                invocation.capability_id.to_string(),
+                invocation.activity_id,
+                provider,
+                outcome,
+            )
+            .await;
+    }
 }
 
 #[async_trait]
@@ -280,21 +314,13 @@ impl LoopCapabilityPort for HookedLoopCapabilityPort {
             Some(resolution) => Ok(resolution),
             // Hooks allowed: forward to the inner port, which already returns a
             // `Resolution` (§5.3 flip) — pure pass-through, no variant inspection.
-            None => self.inner.invoke_capability(request).await,
+            None => self.inner.invoke_capability(request.clone()).await,
         };
         // Fire AfterCapability observers regardless of whether the hook
-        // short-circuited or the inner port ran. Observer-only point — no
-        // gate decisions composed here. Telemetry must reflect both denied
-        // and allowed invocations. The resolved provider is threaded so the
-        // dispatcher can enforce `OwnCapabilities` scope on Installed
-        // observers (serrrfirat finding #3).
-        let _ = self
-            .dispatcher
-            .dispatch_observer_at_with_provider(
-                crate::registry::HookPointSpec::AfterCapability,
-                self.tenant_id.clone(),
-                provider,
-            )
+        // short-circuited or the inner port ran. The observer receives only the
+        // capability identity plus a bounded Parked/Returned/Errored
+        // classification — never raw input, output, gate detail, or error text.
+        self.observe_capability_result(&request, provider, &result)
             .await;
         result
     }
@@ -334,11 +360,13 @@ impl LoopCapabilityPort for HookedLoopCapabilityPort {
         enum Slot {
             /// Hook produced a final resolution — no inner call needed.
             Resolved {
+                invocation: CapabilityInvocation,
                 resolution: Box<Resolution>,
                 provider: Option<ironclaw_host_api::ExtensionId>,
             },
             /// Hooks allowed; the inner port will produce the resolution.
             Pending {
+                invocation: CapabilityInvocation,
                 provider: Option<ironclaw_host_api::ExtensionId>,
             },
         }
@@ -360,6 +388,7 @@ impl LoopCapabilityPort for HookedLoopCapabilityPort {
                     // batch too).
                     let parks = resolution.parks();
                     slots.push(Slot::Resolved {
+                        invocation,
                         resolution: Box::new(resolution),
                         provider,
                     });
@@ -370,6 +399,7 @@ impl LoopCapabilityPort for HookedLoopCapabilityPort {
                 }
                 None => {
                     slots.push(Slot::Pending {
+                        invocation: invocation.clone(),
                         provider: provider.clone(),
                     });
                     pending.push(invocation);
@@ -404,18 +434,32 @@ impl LoopCapabilityPort for HookedLoopCapabilityPort {
             Ok(outcome) => outcome,
             Err(err) => {
                 for slot in slots {
-                    let provider = match slot {
-                        Slot::Resolved { provider, .. } => provider,
-                        Slot::Pending { provider } => provider,
-                    };
-                    let _ = self
-                        .dispatcher
-                        .dispatch_observer_at_with_provider(
-                            crate::registry::HookPointSpec::AfterCapability,
-                            self.tenant_id.clone(),
+                    match slot {
+                        Slot::Resolved {
+                            invocation,
+                            resolution,
                             provider,
-                        )
-                        .await;
+                        } => {
+                            let outcome = if resolution.parks() {
+                                ObservedCapabilityOutcome::Parked
+                            } else {
+                                ObservedCapabilityOutcome::Returned
+                            };
+                            self.observe_capability_outcome(&invocation, provider, outcome)
+                                .await;
+                        }
+                        Slot::Pending {
+                            invocation,
+                            provider,
+                        } => {
+                            self.observe_capability_outcome(
+                                &invocation,
+                                provider,
+                                ObservedCapabilityOutcome::Errored,
+                            )
+                            .await;
+                        }
+                    }
                 }
                 return Err(err);
             }
@@ -450,12 +494,16 @@ impl LoopCapabilityPort for HookedLoopCapabilityPort {
         let mut stopped_on_suspension = stopped_in_preflight;
         let mut pending_after_stop = false;
         for slot in slots {
-            let outcome_and_provider = match slot {
+            let outcome_and_context = match slot {
                 Slot::Resolved {
+                    invocation,
                     resolution,
                     provider,
-                } => Some((*resolution, provider)),
-                Slot::Pending { provider } => {
+                } => Some((invocation, *resolution, provider)),
+                Slot::Pending {
+                    invocation,
+                    provider,
+                } => {
                     if pending_after_stop {
                         // We already stopped on a prior suspension and
                         // queued no work for the inner port past that
@@ -469,20 +517,21 @@ impl LoopCapabilityPort for HookedLoopCapabilityPort {
                         // pending slots without an outcome and continue
                         // — observers on any trailing Resolved slots
                         // must still fire.
-                        inner_outcomes.pop().map(|inner| (inner, provider))
+                        inner_outcomes
+                            .pop()
+                            .map(|inner| (invocation, inner, provider))
                     }
                 }
             };
-            let Some((outcome, provider)) = outcome_and_provider else {
+            let Some((invocation, outcome, provider)) = outcome_and_context else {
                 continue;
             };
-            let _ = self
-                .dispatcher
-                .dispatch_observer_at_with_provider(
-                    crate::registry::HookPointSpec::AfterCapability,
-                    self.tenant_id.clone(),
-                    provider,
-                )
+            let observed_outcome = if outcome.parks() {
+                ObservedCapabilityOutcome::Parked
+            } else {
+                ObservedCapabilityOutcome::Returned
+            };
+            self.observe_capability_outcome(&invocation, provider, observed_outcome)
                 .await;
             // `parks()` (not `is_suspension()`) is the batch-stop predicate:
             // a re-entrant gate parks the batch too (H1).
@@ -1192,6 +1241,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_invocation_observer_receives_bounded_capability_outcomes() {
+        use crate::points::{ObservedCapabilityOutcome, ObserverHookContext};
+        use crate::sink::{ObserverHook, ObserverSink};
+
+        struct ClassifiedOutcomePort;
+        #[async_trait]
+        impl LoopCapabilityPort for ClassifiedOutcomePort {
+            async fn visible_capabilities(
+                &self,
+                _request: VisibleCapabilityRequest,
+            ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
+                unreachable!()
+            }
+
+            async fn invoke_capability(
+                &self,
+                request: CapabilityInvocation,
+            ) -> Result<Resolution, AgentLoopHostError> {
+                match request.capability_id.as_str() {
+                    "cap.returned" => Ok(resolution::completed(
+                        LoopResultRef::new("result:cap.returned").expect("valid result ref"),
+                        "returned".to_string(),
+                        ironclaw_turns::run_profile::CapabilityProgress::MadeProgress,
+                        false,
+                        0,
+                        None,
+                        None,
+                    )),
+                    "cap.parked" => Ok(resolution::approval_required(
+                        ironclaw_turns::LoopGateRef::new("gate:parked").expect("valid gate"),
+                        "approval required".to_string(),
+                        None,
+                    )
+                    .resolution),
+                    "cap.errored" => Err(AgentLoopHostError::new(
+                        ironclaw_turns::run_profile::AgentLoopHostErrorKind::Unavailable,
+                        "sensitive backend detail must not reach observers",
+                    )),
+                    other => panic!("unexpected capability {other}"),
+                }
+            }
+
+            async fn invoke_capability_batch(
+                &self,
+                _request: CapabilityBatchInvocation,
+            ) -> Result<ResolutionBatch, AgentLoopHostError> {
+                unreachable!()
+            }
+        }
+
+        struct RecordingObserver {
+            seen: Arc<Mutex<Vec<(String, ObservedCapabilityOutcome)>>>,
+        }
+        #[async_trait]
+        impl ObserverHook for RecordingObserver {
+            async fn observe(&self, ctx: &ObserverHookContext, _sink: &mut dyn ObserverSink) {
+                self.seen.lock().expect("not poisoned").push((
+                    ctx.capability_name
+                        .clone()
+                        .expect("AfterCapability carries capability name"),
+                    ctx.capability_outcome
+                        .expect("AfterCapability carries outcome classification"),
+                ));
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observer_id = HookId::for_builtin("test::bounded_after_capability", HookVersion::ONE);
+        let mut registry = HookRegistry::new();
+        registry
+            .insert(HookBinding {
+                hook_id: observer_id,
+                hook_version: HookVersion::ONE,
+                trust_class: HookTrustClass::Builtin,
+                phase: HookPhase::Telemetry,
+                priority: HookPriority::DEFAULT,
+                point: HookPointSpec::AfterCapability,
+                event_kind_filter: None,
+                owning_extension: None,
+                scope: HookBindingScope::Global,
+                poisoned: false,
+            })
+            .expect("insert observer");
+        let mut dispatcher = HookDispatcher::new(registry);
+        dispatcher.install_observer_impl(
+            observer_id,
+            crate::dispatch::ObserverHookImpl::Any(Box::new(RecordingObserver {
+                seen: seen.clone(),
+            })),
+        );
+        let wrapped = HookedLoopCapabilityPort::new(
+            Arc::new(ClassifiedOutcomePort),
+            Arc::new(dispatcher),
+            tenant(),
+        );
+
+        assert!(matches!(
+            wrapped
+                .invoke_capability(invocation("cap.returned"))
+                .await
+                .expect("returned call"),
+            Resolution::Done(_)
+        ));
+        assert!(
+            wrapped
+                .invoke_capability(invocation("cap.parked"))
+                .await
+                .expect("parked call")
+                .parks()
+        );
+        let error = wrapped
+            .invoke_capability(invocation("cap.errored"))
+            .await
+            .expect_err("errored call");
+        assert_eq!(
+            error.kind,
+            ironclaw_turns::run_profile::AgentLoopHostErrorKind::Unavailable
+        );
+
+        assert_eq!(
+            *seen.lock().expect("not poisoned"),
+            vec![
+                (
+                    "cap.returned".to_string(),
+                    ObservedCapabilityOutcome::Returned,
+                ),
+                ("cap.parked".to_string(), ObservedCapabilityOutcome::Parked,),
+                (
+                    "cap.errored".to_string(),
+                    ObservedCapabilityOutcome::Errored,
+                ),
+            ],
+            "observer context must expose only capability identity and bounded outcome class"
+        );
+    }
+
+    #[tokio::test]
     async fn batch_fires_dispatch_per_invocation() {
         // With the always-deny hook installed, every invocation in the batch
         // gets denied by hook dispatch and the inner port is never reached.
@@ -1376,7 +1562,7 @@ mod tests {
     /// failing entry, and the error still propagates.
     #[tokio::test]
     async fn batch_dispatches_after_capability_observers_on_inner_error() {
-        use crate::points::ObserverHookContext;
+        use crate::points::{ObservedCapabilityOutcome, ObserverHookContext};
         use crate::sink::{ObserverHook, ObserverSink};
 
         struct FailingPort;
@@ -1412,19 +1598,25 @@ mod tests {
             }
         }
 
-        struct CountingObserver {
-            seen: Arc<Mutex<u32>>,
+        struct RecordingObserver {
+            seen: Arc<Mutex<Vec<(String, ObservedCapabilityOutcome)>>>,
         }
         #[async_trait]
-        impl ObserverHook for CountingObserver {
-            async fn observe(&self, _ctx: &ObserverHookContext, _sink: &mut dyn ObserverSink) {
-                *self.seen.lock().expect("not poisoned") += 1;
+        impl ObserverHook for RecordingObserver {
+            async fn observe(&self, ctx: &ObserverHookContext, _sink: &mut dyn ObserverSink) {
+                self.seen.lock().expect("not poisoned").push((
+                    ctx.capability_name
+                        .clone()
+                        .expect("AfterCapability carries capability name"),
+                    ctx.capability_outcome
+                        .expect("AfterCapability carries outcome classification"),
+                ));
             }
         }
 
         // Dispatcher with only an AfterCapability observer (no before-cap
         // gate → hooks allow → inner runs and fails).
-        let seen = Arc::new(Mutex::new(0u32));
+        let seen = Arc::new(Mutex::new(Vec::new()));
         let observer_id = HookId::for_builtin("test::after_cap_obs", HookVersion::ONE);
         let mut registry = HookRegistry::new();
         registry
@@ -1444,7 +1636,7 @@ mod tests {
         let mut dispatcher = HookDispatcher::new(registry);
         dispatcher.install_observer_impl(
             observer_id,
-            crate::dispatch::ObserverHookImpl::Any(Box::new(CountingObserver {
+            crate::dispatch::ObserverHookImpl::Any(Box::new(RecordingObserver {
                 seen: seen.clone(),
             })),
         );
@@ -1453,7 +1645,7 @@ mod tests {
             HookedLoopCapabilityPort::new(Arc::new(FailingPort), Arc::new(dispatcher), tenant());
 
         let batch = CapabilityBatchInvocation {
-            invocations: vec![invocation("cap.x")],
+            invocations: vec![invocation("cap.x"), invocation("cap.y")],
             stop_on_first_suspension: false,
         };
         let err = wrapped
@@ -1466,9 +1658,12 @@ mod tests {
         );
         assert_eq!(
             *seen.lock().expect("not poisoned"),
-            1,
-            "AfterCapability observer must fire even when inner port errors \
-             so failed batch entries are visible to telemetry"
+            vec![
+                ("cap.x".to_string(), ObservedCapabilityOutcome::Errored),
+                ("cap.y".to_string(), ObservedCapabilityOutcome::Errored),
+            ],
+            "AfterCapability observer must receive every failed batch entry's identity and a \
+             bounded error classification, without receiving the raw error"
         );
     }
 
@@ -1613,20 +1808,26 @@ mod tests {
     /// is independent of the inner-port call topology.
     #[tokio::test]
     async fn batch_invocation_dispatches_after_capability_observer_per_entry() {
-        use crate::points::ObserverHookContext;
+        use crate::points::{ObservedCapabilityOutcome, ObserverHookContext};
         use crate::sink::{ObserverHook, ObserverSink};
 
-        struct CountingObserver {
-            seen: Arc<Mutex<u32>>,
+        struct RecordingObserver {
+            seen: Arc<Mutex<Vec<(String, ObservedCapabilityOutcome)>>>,
         }
         #[async_trait]
-        impl ObserverHook for CountingObserver {
-            async fn observe(&self, _ctx: &ObserverHookContext, _sink: &mut dyn ObserverSink) {
-                *self.seen.lock().expect("not poisoned") += 1;
+        impl ObserverHook for RecordingObserver {
+            async fn observe(&self, ctx: &ObserverHookContext, _sink: &mut dyn ObserverSink) {
+                self.seen.lock().expect("not poisoned").push((
+                    ctx.capability_name
+                        .clone()
+                        .expect("AfterCapability carries capability name"),
+                    ctx.capability_outcome
+                        .expect("AfterCapability carries outcome classification"),
+                ));
             }
         }
 
-        let seen = Arc::new(Mutex::new(0u32));
+        let seen = Arc::new(Mutex::new(Vec::new()));
         let observer_id = HookId::for_builtin("test::after_cap_per_entry", HookVersion::ONE);
         let mut registry = HookRegistry::new();
         registry
@@ -1646,7 +1847,7 @@ mod tests {
         let mut dispatcher = HookDispatcher::new(registry);
         dispatcher.install_observer_impl(
             observer_id,
-            crate::dispatch::ObserverHookImpl::Any(Box::new(CountingObserver {
+            crate::dispatch::ObserverHookImpl::Any(Box::new(RecordingObserver {
                 seen: seen.clone(),
             })),
         );
@@ -1671,9 +1872,12 @@ mod tests {
         );
         assert_eq!(
             *seen.lock().expect("not poisoned"),
-            3,
-            "AfterCapability observer must fire per merged entry (3 entries) \
-             even though the inner port was batched into a single call"
+            vec![
+                ("cap.alpha".to_string(), ObservedCapabilityOutcome::Returned,),
+                ("cap.beta".to_string(), ObservedCapabilityOutcome::Returned),
+                ("cap.gamma".to_string(), ObservedCapabilityOutcome::Returned,),
+            ],
+            "AfterCapability observer must receive every batch entry's capability identity and outcome"
         );
     }
 
@@ -2209,7 +2413,7 @@ mod tests {
     #[tokio::test]
     async fn batch_invocation_fires_observer_for_hook_suspended_entry_after_allowed_entry_with_stop_on_first_suspension()
      {
-        use crate::points::ObserverHookContext;
+        use crate::points::{ObservedCapabilityOutcome, ObserverHookContext};
         use crate::sink::{ObserverHook, ObserverSink};
 
         /// Allows `cap.alpha`, pauses `cap.beta` for approval. The
@@ -2230,13 +2434,19 @@ mod tests {
             }
         }
 
-        struct CountingObserver {
-            seen: Arc<Mutex<u32>>,
+        struct RecordingObserver {
+            seen: Arc<Mutex<Vec<(String, ObservedCapabilityOutcome)>>>,
         }
         #[async_trait]
-        impl ObserverHook for CountingObserver {
-            async fn observe(&self, _ctx: &ObserverHookContext, _sink: &mut dyn ObserverSink) {
-                *self.seen.lock().expect("not poisoned") += 1;
+        impl ObserverHook for RecordingObserver {
+            async fn observe(&self, ctx: &ObserverHookContext, _sink: &mut dyn ObserverSink) {
+                self.seen.lock().expect("not poisoned").push((
+                    ctx.capability_name
+                        .clone()
+                        .expect("AfterCapability carries capability name"),
+                    ctx.capability_outcome
+                        .expect("AfterCapability carries outcome classification"),
+                ));
             }
         }
 
@@ -2284,10 +2494,10 @@ mod tests {
             gating_id,
             BeforeCapabilityHookImpl::Restricted(Box::new(SelectivePauseHook)),
         );
-        let seen = Arc::new(Mutex::new(0u32));
+        let seen = Arc::new(Mutex::new(Vec::new()));
         dispatcher.install_observer_impl(
             observer_id,
-            crate::dispatch::ObserverHookImpl::Any(Box::new(CountingObserver {
+            crate::dispatch::ObserverHookImpl::Any(Box::new(RecordingObserver {
                 seen: seen.clone(),
             })),
         );
@@ -2329,10 +2539,12 @@ mod tests {
         );
         assert_eq!(
             *seen.lock().expect("not poisoned"),
-            2,
-            "AfterCapability observer must fire for BOTH entries — the \
-             hook-allowed alpha AND the hook-resolved suspension beta. \
-             Pre-fix the merge loop broke before firing beta's observer.",
+            vec![
+                ("cap.alpha".to_string(), ObservedCapabilityOutcome::Returned,),
+                ("cap.beta".to_string(), ObservedCapabilityOutcome::Parked),
+            ],
+            "AfterCapability observer must classify the hook-allowed alpha as Returned and the \
+             hook-resolved beta suspension as Parked.",
         );
         // No inner work for beta — the hook short-circuited it. The
         // inner test port's `invoke_capability_batch` impl delegates

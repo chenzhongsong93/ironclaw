@@ -1171,35 +1171,72 @@ impl HookDispatcher {
         tenant: ironclaw_host_api::TenantId,
         provider: Option<ironclaw_host_api::ExtensionId>,
     ) -> ObserverDispatchOutcome {
+        let observed_kind = match point {
+            HookPointSpec::AfterModel => crate::points::observer::ObservedKind::AfterModel,
+            HookPointSpec::AfterCapability => {
+                crate::points::observer::ObservedKind::AfterCapability
+            }
+            HookPointSpec::AfterCheckpoint => {
+                crate::points::observer::ObservedKind::AfterCheckpoint
+            }
+            _ => {
+                tracing::error!(
+                    ?point,
+                    "dispatch_observer_at called with non-observer point; \
+                     returning empty outcome (this indicates a dispatcher \
+                     wiring bug)"
+                );
+                return ObserverDispatchOutcome {
+                    facts: Vec::new(),
+                    failures: Vec::new(),
+                };
+            }
+        };
+        self.dispatch_observer_context(
+            point,
+            ObserverHookContext {
+                tenant_id: tenant,
+                observed_kind,
+                provider,
+                capability_name: None,
+                capability_activity_id: None,
+                capability_outcome: None,
+            },
+        )
+        .await
+    }
+
+    /// Dispatch the bounded completion fact for one capability invocation.
+    /// Input/output payloads and host error text are deliberately absent.
+    pub async fn dispatch_after_capability(
+        &self,
+        tenant: ironclaw_host_api::TenantId,
+        capability_name: String,
+        capability_activity_id: ironclaw_turns::CapabilityActivityId,
+        provider: Option<ironclaw_host_api::ExtensionId>,
+        outcome: crate::points::ObservedCapabilityOutcome,
+    ) -> ObserverDispatchOutcome {
+        self.dispatch_observer_context(
+            HookPointSpec::AfterCapability,
+            ObserverHookContext::after_capability(
+                tenant,
+                capability_name,
+                capability_activity_id,
+                provider,
+                outcome,
+            ),
+        )
+        .await
+    }
+
+    async fn dispatch_observer_context(
+        &self,
+        point: HookPointSpec,
+        ctx: ObserverHookContext,
+    ) -> ObserverDispatchOutcome {
         let (ordered, mut poisoned) = self.ordered_bindings_with_poison_snapshot(point);
         let mut facts = Vec::new();
         let mut failures = Vec::new();
-        let ctx = ObserverHookContext {
-            tenant_id: tenant,
-            observed_kind: match point {
-                HookPointSpec::AfterModel => crate::points::observer::ObservedKind::AfterModel,
-                HookPointSpec::AfterCapability => {
-                    crate::points::observer::ObservedKind::AfterCapability
-                }
-                HookPointSpec::AfterCheckpoint => {
-                    crate::points::observer::ObservedKind::AfterCheckpoint
-                }
-                _ => {
-                    // Non-observer point passed in: a bug in the dispatcher's
-                    // own caller (we should never reach this arm from
-                    // production paths). Log so the bug is visible without
-                    // crashing the loop.
-                    tracing::error!(
-                        ?point,
-                        "dispatch_observer_at called with non-observer point; \
-                         returning empty outcome (this indicates a dispatcher \
-                         wiring bug)"
-                    );
-                    return ObserverDispatchOutcome { facts, failures };
-                }
-            },
-            provider: provider.clone(),
-        };
 
         for (_key, binding) in ordered {
             if poisoned.contains(&binding.hook_id) {
@@ -1214,7 +1251,7 @@ impl HookDispatcher {
             // is `Global`/`SameTenant`, which `permits` always allows.
             if !binding
                 .scope
-                .permits(binding.owning_extension.as_ref(), provider.as_ref())
+                .permits(binding.owning_extension.as_ref(), ctx.provider.as_ref())
             {
                 continue;
             }

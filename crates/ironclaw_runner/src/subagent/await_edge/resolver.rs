@@ -13,8 +13,9 @@ use std::sync::{Arc, OnceLock};
 use ironclaw_host_api::{CapabilityId, UserId};
 use ironclaw_loop_host::{AwaitEdgeSettler, DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID, ResolveOutcome};
 use ironclaw_threads::{
-    LatestThreadMessageRequest, MessageKind, MessageStatus, SessionThreadService,
-    ThreadHistoryRequest, ThreadScope, ToolResultSafeSummary, UpdateToolResultReferenceRequest,
+    LatestThreadMessageRequest, MessageKind, MessageStatus, SessionThreadError,
+    SessionThreadService, ThreadHistoryRequest, ThreadScope, ToolResultSafeSummary,
+    UpdateToolResultReferenceRequest,
 };
 use ironclaw_turns::{
     GateRef, GetRunStateRequest, IdempotencyKey, ResumeTurnPrecondition, ResumeTurnRequest,
@@ -35,6 +36,12 @@ use crate::subagent::spawn_result::{
 use crate::subagent::untrusted_text::{
     sanitize_tool_result_summary, sanitize_untrusted_terminal_reason, wrap_untrusted_subagent_text,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentResumeOutcome {
+    Resumed,
+    AlreadyTerminal,
+}
 
 pub struct AwaitEdgeResolver<
     S: SessionThreadService + ?Sized,
@@ -363,6 +370,10 @@ where
             terminal_reason: None,
             reservation_release: super::ReservationReleaseState::Unclaimed,
             created_at: chrono::Utc::now(),
+            deadline: Some(
+                chrono::Utc::now()
+                    + chrono::Duration::seconds(super::DEFAULT_AWAIT_EDGE_DEADLINE_SECONDS),
+            ),
             settled_at: None,
         }))
     }
@@ -404,7 +415,7 @@ where
             owner_user_id,
             mission_id: None,
         };
-        let final_text = self
+        let final_text = match self
             .thread_service
             .latest_thread_message(LatestThreadMessageRequest {
                 scope: child_thread_scope,
@@ -413,10 +424,18 @@ where
                 status: MessageStatus::Finalized,
             })
             .await
-            .map_err(|error| TurnError::Unavailable {
-                reason: format!("subagent child final message unavailable: {error}"),
-            })?
-            .and_then(|message| message.content);
+        {
+            Ok(message) => message.and_then(|message| message.content),
+            // An expired edge can predate child-thread creation (edge is
+            // deliberately written first). Recovery must still deliver a
+            // sanitized failed result and unblock the parent.
+            Err(SessionThreadError::UnknownThread { .. }) if status == TurnStatus::Failed => None,
+            Err(error) => {
+                return Err(TurnError::Unavailable {
+                    reason: format!("subagent child final message unavailable: {error}"),
+                });
+            }
+        };
         let failure_summary = match status {
             TurnStatus::Failed | TurnStatus::Cancelled | TurnStatus::RecoveryRequired => {
                 sanitized_reason
@@ -463,7 +482,6 @@ where
         Ok(())
     }
 
-    /// Resumes the parent using the actor cached on `edge.parent_run_context`
     /// at open/reconstruct time — never a live `TurnLifecycleEvent` — so this
     /// is callable from both the reactive settle path (`settle_and_maybe_drain`)
     /// and recovery's re-drive of a crash-settled-but-undrained group
@@ -472,8 +490,7 @@ where
         &self,
         edge: &AwaitEdge,
         parent_run_id: TurnRunId,
-        child_run_id: TurnRunId,
-    ) -> Result<(), TurnError> {
+    ) -> Result<ParentResumeOutcome, TurnError> {
         let actor =
             edge.parent_run_context
                 .actor
@@ -495,6 +512,7 @@ where
         // `resume_turn` fail closed with `ScopeNotFound` (found live against
         // the e2e harness).
         let parent_scope = edge.parent_run_context.scope.clone();
+        let gate_digest = blake3::hash(edge.gate_ref.as_str().as_bytes()).to_hex();
         let result = coordinator
             .resume_turn(ResumeTurnRequest {
                 scope: parent_scope,
@@ -504,7 +522,7 @@ where
                 source_binding_ref: edge.source_binding_ref.clone(),
                 reply_target_binding_ref: edge.reply_target_binding_ref.clone(),
                 idempotency_key: IdempotencyKey::new(format!(
-                    "subagent-resume:{parent_run_id}:{child_run_id}"
+                    "subagent-resume:{parent_run_id}:{gate_digest}"
                 ))
                 .map_err(|reason| TurnError::InvalidRequest { reason })?,
                 // Pin the resume to the dependent-run gate so a child
@@ -514,14 +532,85 @@ where
                 resume_disposition: None,
             })
             .await;
-        result.map(|_| ()).or_else(|error| {
-            if is_benign_already_resumed(&error) {
-                Ok(())
-            } else {
-                Err(error)
+        match result {
+            Ok(_) => Ok(ParentResumeOutcome::Resumed),
+            Err(error) if is_terminal_parent(&error) => Ok(ParentResumeOutcome::AlreadyTerminal),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Reconcile one durable edge without relying on lifecycle redelivery.
+    ///
+    /// `Open` edges are resolved from the authoritative child run record when
+    /// it is terminal. A missing child remains open until its additive deadline
+    /// elapses, then is settled as a failed spawn so the parent can resume. A
+    /// non-terminal child remains untouched. `Settled` edges re-drive drain.
+    pub(super) async fn recover_edge(
+        &self,
+        child_scope: &TurnScope,
+        parent_run_id: TurnRunId,
+        child_run_id: TurnRunId,
+        edge: &AwaitEdge,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ResolveOutcome, TurnError> {
+        match edge.state {
+            AwaitEdgeState::Open => {
+                match self
+                    .turn_state_store
+                    .get_run_record(child_scope, child_run_id)
+                    .await?
+                {
+                    Some(child_record) => {
+                        let Some(terminal_kind) =
+                            EdgeTerminalKind::from_status(child_record.status)
+                        else {
+                            return Ok(ResolveOutcome::AlreadyClosed);
+                        };
+                        let event = terminal_event_from_record(&child_record, edge)?;
+                        self.settle_and_maybe_drain(
+                            child_scope,
+                            parent_run_id,
+                            child_run_id,
+                            terminal_kind,
+                            &event,
+                            child_record.received_at,
+                        )
+                        .await
+                    }
+                    None if edge.effective_deadline() <= now => {
+                        let event = missing_child_deadline_event(child_scope, child_run_id, edge)?;
+                        self.settle_and_maybe_drain(
+                            child_scope,
+                            parent_run_id,
+                            child_run_id,
+                            EdgeTerminalKind::Failed,
+                            &event,
+                            edge.created_at,
+                        )
+                        .await
+                    }
+                    None => Err(TurnError::Unavailable {
+                        reason: format!(
+                            "await-edge child {child_run_id} is not committed and its deadline has not elapsed"
+                        ),
+                    }),
+                }
             }
-        })?;
-        Ok(())
+            AwaitEdgeState::Settled => {
+                self.drain_settled_group(child_scope, parent_run_id, child_run_id)
+                    .await
+            }
+            AwaitEdgeState::Drained | AwaitEdgeState::Abandoned => {
+                self.close_edge(
+                    child_scope,
+                    parent_run_id,
+                    edge.tree_root_run_id,
+                    child_run_id,
+                )
+                .await?;
+                Ok(ResolveOutcome::Drained)
+            }
+        }
     }
 
     /// Drives one child terminal event through settle -> (group-ready?) ->
@@ -815,18 +904,17 @@ where
             .await?;
         }
 
-        self.resume_parent(&edge, parent_run_id, driving_child_run_id)
-            .await?;
+        let parent_resume = self.resume_parent(&edge, parent_run_id).await?;
 
         for (member_child_run_id, member_edge) in &group {
             self.goal_store
-                .delete_goal(child_scope, *member_child_run_id)
+                .delete_goal(&member_edge.child_scope, *member_child_run_id)
                 .await
                 .map_err(|error| TurnError::Unavailable {
                     reason: error.safe_summary,
                 })?;
             self.close_edge(
-                child_scope,
+                &member_edge.child_scope,
                 parent_run_id,
                 member_edge.tree_root_run_id,
                 *member_child_run_id,
@@ -834,7 +922,10 @@ where
             .await?;
         }
 
-        Ok(ResolveOutcome::Resumed)
+        Ok(match parent_resume {
+            ParentResumeOutcome::Resumed => ResolveOutcome::Resumed,
+            ParentResumeOutcome::AlreadyTerminal => ResolveOutcome::Drained,
+        })
     }
 
     /// §2/§5.5's full close sequence for one edge: release tri-state ->
@@ -892,6 +983,24 @@ where
                 reason: error.to_string(),
             })
     }
+
+    async fn observe_child_terminal_event(
+        &self,
+        event: &TurnLifecycleEvent,
+    ) -> Result<(), TurnError> {
+        match self.handle_child_terminal_inner(event).await {
+            Ok(_) => Ok(()),
+            Err(error) if is_parent_not_blocked_yet(&error) => {
+                tracing::debug!(
+                    child_run_id = %event.run_id,
+                    error = %error,
+                    "fast child settled before parent blocked; durable edge awaits blocked-state recovery"
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 fn store_error(error: super::AwaitEdgeStoreError) -> TurnError {
@@ -900,23 +1009,27 @@ fn store_error(error: super::AwaitEdgeStoreError) -> TurnError {
     }
 }
 
-/// §5.2's benign already-closed set for a resume attempt pinned to
-/// `ResumeTurnPrecondition::BlockedDependentRunGate`: exactly
-/// `from ∈ {Queued, Running, Completed}` — a second resume attempt
-/// (double-settle, or recovery re-driving an already-resumed parent)
-/// observes the parent already moved off `BlockedDependentRun` onto one of
-/// these and no-ops. Any other `from` (Failed/Cancelled/CancelRequested/
-/// RecoveryRequired, or a still-blocked state like BlockedApproval/
-/// BlockedAuth/BlockedResource/BlockedExternalTool) means the parent never
-/// actually moved past this gate for an unrelated reason — that must surface
-/// as a real error so the caller retries rather than silently dropping the
-/// child's result. Pulled out as a pure function so the discriminator itself
-/// is unit-testable without standing up a full resolver + coordinator.
-fn is_benign_already_resumed(error: &TurnError) -> bool {
+/// A terminal parent no longer needs a child wake. Its edge must still close so
+/// periodic recovery does not retain a Settled record forever. `Queued` and
+/// `Running` are deliberately excluded: they can be the fast-child window.
+fn is_terminal_parent(error: &TurnError) -> bool {
     matches!(
         error,
         TurnError::InvalidTransition {
-            from: TurnStatus::Queued | TurnStatus::Running | TurnStatus::Completed,
+            from: TurnStatus::Completed
+                | TurnStatus::Cancelled
+                | TurnStatus::Failed
+                | TurnStatus::RecoveryRequired,
+            ..
+        }
+    )
+}
+
+fn is_parent_not_blocked_yet(error: &TurnError) -> bool {
+    matches!(
+        error,
+        TurnError::InvalidTransition {
+            from: TurnStatus::Queued | TurnStatus::Running,
             ..
         }
     )
@@ -927,66 +1040,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn benign_already_resumed_set_is_exactly_queued_running_completed() {
-        let benign = [
-            TurnStatus::Queued,
-            TurnStatus::Running,
+    fn terminal_parent_set_closes_edges_without_resume() {
+        for from in [
             TurnStatus::Completed,
-        ];
-        for from in benign {
+            TurnStatus::Cancelled,
+            TurnStatus::Failed,
+            TurnStatus::RecoveryRequired,
+        ] {
             let error = TurnError::InvalidTransition {
                 from,
                 to: TurnStatus::Queued,
             };
             assert!(
-                is_benign_already_resumed(&error),
-                "{from:?} must be treated as benign already-resumed"
+                is_terminal_parent(&error),
+                "{from:?} has no remaining parent wake and must permit edge cleanup"
             );
         }
     }
 
     #[test]
-    fn non_benign_invalid_transition_statuses_surface_as_real_errors() {
-        // Every `TurnStatus` NOT in the benign set — including the
-        // still-blocked-on-something-else statuses that are the actual data
-        // -loss bug this discriminator guards against (a parent stuck on an
-        // unrelated approval/auth/resource/external-tool gate must not be
-        // silently treated as "already resumed").
-        let non_benign = [
+    fn non_terminal_invalid_transition_states_preserve_the_edge() {
+        // Running/Queued are load-bearing: a fast child can terminate before
+        // the parent commits BlockedDependentRun. Other blocked states also
+        // require caller-visible failure rather than deleting child evidence.
+        let non_terminal = [
+            TurnStatus::Queued,
+            TurnStatus::Running,
             TurnStatus::BlockedApproval,
             TurnStatus::BlockedAuth,
             TurnStatus::BlockedResource,
             TurnStatus::BlockedDependentRun,
             TurnStatus::BlockedExternalTool,
             TurnStatus::CancelRequested,
-            TurnStatus::Cancelled,
-            TurnStatus::Failed,
-            TurnStatus::RecoveryRequired,
         ];
-        for from in non_benign {
+        for from in non_terminal {
             let error = TurnError::InvalidTransition {
                 from,
                 to: TurnStatus::Queued,
             };
             assert!(
-                !is_benign_already_resumed(&error),
-                "{from:?} must NOT be treated as benign — it indicates the parent \
-                 never actually moved past BlockedDependentRun for an unrelated reason"
+                !is_terminal_parent(&error),
+                "{from:?} must preserve the Settled edge for recovery"
             );
         }
     }
 
     #[test]
-    fn non_invalid_transition_errors_are_never_benign() {
-        // A wildcard on the *error variant* (matching `Conflict` or any
-        // other kind alongside `InvalidTransition`) is exactly the class of
-        // bug this discriminator replaced — pin that only this one error
-        // shape, with only this one `from`-set, is ever benign.
-        assert!(!is_benign_already_resumed(&TurnError::Conflict {
+    fn non_invalid_transition_errors_do_not_imply_parent_terminal() {
+        assert!(!is_terminal_parent(&TurnError::Conflict {
             reason: "unrelated conflict".to_string()
         }));
-        assert!(!is_benign_already_resumed(&TurnError::ScopeNotFound));
-        assert!(!is_benign_already_resumed(&TurnError::Unauthorized));
+        assert!(!is_terminal_parent(&TurnError::ScopeNotFound));
+        assert!(!is_terminal_parent(&TurnError::Unauthorized));
     }
 
     // ─── reconstruct_edge (FIX A): pure data transformation off cached
@@ -1594,6 +1699,10 @@ mod tests {
             terminal_reason: None,
             reservation_release: crate::subagent::await_edge::ReservationReleaseState::Unclaimed,
             created_at: chrono::Utc::now(),
+            deadline: Some(
+                chrono::Utc::now()
+                    + chrono::Duration::seconds(super::super::DEFAULT_AWAIT_EDGE_DEADLINE_SECONDS),
+            ),
             settled_at: None,
         };
         store
@@ -1689,11 +1798,11 @@ where
         state: ironclaw_turns::TurnRunState,
     ) -> Result<(), TurnError> {
         let event = terminal_event_from_state(&state)?;
-        self.handle_child_terminal_inner(&event).await.map(|_| ())
+        self.observe_child_terminal_event(&event).await
     }
 
     async fn observe_committed_event(&self, event: TurnLifecycleEvent) -> Result<(), TurnError> {
-        self.handle_child_terminal_inner(&event).await.map(|_| ())
+        self.observe_child_terminal_event(&event).await
     }
 }
 
@@ -1768,6 +1877,57 @@ fn parent_result_summary(
     };
     summary = sanitize_tool_result_summary(summary);
     ToolResultSafeSummary::new(summary).map_err(|reason| TurnError::InvalidRequest { reason })
+}
+
+fn terminal_event_from_record(
+    record: &TurnRunRecord,
+    edge: &AwaitEdge,
+) -> Result<TurnLifecycleEvent, TurnError> {
+    let kind = event_kind_from_terminal_status(record.status)?;
+    Ok(TurnLifecycleEvent {
+        cursor: record.event_cursor,
+        scope: record.scope.clone(),
+        occurred_at: None,
+        owner_user_id: edge
+            .parent_run_context
+            .actor
+            .clone()
+            .map(|actor| actor.user_id),
+        run_id: record.run_id,
+        status: record.status,
+        kind,
+        blocked_gate: None,
+        sanitized_reason: record
+            .failure
+            .as_ref()
+            .map(|failure| failure.category().to_string()),
+        retryable: None,
+        detail: None,
+    })
+}
+
+fn missing_child_deadline_event(
+    child_scope: &TurnScope,
+    child_run_id: TurnRunId,
+    edge: &AwaitEdge,
+) -> Result<TurnLifecycleEvent, TurnError> {
+    Ok(TurnLifecycleEvent {
+        cursor: ironclaw_turns::EventCursor(0),
+        scope: child_scope.clone(),
+        occurred_at: None,
+        owner_user_id: edge
+            .parent_run_context
+            .actor
+            .clone()
+            .map(|actor| actor.user_id),
+        run_id: child_run_id,
+        status: TurnStatus::Failed,
+        kind: event_kind_from_terminal_status(TurnStatus::Failed)?,
+        blocked_gate: None,
+        sanitized_reason: Some("subagent_child_submission_missing".to_string()),
+        retryable: Some(false),
+        detail: None,
+    })
 }
 
 fn terminal_event_from_state(

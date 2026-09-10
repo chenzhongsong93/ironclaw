@@ -654,9 +654,19 @@ where
     let subagent_await_edge_settler = Arc::clone(&parts.subagent_await_edge_settler);
     let subagent_completion_observer: Arc<dyn TurnCommittedEventObserver> =
         Arc::clone(&subagent_await_edge_settler).as_turn_committed_event_observer();
+    let spawn_counters = Arc::new(RunScopedSpawnCounterRegistry::default());
+    let spawn_authorizations = Arc::new(RunScopedSpawnAuthorizationRegistry::default());
+    let spawn_counter_cleanup_observer: Arc<dyn TurnCommittedEventObserver> =
+        Arc::new(RunScopedSpawnCounterLifecycleObserver::new(
+            Arc::clone(&spawn_counters),
+            Arc::clone(&spawn_authorizations),
+        ));
     let lifecycle_bus = Arc::new(DefaultTurnLifecycleEventBus::new());
     lifecycle_bus
         .subscribe_required(Arc::clone(&subagent_completion_observer))
+        .map_err(|error| DefaultPlannedRuntimeBuildError::SubagentCompletion(error.to_string()))?;
+    lifecycle_bus
+        .subscribe_required(spawn_counter_cleanup_observer)
         .map_err(|error| DefaultPlannedRuntimeBuildError::SubagentCompletion(error.to_string()))?;
     if let Some(turn_event_sink) = parts.turn_event_sink.clone() {
         lifecycle_bus
@@ -710,6 +720,8 @@ where
         },
         parts.subagent_spawn_limits,
         subagent_flavor_catalog,
+        Arc::clone(&spawn_counters),
+        Arc::clone(&spawn_authorizations),
     )?);
     let mut capability_factory_builder =
         DecoratingLoopCapabilityPortFactory::new(parts.capability_factory)
@@ -837,7 +849,11 @@ where
         .with_runner_heartbeat_interval(parts.config.heartbeat_interval)
         .with_poll_interval(parts.config.poll_interval)
         .with_lease_recovery_interval(parts.config.lease_recovery_interval);
-    let scheduler = TurnRunScheduler::new(Arc::clone(&transition_port), executor, scheduler_config);
+    let scheduler = TurnRunScheduler::new(Arc::clone(&transition_port), executor, scheduler_config)
+        .with_await_edge_recovery(
+            Arc::clone(&parts.subagent_await_edge_writer),
+            parts.config.lease_recovery_interval,
+        );
     let scheduler_handle = wake_wiring.start(scheduler);
 
     Ok(
@@ -868,6 +884,118 @@ const SCHEDULED_TRIGGER_DENIED_CAPABILITY_IDS: &[&str] = &[
     ironclaw_host_runtime::TRIGGER_RESUME_CAPABILITY_ID,
 ];
 
+/// Spawn authorizations registered by provider tool calls for one parent run.
+type RunSpawnAuthorizations = HashMap<CapabilityInputRef, CapabilityActivityId>;
+
+#[derive(Default)]
+struct RunScopedSpawnAuthorizationRegistry {
+    maps: Mutex<HashMap<ironclaw_turns::TurnRunId, Arc<Mutex<RunSpawnAuthorizations>>>>,
+}
+
+impl RunScopedSpawnAuthorizationRegistry {
+    fn map_for(&self, run_id: ironclaw_turns::TurnRunId) -> Arc<Mutex<RunSpawnAuthorizations>> {
+        let mut maps = match self.maps.lock() {
+            Ok(maps) => maps,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        maps.entry(run_id)
+            .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
+            .clone()
+    }
+
+    fn remove(&self, run_id: ironclaw_turns::TurnRunId) {
+        let mut maps = match self.maps.lock() {
+            Ok(maps) => maps,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        maps.remove(&run_id);
+    }
+}
+
+#[derive(Default)]
+struct RunScopedSpawnCounterRegistry {
+    counters: Mutex<HashMap<ironclaw_turns::TurnRunId, Arc<AtomicU32>>>,
+}
+
+impl RunScopedSpawnCounterRegistry {
+    fn counter_for(&self, run_id: ironclaw_turns::TurnRunId) -> Arc<AtomicU32> {
+        let mut counters = match self.counters.lock() {
+            Ok(counters) => counters,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        counters
+            .entry(run_id)
+            .or_insert_with(|| Arc::new(AtomicU32::new(0)))
+            .clone()
+    }
+
+    fn remove(&self, run_id: ironclaw_turns::TurnRunId) {
+        let mut counters = match self.counters.lock() {
+            Ok(counters) => counters,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        counters.remove(&run_id);
+    }
+
+    #[cfg(test)]
+    fn has_counter_for(&self, run_id: ironclaw_turns::TurnRunId) -> bool {
+        let counters = match self.counters.lock() {
+            Ok(counters) => counters,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        counters.contains_key(&run_id)
+    }
+}
+
+struct RunScopedSpawnCounterLifecycleObserver {
+    counters: Arc<RunScopedSpawnCounterRegistry>,
+    authorizations: Arc<RunScopedSpawnAuthorizationRegistry>,
+}
+
+impl RunScopedSpawnCounterLifecycleObserver {
+    fn new(
+        counters: Arc<RunScopedSpawnCounterRegistry>,
+        authorizations: Arc<RunScopedSpawnAuthorizationRegistry>,
+    ) -> Self {
+        Self {
+            counters,
+            authorizations,
+        }
+    }
+
+    fn clear_terminal_run(&self, run_id: ironclaw_turns::TurnRunId) {
+        self.counters.remove(run_id);
+        self.authorizations.remove(run_id);
+    }
+}
+
+#[async_trait::async_trait]
+impl TurnCommittedEventObserver for RunScopedSpawnCounterLifecycleObserver {
+    fn observes_state(&self, state: &ironclaw_turns::TurnRunState) -> bool {
+        state.status.is_terminal()
+    }
+
+    fn observes_event(&self, event: &ironclaw_turns::TurnLifecycleEvent) -> bool {
+        event.status.is_terminal()
+    }
+
+    async fn observe_committed_state(
+        &self,
+        state: ironclaw_turns::TurnRunState,
+    ) -> Result<(), ironclaw_turns::TurnError> {
+        self.clear_terminal_run(state.run_id);
+        Ok(())
+    }
+
+    async fn observe_committed_event(
+        &self,
+        event: ironclaw_turns::TurnLifecycleEvent,
+    ) -> Result<(), ironclaw_turns::TurnError> {
+        self.clear_terminal_run(event.run_id);
+        Ok(())
+    }
+}
+
 struct SubagentSpawnCapabilityDecorator {
     spawn_deps: Arc<SubagentSpawnDeps>,
     spawn_id: CapabilityId,
@@ -875,14 +1003,12 @@ struct SubagentSpawnCapabilityDecorator {
     /// Schema precomputed once at construction time so `decorate()` does not
     /// rebuild it on every loop run.
     parameters_schema: Arc<serde_json::Value>,
-    /// 天权治本(2026-07-27):共享 spawn_authorizations + spawned_this_turn。
-    /// decorate 每次 create_capability_port 创建新 port 实例(per-run),
-    /// 若 spawn_authorizations 在 port 里则 register/authorize 跨 port 重建读写不同 map,
-    /// 致 authorize 读空 map → spawn_requires_provider_registration reject 不阻塞。
-    /// 放 decorator(per-process 共享),decorate 时 Arc::clone 传给 port,
-    /// input_ref payload 含 run_id(capability_port.rs:3193)天然按 run 隔离。
-    spawn_authorizations: Arc<Mutex<HashMap<CapabilityInputRef, CapabilityActivityId>>>,
-    spawned_this_turn: Arc<AtomicU32>,
+    /// Provider registrations are shared per parent run across capability-port
+    /// recreation and are released by the terminal lifecycle observer.
+    spawn_authorizations: Arc<RunScopedSpawnAuthorizationRegistry>,
+    /// Shared counter registry keyed by the parent run id. Each decorated port
+    /// obtains its parent's counter, and terminal lifecycle events remove it.
+    spawn_counters: Arc<RunScopedSpawnCounterRegistry>,
 }
 
 impl SubagentSpawnCapabilityDecorator {
@@ -890,6 +1016,8 @@ impl SubagentSpawnCapabilityDecorator {
         spawn_deps: SubagentSpawnDeps,
         spawn_limits: SubagentSpawnLimits,
         flavor_catalog: Vec<SpawnSubagentFlavorDescriptor>,
+        spawn_counters: Arc<RunScopedSpawnCounterRegistry>,
+        spawn_authorizations: Arc<RunScopedSpawnAuthorizationRegistry>,
     ) -> Result<Self, DefaultPlannedRuntimeBuildError> {
         let spawn_id = CapabilityId::new(ironclaw_loop_host::DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID)
             .map_err(|error| DefaultPlannedRuntimeBuildError::RunProfile(error.to_string()))?;
@@ -901,8 +1029,8 @@ impl SubagentSpawnCapabilityDecorator {
             spawn_id,
             spawn_limits,
             parameters_schema,
-            spawn_authorizations: Arc::new(Mutex::new(HashMap::new())),
-            spawned_this_turn: Arc::new(AtomicU32::new(0)),
+            spawn_authorizations,
+            spawn_counters,
         })
     }
 }
@@ -924,8 +1052,8 @@ impl LoopCapabilityPortDecorator for SubagentSpawnCapabilityDecorator {
             self.spawn_limits,
             Arc::clone(&self.spawn_deps),
             Arc::clone(&self.parameters_schema),
-            Arc::clone(&self.spawn_authorizations),
-            Arc::clone(&self.spawned_this_turn),
+            self.spawn_authorizations.map_for(run_context.run_id),
+            self.spawn_counters.counter_for(run_context.run_id),
         ))
     }
 }
@@ -937,7 +1065,11 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use super::{SCHEDULED_TRIGGER_DENIED_CAPABILITY_IDS, scheduler_permit_count};
+    use super::{
+        RunScopedSpawnAuthorizationRegistry, RunScopedSpawnCounterLifecycleObserver,
+        RunScopedSpawnCounterRegistry, SCHEDULED_TRIGGER_DENIED_CAPABILITY_IDS,
+        scheduler_permit_count,
+    };
     use async_trait::async_trait;
     use ironclaw_host_api::{
         AgentId, CapabilityId, ProjectId, Resolution, ResolutionBatch, RuntimeKind, TenantId,
@@ -948,12 +1080,13 @@ mod tests {
         TRIGGER_REMOVE_CAPABILITY_ID, TRIGGER_RESUME_CAPABILITY_ID,
     };
     use ironclaw_turns::{
-        InMemoryRunProfileResolver, RunProfileResolver, TurnId, TurnRunId, TurnScope,
+        CapabilityActivityId, InMemoryRunProfileResolver, RunProfileResolver, TurnId, TurnRunId,
+        TurnScope,
         run_profile::{
             AgentLoopHostError, AgentLoopHostErrorKind, CapabilityBatchInvocation,
-            CapabilityDescriptorView, CapabilityInvocation, CapabilitySurfaceVersion,
-            ConcurrencyHint, LoopCapabilityPort, LoopRunContext, RunProfileResolutionRequest,
-            VisibleCapabilityRequest, VisibleCapabilitySurface,
+            CapabilityDescriptorView, CapabilityInputRef, CapabilityInvocation,
+            CapabilitySurfaceVersion, ConcurrencyHint, LoopCapabilityPort, LoopRunContext,
+            RunProfileResolutionRequest, VisibleCapabilityRequest, VisibleCapabilitySurface,
         },
     };
 
@@ -1016,6 +1149,94 @@ mod tests {
         assert_eq!(permits, tokio::sync::Semaphore::MAX_PERMITS);
         // Must not panic.
         let _ = tokio::sync::Semaphore::new(permits);
+    }
+
+    #[test]
+    fn spawn_counter_registry_shares_a_parent_run_counter_and_isolates_other_runs() {
+        let counters = RunScopedSpawnCounterRegistry::default();
+        let parent_a = TurnRunId::new();
+        let parent_b = TurnRunId::new();
+
+        let first_port_for_a = counters.counter_for(parent_a);
+        let second_port_for_a = counters.counter_for(parent_a);
+        let port_for_b = counters.counter_for(parent_b);
+
+        assert!(
+            Arc::ptr_eq(&first_port_for_a, &second_port_for_a),
+            "ports created for one parent run must share its spawn counter"
+        );
+        for expected in 0..4 {
+            assert_eq!(
+                first_port_for_a.fetch_add(1, Ordering::AcqRel),
+                expected,
+                "the shared parent counter must retain every port's reservations"
+            );
+        }
+        assert_eq!(second_port_for_a.load(Ordering::Acquire), 4);
+        assert_eq!(
+            port_for_b.load(Ordering::Acquire),
+            0,
+            "a different parent run must start with an independent cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_counter_registry_drops_parent_counter_on_terminal_lifecycle_event() {
+        use ironclaw_turns::{
+            DefaultTurnLifecycleEventBus, EventCursor, TurnEventKind, TurnLifecycleEvent,
+            TurnLifecycleEventBus, TurnStatus,
+        };
+
+        let counters = Arc::new(RunScopedSpawnCounterRegistry::default());
+        let authorizations = Arc::new(RunScopedSpawnAuthorizationRegistry::default());
+        let parent_run_id = TurnRunId::new();
+        counters
+            .counter_for(parent_run_id)
+            .store(4, Ordering::Release);
+        let input_ref = CapabilityInputRef::new("input:terminal-cleanup").expect("valid input");
+        authorizations
+            .map_for(parent_run_id)
+            .lock()
+            .expect("authorization map lock")
+            .insert(input_ref.clone(), CapabilityActivityId::new());
+
+        let bus = DefaultTurnLifecycleEventBus::new();
+        bus.subscribe_required(Arc::new(RunScopedSpawnCounterLifecycleObserver::new(
+            Arc::clone(&counters),
+            Arc::clone(&authorizations),
+        )))
+        .expect("counter cleanup observer subscribes");
+
+        let scope = test_run_context().await.scope;
+        bus.publish_event(TurnLifecycleEvent {
+            cursor: EventCursor(1),
+            scope,
+            occurred_at: None,
+            owner_user_id: None,
+            run_id: parent_run_id,
+            status: TurnStatus::Completed,
+            kind: TurnEventKind::Completed,
+            blocked_gate: None,
+            sanitized_reason: None,
+            retryable: None,
+            detail: None,
+        })
+        .await
+        .expect("terminal lifecycle event is observed");
+
+        assert!(
+            !counters.has_counter_for(parent_run_id),
+            "terminal parent runs must release their per-run counter entries"
+        );
+        assert!(
+            authorizations
+                .maps
+                .lock()
+                .expect("authorization registry lock")
+                .get(&parent_run_id)
+                .is_none(),
+            "terminal parent runs must release their provider spawn registrations"
+        );
     }
 
     async fn test_run_context() -> LoopRunContext {

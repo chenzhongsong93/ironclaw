@@ -1,6 +1,7 @@
 //! Context for the `before_capability` hook point.
 
 use ironclaw_host_api::{ExtensionId, TenantId};
+use ironclaw_turns::CapabilityActivityId;
 use rust_decimal::Decimal;
 use std::str::FromStr;
 
@@ -23,6 +24,10 @@ const MAX_DEPTH: usize = 8;
 pub struct BeforeCapabilityHookContext {
     pub tenant_id: TenantId,
     pub capability_name: String,
+    /// Opaque identity shared with the matching `AfterCapability` observation.
+    /// State-aware hooks use it to associate a completion with the invocation
+    /// that reserved their state without receiving capability input or output.
+    pub activity_id: Option<CapabilityActivityId>,
     /// The dispatcher's *opaque* digest of the capability arguments. Hook
     /// authors can compare this digest across calls (e.g., for repetition
     /// detection) but cannot read the underlying args; raw args never reach
@@ -76,6 +81,7 @@ impl BeforeCapabilityHookContext {
         Self {
             tenant_id,
             capability_name,
+            activity_id: None,
             arguments_digest,
             arguments,
             provider,
@@ -98,6 +104,12 @@ impl BeforeCapabilityHookContext {
             SanitizedArguments::unresolved(),
             None,
         )
+    }
+
+    #[must_use]
+    pub fn with_activity_id(mut self, activity_id: CapabilityActivityId) -> Self {
+        self.activity_id = Some(activity_id);
+        self
     }
 
     /// Builder-style setter for the stable per-invocation event id used by

@@ -10,6 +10,7 @@ use super::{HarnessResult, HostRuntimeCapabilityHarness};
 
 #[derive(Debug, Clone)]
 pub struct RecordedCapabilityResult {
+    pub result_ref: String,
     pub capability_id: CapabilityId,
     pub output: serde_json::Value,
 }

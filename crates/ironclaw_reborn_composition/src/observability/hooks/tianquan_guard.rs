@@ -36,43 +36,23 @@
 //! therefore uses coarse, argument-free rules keyed on `capability_name` plus
 //! cross-call state, not on argument content.
 //!
-//! # State lifetime & segment reset (verified 2026-07-31)
+//! # Spawn dispatch lifecycle
 //!
-//! The context does not carry a `run_id` / `turn_id` (verified against
-//! `ironclaw_hooks::points::capability`), but the guard's effective state
-//! lifetime is **one continuous execution segment of a run**, not the whole
-//! run: `RebornTurnRunExecutor` calls `HostFactory::create_host(claimed)` each
-//! time the scheduler (re-)claims a run, and each host build mints a fresh
-//! dispatcher (see `factory::build_hook_dispatcher_builder_factory_with`), so
-//! each segment gets a fresh guard. When a blocking spawn parks the run and
-//! the child's terminal event settles it, the resume re-claims the run and
-//! builds a new host — **`pending_spawn` clears implicitly at the resume
-//! boundary**. This is the precise "spawn completed" reset the original design
-//! wanted as a TODO: it already exists structurally. Live verification
-//! (verify_l3 2026-07-31, thread d36377fa): post-resume `result_read` calls
-//! 78 s after spawn (child completed) were correctly allowed — no over-deny of
-//! legitimate result reads — while pre-resume polls within a segment are
-//! denied for the full `PENDING_SPAWN_WINDOW`.
+//! The same guard instance is installed at both `BeforeCapability` and
+//! `AfterCapability`. `BeforeCapability` only reserves an `Invoking` state; it
+//! does not claim that a child exists. The bounded after-context then moves the
+//! state to `Waiting` only when the returned resolution actually parks, or back
+//! to `Idle` when the call returns without parking or errors. This prevents a
+//! scope-recovery transient (or any other pre-dispatch failure) from creating a
+//! ghost pending spawn that blocks an immediate retry.
 //!
-//! - `pending_spawn` also clears itself on a **time window** as a segment-
-//!   internal backstop: a spawn is considered "pending" for
-//!   `PENDING_SPAWN_WINDOW` (300 s) after the spawn is allowed. The window is
-//!   sized to cover worst-case subagent generation within one segment: minimax
-//!   needs ~115 s for a 3000-char chapter (measured 2026-07-29), the request
-//!   timeout is 180 s and the runner lease is 200 s (a segment cannot outlive
-//!   its lease by much), so 300 s ≈ the rest of the segment for any spawn that
-//!   has time to run at all. The previous 60 s window expired mid-generation
-//!   and re-allowed `result_read` polling (handover 2026-07-31 下轮首做①).
-//! - `spawn_count` / `shell_count` are cumulative for the lifetime of the
-//!   guard instance (one segment). Cross-segment leaks cannot occur; per-turn
-//!   accumulation across resume boundaries is intentionally NOT enforced
-//!   (post-resume re-spawn and result_read are legitimate).
-//!
-//! Note: an `AfterCapability` observer cannot serve as the completion signal:
-//! `ObserverHookContext` carries no capability name, and `spawn_subagent`
-//! returns a `spawned` handle immediately (the blocking is at the loop-resume
-//! level), so its completion event fires long before the child finishes. The
-//! segment-boundary reset + time window is the correct mechanism.
+//! The lifecycle observer consumes only capability identity and the bounded
+//! `Parked`/`Returned`/`Errored` classification; it never receives capability
+//! input, output, gate detail, or host error text. `PENDING_SPAWN_WINDOW` remains
+//! a bounded backstop for a lost after-observation or a hung child. A fresh
+
+//! dispatcher is still minted per execution segment, so resume also resets the
+//! state structurally.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -82,8 +62,15 @@ use async_trait::async_trait;
 
 use ironclaw_hooks::identity::{HookId, HookVersion};
 use ironclaw_hooks::ordering::HookPhase;
-use ironclaw_hooks::points::BeforeCapabilityHookContext;
-use ironclaw_hooks::sink::{PrivilegedBeforeCapabilityHook, PrivilegedGateSink};
+use ironclaw_hooks::points::{
+    BeforeCapabilityHookContext, ObservedCapabilityOutcome, ObservedKind, ObserverHookContext,
+};
+use ironclaw_hooks::registry::HookPointSpec;
+use ironclaw_hooks::sink::{
+    ObserverHook, ObserverSink, PrivilegedBeforeCapabilityHook, PrivilegedGateSink,
+};
+
+use ironclaw_turns::CapabilityActivityId;
 
 use crate::error::RebornBuildError;
 
@@ -91,6 +78,8 @@ use crate::error::RebornBuildError;
 /// so the binding is deterministic for checkpoint replay validation.
 pub(crate) const TIANQUAN_GUARD_CANONICAL_PATH: &str =
     "ironclaw_reborn_composition::hooks::tianquan_guard::TianquanBuiltinGuard";
+pub(super) const TIANQUAN_GUARD_OBSERVER_CANONICAL_PATH: &str =
+    "ironclaw_reborn_composition::hooks::tianquan_guard::TianquanBuiltinGuardAfterCapability";
 
 /// Window after an allowed spawn during which `result_read` is denied as a
 /// "polling while spawn is blocking" anti-pattern. Sized at 300 s to cover
@@ -129,25 +118,32 @@ const REASON_RESULT_READ_DURING_PENDING_SPAWN: &str =
     "spawn 是 blocking,等 resume 不要 result_read 轮询";
 const REASON_DUPLICATE_SPAWN: &str = "已 spawn,等 resume 不要重复 spawn";
 const REASON_SHELL_RATE_LIMITED: &str = "builtin.shell 调用过多,用 MCP 工具而非 shell";
-const REASON_REPEAT_CALL: &str =
-    "同工具连续调用过多,勿空转重试:conforms 稳定则 advance_stage(to=approve) 进 committer,或 L7 完成切 loop:prose spawn_subagent 进 L8;真问题请报告而非重复调用";
+const REASON_REPEAT_CALL: &str = "同工具连续调用过多,勿空转重试:conforms 稳定则 advance_stage(to=approve) 进 committer,或 L7 完成切 loop:prose spawn_subagent 进 L8;真问题请报告而非重复调用";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpawnDispatchState {
+    Idle,
+    Invoking {
+        activity_id: CapabilityActivityId,
+        started_at: Instant,
+    },
+    Waiting {
+        activity_id: CapabilityActivityId,
+        started_at: Instant,
+    },
+}
 
 /// Cross-call state for [`TianquanBuiltinGuard`]. Held behind an
 /// `Arc<Mutex<...>>` so the guard (which is `Send + Sync + 'static`) can share
 /// mutable counters across invocations within one dispatcher's lifetime.
 #[derive(Debug, Clone)]
 struct TianquanGuardState {
-    /// True when a spawn was allowed and the time window has not yet elapsed.
-    /// Set on the first allowed spawn; cleared by the time-window check on the
-    /// next relevant evaluation.
-    pending_spawn: bool,
-    /// `Instant` at which the last allowed spawn fired. Used to expire
-    /// `pending_spawn` after [`PENDING_SPAWN_WINDOW`].
-    last_spawn_at: Option<Instant>,
+    /// Lifecycle of the one spawn dispatch allowed in this execution segment.
+    spawn_dispatch: SpawnDispatchState,
     /// Cumulative count of `builtin.spawn_subagent` evaluations seen by this
     /// guard (both allowed and denied). Retained for observability/tests; the
-    /// duplicate-spawn deny keys on `pending_spawn` (window-active), not on
-    /// this counter, so a legitimate re-spawn after the previous child's
+    /// duplicate-spawn deny keys on the active dispatch state, not on this
+    /// counter, so a legitimate re-spawn after the previous child's
     /// window expired is allowed.
     spawn_count: u32,
     /// Cumulative count of `builtin.shell` evaluations seen by this guard.
@@ -160,18 +156,20 @@ struct TianquanGuardState {
     /// [`REPEAT_CALL_LIMIT`] deny for any capability — including MCP tools
     /// such as `tianquan-graph.run_skill_verify` (hook covers all capability
     /// kinds via `HookedLoopCapabilityPort`). Special-cased capabilities
-    /// (spawn/result_read/shell) do not touch these counters.
+    /// (spawn/result_read/shell) do not increment these counters, but every
+    /// invocation still replaces `last_capability` so it interrupts an
+    /// ordinary capability's consecutive-call sequence.
     repeat_calls: HashMap<String, u32>,
-    /// The last capability name evaluated, used to detect *consecutive* vs
-    /// *interleaved* calls. `None` before the first evaluation.
+    /// The last capability invocation evaluated, including special
+    /// capabilities and denials. Used to detect *consecutive* vs
+    /// *interleaved* ordinary calls. `None` before the first evaluation.
     last_capability: Option<String>,
 }
 
 impl TianquanGuardState {
     fn new() -> Self {
         Self {
-            pending_spawn: false,
-            last_spawn_at: None,
+            spawn_dispatch: SpawnDispatchState::Idle,
             spawn_count: 0,
             shell_count: 0,
             repeat_calls: HashMap::new(),
@@ -179,17 +177,48 @@ impl TianquanGuardState {
         }
     }
 
-    /// Expire `pending_spawn` if the time window has elapsed. Called at the
-    /// top of every evaluation so the deny on `result_read` is lifted promptly
-    /// once the window closes.
-    fn expire_pending_spawn(&mut self, now: Instant) {
-        if self.pending_spawn
-            && let Some(spawned_at) = self.last_spawn_at
-            && now.duration_since(spawned_at) >= PENDING_SPAWN_WINDOW
+    /// Expire a stale in-flight/waiting spawn if the bounded backstop elapsed.
+    fn expire_spawn_dispatch(&mut self, now: Instant) {
+        let started_at = match &self.spawn_dispatch {
+            SpawnDispatchState::Invoking { started_at, .. }
+            | SpawnDispatchState::Waiting { started_at, .. } => Some(*started_at),
+            SpawnDispatchState::Idle => None,
+        };
+        if started_at
+            .is_some_and(|started_at| now.duration_since(started_at) >= PENDING_SPAWN_WINDOW)
         {
-            self.pending_spawn = false;
-            self.last_spawn_at = None;
+            self.spawn_dispatch = SpawnDispatchState::Idle;
         }
+    }
+
+    fn has_active_spawn(&self) -> bool {
+        !matches!(self.spawn_dispatch, SpawnDispatchState::Idle)
+    }
+
+    fn observe_spawn_outcome(
+        &mut self,
+        activity_id: CapabilityActivityId,
+        outcome: ObservedCapabilityOutcome,
+    ) {
+        let started_at = match &self.spawn_dispatch {
+            SpawnDispatchState::Invoking {
+                activity_id: pending_activity_id,
+                started_at,
+            } if *pending_activity_id == activity_id => *started_at,
+            SpawnDispatchState::Idle
+            | SpawnDispatchState::Waiting { .. }
+            | SpawnDispatchState::Invoking { .. } => return,
+        };
+        self.spawn_dispatch = match outcome {
+            ObservedCapabilityOutcome::Parked => SpawnDispatchState::Waiting {
+                activity_id,
+                started_at,
+            },
+            ObservedCapabilityOutcome::Returned | ObservedCapabilityOutcome::Errored => {
+                SpawnDispatchState::Idle
+            }
+            _ => SpawnDispatchState::Idle,
+        };
     }
 }
 
@@ -214,20 +243,42 @@ impl TianquanBuiltinGuard {
         }
     }
 
-    /// Snapshot-test accessor for the pending-spawn flag. Test-only: used to
-    /// assert that the first allowed spawn sets the flag.
     #[cfg(test)]
-    fn pending_spawn(&self) -> bool {
+    fn spawn_dispatch_state(&self) -> SpawnDispatchState {
         self.state
             .lock()
             .expect("Tianquan guard state mutex poisoned")
-            .pending_spawn
+            .spawn_dispatch
+            .clone()
     }
 }
 
 impl Default for TianquanBuiltinGuard {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[async_trait]
+impl ObserverHook for TianquanBuiltinGuard {
+    async fn observe(&self, ctx: &ObserverHookContext, _sink: &mut dyn ObserverSink) {
+        if ctx.observed_kind != ObservedKind::AfterCapability
+            || ctx.capability_name.as_deref() != Some(CAPABILITY_SPAWN_SUBAGENT)
+        {
+            return;
+        }
+        let Some(outcome) = ctx.capability_outcome else {
+            return;
+        };
+        let Some(activity_id) = ctx.capability_activity_id else {
+            return;
+        };
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        state.expire_spawn_dispatch(Instant::now());
+        state.observe_spawn_outcome(activity_id, outcome);
     }
 }
 
@@ -245,12 +296,19 @@ impl PrivilegedBeforeCapabilityHook for TianquanBuiltinGuard {
                 return;
             }
         };
-        state.expire_pending_spawn(now);
+        state.expire_spawn_dispatch(now);
+        // Every invocation, including a special capability rejected by its
+        // dedicated rule, breaks an ordinary capability's repeat sequence.
+        // Preserve the prior value for the ordinary-capability calculation
+        // below, then record this invocation before any early return.
+        let repeats_previous_capability =
+            state.last_capability.as_deref() == Some(ctx.capability_name.as_str());
+        state.last_capability = Some(ctx.capability_name.clone());
 
         match ctx.capability_name.as_str() {
             CAPABILITY_SPAWN_SUBAGENT => {
                 state.spawn_count = state.spawn_count.saturating_add(1);
-                if state.pending_spawn {
+                if state.has_active_spawn() {
                     // A previous spawn's blocking window is still active: a
                     // second spawn now is the duplicate-spawn anti-pattern.
                     // Once the window expires (child presumed resumed or hung
@@ -261,14 +319,22 @@ impl PrivilegedBeforeCapabilityHook for TianquanBuiltinGuard {
                     sink.deny(REASON_DUPLICATE_SPAWN);
                     return;
                 }
-                // No spawn pending: record the window start and allow.
-                state.pending_spawn = true;
-                state.last_spawn_at = Some(now);
+                // Reserve only the invocation. The matching AfterCapability
+                // observation commits Waiting iff the returned resolution parks.
+                let Some(activity_id) = ctx.activity_id else {
+                    drop(state);
+                    sink.deny("tianquan guard requires capability activity identity");
+                    return;
+                };
+                state.spawn_dispatch = SpawnDispatchState::Invoking {
+                    activity_id,
+                    started_at: now,
+                };
                 drop(state);
                 sink.pass();
             }
             CAPABILITY_RESULT_READ => {
-                if state.pending_spawn {
+                if state.has_active_spawn() {
                     // A spawn is still within its blocking window: result_read
                     // here is "polling a result that cannot be ready yet."
                     drop(state);
@@ -296,7 +362,7 @@ impl PrivilegedBeforeCapabilityHook for TianquanBuiltinGuard {
             // (verify -> get_layer_stage -> advance_stage) never trip this.
             _ => {
                 let cap_name = ctx.capability_name.clone();
-                let count = if state.last_capability.as_deref() == Some(cap_name.as_str()) {
+                let count = if repeats_previous_capability {
                     state
                         .repeat_calls
                         .get(&cap_name)
@@ -306,10 +372,7 @@ impl PrivilegedBeforeCapabilityHook for TianquanBuiltinGuard {
                 } else {
                     1
                 };
-                state
-                    .repeat_calls
-                    .insert(cap_name.clone(), count);
-                state.last_capability = Some(cap_name.clone());
+                state.repeat_calls.insert(cap_name.clone(), count);
                 if count >= REPEAT_CALL_LIMIT {
                     let detail = format!(
                         "{cap_name} 已连续调用 {count} 次未推进(上限 {REPEAT_CALL_LIMIT} 次)"
@@ -352,15 +415,26 @@ impl PrivilegedBeforeCapabilityHook for TianquanBuiltinGuard {
 pub(crate) fn install_tianquan_guard(
     builder: ironclaw_hooks::dispatch::HookDispatcherBuilder,
 ) -> Result<ironclaw_hooks::dispatch::HookDispatcherBuilder, RebornBuildError> {
-    let hook_id = HookId::for_builtin(TIANQUAN_GUARD_CANONICAL_PATH, HookVersion::ONE);
+    let guard = TianquanBuiltinGuard::new();
+    let before_hook_id = HookId::for_builtin(TIANQUAN_GUARD_CANONICAL_PATH, HookVersion::ONE);
+    let observer_hook_id =
+        HookId::for_builtin(TIANQUAN_GUARD_OBSERVER_CANONICAL_PATH, HookVersion::ONE);
     builder
         .install_builtin_before_capability(
-            hook_id,
+            before_hook_id,
             HookPhase::Policy,
-            Box::new(TianquanBuiltinGuard::new()),
+            Box::new(guard.clone()),
         )
+        .and_then(|builder| {
+            builder.install_builtin_observer(
+                observer_hook_id,
+                HookPhase::Telemetry,
+                HookPointSpec::AfterCapability,
+                Box::new(guard),
+            )
+        })
         .map_err(|error| RebornBuildError::InvalidConfig {
-            reason: format!("failed to install tianquan builtin guard hook: {error}"),
+            reason: format!("failed to install tianquan builtin guard hook pair: {error}"),
         })
 }
 
@@ -403,6 +477,15 @@ mod tests {
         }
     }
 
+    impl ObserverSink for CapturingSink {
+        fn note(
+            &mut self,
+            _category: ironclaw_hooks::kinds::observer::NoteCategory,
+            _summary: &'static str,
+        ) {
+        }
+    }
+
     impl PrivilegedGateSink for CapturingSink {
         fn allow(&mut self) {
             self.outcome = CapturedOutcome::Allowed;
@@ -431,6 +514,37 @@ mod tests {
             capability_name.to_string(),
             [0u8; 32],
         )
+        .with_activity_id(CapabilityActivityId::new())
+    }
+
+    fn observe_capability_with_id(
+        guard: &TianquanBuiltinGuard,
+        capability_name: &str,
+        activity_id: CapabilityActivityId,
+        outcome: ObservedCapabilityOutcome,
+    ) {
+        let ctx = ObserverHookContext::after_capability(
+            TenantId::new("tianquan-test".to_string()).expect("valid tenant"),
+            capability_name.to_string(),
+            activity_id,
+            None,
+            outcome,
+        );
+        let mut sink = CapturingSink::new();
+        futures::executor::block_on(guard.observe(&ctx, &mut sink));
+    }
+
+    fn observe_capability(
+        guard: &TianquanBuiltinGuard,
+        capability_name: &str,
+        outcome: ObservedCapabilityOutcome,
+    ) {
+        let activity_id = match guard.spawn_dispatch_state() {
+            SpawnDispatchState::Invoking { activity_id, .. }
+            | SpawnDispatchState::Waiting { activity_id, .. } => activity_id,
+            SpawnDispatchState::Idle => CapabilityActivityId::new(),
+        };
+        observe_capability_with_id(guard, capability_name, activity_id, outcome);
     }
 
     /// Run the guard against `ctx` and return the captured outcome.
@@ -469,10 +583,13 @@ mod tests {
     #[test]
     fn result_read_during_pending_spawn_denied() {
         let guard = TianquanBuiltinGuard::new();
-        // First spawn: allowed, sets pending_spawn.
+        // First spawn: allowed, reserves the invocation until AfterCapability.
         let spawn_outcome = evaluate(&guard, &ctx_for(CAPABILITY_SPAWN_SUBAGENT));
         assert_passed(spawn_outcome);
-        assert!(guard.pending_spawn(), "first spawn must set pending_spawn");
+        assert!(matches!(
+            guard.spawn_dispatch_state(),
+            SpawnDispatchState::Invoking { .. }
+        ));
         // result_read while pending: denied.
         let read_outcome = evaluate(&guard, &ctx_for(CAPABILITY_RESULT_READ));
         assert_denied(read_outcome);
@@ -498,6 +615,106 @@ mod tests {
     }
 
     #[test]
+    fn after_spawn_parked_commits_waiting_and_blocks_retry() {
+        let guard = TianquanBuiltinGuard::new();
+        let spawn = ctx_for(CAPABILITY_SPAWN_SUBAGENT);
+        let activity_id = spawn.activity_id.expect("test spawn has activity id");
+        assert_passed(evaluate(&guard, &spawn));
+        observe_capability_with_id(
+            &guard,
+            CAPABILITY_SPAWN_SUBAGENT,
+            activity_id,
+            ObservedCapabilityOutcome::Parked,
+        );
+
+        assert!(matches!(
+            guard.spawn_dispatch_state(),
+            SpawnDispatchState::Waiting { .. }
+        ));
+        assert_denied(evaluate(&guard, &ctx_for(CAPABILITY_SPAWN_SUBAGENT)));
+        assert_denied(evaluate(&guard, &ctx_for(CAPABILITY_RESULT_READ)));
+    }
+
+    #[test]
+    fn rejected_concurrent_spawn_outcome_cannot_release_the_inflight_spawn() {
+        let guard = TianquanBuiltinGuard::new();
+        let first = ctx_for(CAPABILITY_SPAWN_SUBAGENT);
+        let first_activity_id = first.activity_id.expect("test spawn has activity id");
+        assert_passed(evaluate(&guard, &first));
+        let second = ctx_for(CAPABILITY_SPAWN_SUBAGENT);
+        let second_activity_id = second.activity_id.expect("test spawn has activity id");
+        assert_denied(evaluate(&guard, &second));
+
+        observe_capability_with_id(
+            &guard,
+            CAPABILITY_SPAWN_SUBAGENT,
+            second_activity_id,
+            ObservedCapabilityOutcome::Returned,
+        );
+        assert!(matches!(
+            guard.spawn_dispatch_state(),
+            SpawnDispatchState::Invoking { activity_id, .. } if activity_id == first_activity_id
+        ));
+
+        observe_capability_with_id(
+            &guard,
+            CAPABILITY_SPAWN_SUBAGENT,
+            first_activity_id,
+            ObservedCapabilityOutcome::Parked,
+        );
+        assert!(matches!(
+            guard.spawn_dispatch_state(),
+            SpawnDispatchState::Waiting { activity_id, .. } if activity_id == first_activity_id
+        ));
+    }
+
+    #[test]
+    fn after_spawn_returned_or_errored_releases_immediately_for_retry() {
+        for outcome in [
+            ObservedCapabilityOutcome::Returned,
+            ObservedCapabilityOutcome::Errored,
+        ] {
+            let guard = TianquanBuiltinGuard::new();
+            assert_passed(evaluate(&guard, &ctx_for(CAPABILITY_SPAWN_SUBAGENT)));
+            observe_capability(&guard, CAPABILITY_SPAWN_SUBAGENT, outcome);
+
+            assert_eq!(guard.spawn_dispatch_state(), SpawnDispatchState::Idle);
+            assert_passed(evaluate(&guard, &ctx_for(CAPABILITY_SPAWN_SUBAGENT)));
+        }
+    }
+
+    #[test]
+    fn unrelated_or_late_after_observation_cannot_change_spawn_state() {
+        let guard = TianquanBuiltinGuard::new();
+        assert_passed(evaluate(&guard, &ctx_for(CAPABILITY_SPAWN_SUBAGENT)));
+
+        observe_capability(
+            &guard,
+            CAPABILITY_RESULT_READ,
+            ObservedCapabilityOutcome::Errored,
+        );
+        assert!(matches!(
+            guard.spawn_dispatch_state(),
+            SpawnDispatchState::Invoking { .. }
+        ));
+
+        observe_capability(
+            &guard,
+            CAPABILITY_SPAWN_SUBAGENT,
+            ObservedCapabilityOutcome::Parked,
+        );
+        observe_capability(
+            &guard,
+            CAPABILITY_SPAWN_SUBAGENT,
+            ObservedCapabilityOutcome::Returned,
+        );
+        assert!(matches!(
+            guard.spawn_dispatch_state(),
+            SpawnDispatchState::Waiting { .. }
+        ));
+    }
+
+    #[test]
     fn respawn_allowed_after_window_expiry() {
         // The duplicate-spawn deny keys on the pending window, not a
         // cumulative count: once the window has elapsed (child presumed
@@ -505,9 +722,8 @@ mod tests {
         // legitimate re-spawn (validator blocked the first child's prose, or
         // the child hung) is not permanently blocked.
         //
-        // `Instant` cannot be advanced, so we expire the window the same way
-        // `expire_pending_spawn` would once `now - last_spawn_at >= window`,
-        // then assert the public behavior (spawn passes again).
+        // `Instant` cannot be advanced, so set the state to the same Idle value
+        // `expire_spawn_dispatch` would produce, then assert public behavior.
         let guard = TianquanBuiltinGuard::new();
         evaluate(&guard, &ctx_for(CAPABILITY_SPAWN_SUBAGENT));
         let denied = evaluate(&guard, &ctx_for(CAPABILITY_SPAWN_SUBAGENT));
@@ -518,16 +734,15 @@ mod tests {
                 .state
                 .lock()
                 .expect("Tianquan guard state mutex poisoned");
-            state.pending_spawn = false;
-            state.last_spawn_at = None;
+            state.spawn_dispatch = SpawnDispatchState::Idle;
         }
 
         let respawn = evaluate(&guard, &ctx_for(CAPABILITY_SPAWN_SUBAGENT));
         assert_passed(respawn);
-        assert!(
-            guard.pending_spawn(),
-            "re-spawn must re-arm the pending window"
-        );
+        assert!(matches!(
+            guard.spawn_dispatch_state(),
+            SpawnDispatchState::Invoking { .. }
+        ));
     }
 
     #[test]
@@ -551,10 +766,13 @@ mod tests {
     #[test]
     fn first_spawn_allowed_and_sets_pending() {
         let guard = TianquanBuiltinGuard::new();
-        assert!(!guard.pending_spawn());
+        assert_eq!(guard.spawn_dispatch_state(), SpawnDispatchState::Idle);
         let outcome = evaluate(&guard, &ctx_for(CAPABILITY_SPAWN_SUBAGENT));
         assert_passed(outcome);
-        assert!(guard.pending_spawn(), "first spawn must set pending_spawn");
+        assert!(matches!(
+            guard.spawn_dispatch_state(),
+            SpawnDispatchState::Invoking { .. }
+        ));
     }
 
     #[test]
@@ -592,22 +810,22 @@ mod tests {
         // spawn is allowed, then we simulate the window elapsing, and
         // result_read is no longer denied.
         //
-        // Because `Instant` cannot be arbitrarily advanced, we directly
-        // manipulate the state the same way `expire_pending_spawn` would once
-        // `now - last_spawn_at >= window`, then assert the public behavior
-        // (result_read passes). This pins the contract: once the window
-        // closes, the pending-spawn deny lifts.
+        // Because `Instant` cannot be arbitrarily advanced, set the state to
+        // the same Idle value `expire_spawn_dispatch` would produce, then assert
+        // the public behavior. Once the window closes, the deny must lift.
         let guard = TianquanBuiltinGuard::new();
         evaluate(&guard, &ctx_for(CAPABILITY_SPAWN_SUBAGENT));
-        assert!(guard.pending_spawn());
+        assert!(matches!(
+            guard.spawn_dispatch_state(),
+            SpawnDispatchState::Invoking { .. }
+        ));
 
         {
             let mut state = guard
                 .state
                 .lock()
                 .expect("Tianquan guard state mutex poisoned");
-            state.pending_spawn = false;
-            state.last_spawn_at = None;
+            state.spawn_dispatch = SpawnDispatchState::Idle;
         }
 
         let read_outcome = evaluate(&guard, &ctx_for(CAPABILITY_RESULT_READ));
@@ -651,12 +869,68 @@ mod tests {
         // counter: verify -> get_layer_stage -> verify... is a normal flow and
         // must never be denied even after many total verify calls.
         let guard = TianquanBuiltinGuard::new();
-        for i in 0..REPEAT_CALL_LIMIT + 2 {
+        for _ in 0..REPEAT_CALL_LIMIT + 2 {
             let outcome = evaluate(&guard, &ctx_for("tianquan-graph.run_skill_verify"));
             assert_passed(outcome);
             let interleave = evaluate(&guard, &ctx_for("tianquan-graph.get_layer_stage"));
             assert_passed(interleave);
         }
+    }
+
+    #[test]
+    fn repeat_call_is_interrupted_by_shell_invocation() {
+        // A special capability is still an invocation boundary for ordinary
+        // capability repetition. The sixth ordinary invocation would normally
+        // be denied, but shell breaks that sequence without changing its own
+        // rate-limit behavior.
+        let guard = TianquanBuiltinGuard::new();
+        for _ in 0..REPEAT_CALL_LIMIT - 1 {
+            assert_passed(evaluate(
+                &guard,
+                &ctx_for("tianquan-graph.run_skill_verify"),
+            ));
+        }
+
+        assert_passed(evaluate(&guard, &ctx_for(CAPABILITY_SHELL)));
+        assert_passed(evaluate(
+            &guard,
+            &ctx_for("tianquan-graph.run_skill_verify"),
+        ));
+    }
+
+    #[test]
+    fn repeat_call_is_interrupted_by_spawn_invocation() {
+        let guard = TianquanBuiltinGuard::new();
+        for _ in 0..REPEAT_CALL_LIMIT - 1 {
+            assert_passed(evaluate(
+                &guard,
+                &ctx_for("tianquan-graph.run_skill_verify"),
+            ));
+        }
+
+        assert_passed(evaluate(&guard, &ctx_for(CAPABILITY_SPAWN_SUBAGENT)));
+        assert_passed(evaluate(
+            &guard,
+            &ctx_for("tianquan-graph.run_skill_verify"),
+        ));
+    }
+
+    #[test]
+    fn repeat_call_is_interrupted_by_denied_result_read() {
+        let guard = TianquanBuiltinGuard::new();
+        for _ in 0..REPEAT_CALL_LIMIT - 1 {
+            assert_passed(evaluate(
+                &guard,
+                &ctx_for("tianquan-graph.run_skill_verify"),
+            ));
+        }
+
+        assert_passed(evaluate(&guard, &ctx_for(CAPABILITY_SPAWN_SUBAGENT)));
+        assert_denied(evaluate(&guard, &ctx_for(CAPABILITY_RESULT_READ)));
+        assert_passed(evaluate(
+            &guard,
+            &ctx_for("tianquan-graph.run_skill_verify"),
+        ));
     }
 
     #[test]
@@ -675,6 +949,134 @@ mod tests {
         assert_passed(outcome);
     }
 
+    #[tokio::test]
+    async fn middleware_releases_transient_spawn_for_immediate_retry_then_commits_parked_spawn() {
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use ironclaw_hooks::dispatch::HookDispatcherBuilder;
+        use ironclaw_hooks::middleware::HookedLoopCapabilityPort;
+        use ironclaw_hooks::registry::HookRegistry;
+        use ironclaw_host_api::{CapabilityId, Resolution, ResolutionBatch};
+        use ironclaw_turns::run_profile::{
+            AgentLoopHostError, CapabilityBatchInvocation, CapabilityFailureKind,
+            CapabilityInputRef, CapabilityInvocation, CapabilitySurfaceVersion, LoopCapabilityPort,
+            VisibleCapabilityRequest, VisibleCapabilitySurface, resolution,
+        };
+        use ironclaw_turns::{CapabilityActivityId, LoopGateRef};
+
+        struct SequencedSpawnPort {
+            calls: AtomicUsize,
+            outcomes: Mutex<VecDeque<Resolution>>,
+        }
+
+        #[async_trait::async_trait]
+        impl LoopCapabilityPort for SequencedSpawnPort {
+            async fn visible_capabilities(
+                &self,
+                _request: VisibleCapabilityRequest,
+            ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
+                unreachable!("the guard middleware test does not query the capability surface")
+            }
+
+            async fn invoke_capability(
+                &self,
+                _request: CapabilityInvocation,
+            ) -> Result<Resolution, AgentLoopHostError> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(self
+                    .outcomes
+                    .lock()
+                    .expect("outcome queue")
+                    .pop_front()
+                    .expect("scripted outcome"))
+            }
+
+            async fn invoke_capability_batch(
+                &self,
+                _request: CapabilityBatchInvocation,
+            ) -> Result<ResolutionBatch, AgentLoopHostError> {
+                unreachable!("single-call regression does not invoke a batch")
+            }
+        }
+
+        fn invocation(capability_name: &str, input_label: &str) -> CapabilityInvocation {
+            CapabilityInvocation {
+                activity_id: CapabilityActivityId::new(),
+                surface_version: CapabilitySurfaceVersion::new("tianquan-guard:test")
+                    .expect("valid surface version"),
+                capability_id: CapabilityId::new(capability_name).expect("valid capability id"),
+                input_ref: CapabilityInputRef::new(format!("input:{input_label}"))
+                    .expect("valid input ref"),
+                approval_resume: None,
+                auth_resume: None,
+            }
+        }
+
+        let inner = Arc::new(SequencedSpawnPort {
+            calls: AtomicUsize::new(0),
+            outcomes: Mutex::new(VecDeque::from([
+                resolution::failed(
+                    CapabilityFailureKind::Transient,
+                    "scope recovery in progress".to_string(),
+                    None,
+                ),
+                resolution::approval_required(
+                    LoopGateRef::new("gate:spawn-waiting").expect("valid gate"),
+                    "waiting for child".to_string(),
+                    None,
+                )
+                .resolution,
+            ])),
+        });
+        let dispatcher = install_tianquan_guard(HookDispatcherBuilder::new(HookRegistry::new()))
+            .expect("install guard pair")
+            .build_arc();
+        let wrapped = HookedLoopCapabilityPort::new(
+            inner.clone(),
+            dispatcher,
+            TenantId::new("tianquan-test").expect("valid tenant"),
+        );
+
+        let first = wrapped
+            .invoke_capability(invocation(CAPABILITY_SPAWN_SUBAGENT, "first"))
+            .await
+            .expect("transient is a resolution");
+        let Resolution::Done(first) = first else {
+            panic!("expected transient Done resolution");
+        };
+        assert_eq!(
+            first.verdict.error_kind(),
+            Some(&ironclaw_host_api::FailureKind::Transient)
+        );
+
+        let retry = wrapped
+            .invoke_capability(invocation(CAPABILITY_SPAWN_SUBAGENT, "retry"))
+            .await
+            .expect("immediate retry reaches inner");
+        assert!(retry.parks(), "the successful dispatch must park");
+
+        assert!(matches!(
+            wrapped
+                .invoke_capability(invocation(CAPABILITY_SPAWN_SUBAGENT, "duplicate"))
+                .await
+                .expect("duplicate is model-visible denial"),
+            Resolution::Denied(_)
+        ));
+        assert!(matches!(
+            wrapped
+                .invoke_capability(invocation(CAPABILITY_RESULT_READ, "poll"))
+                .await
+                .expect("poll is model-visible denial"),
+            Resolution::Denied(_)
+        ));
+        assert_eq!(
+            inner.calls.load(Ordering::Relaxed),
+            2,
+            "transient retry reaches inner, but waiting-state duplicate and poll do not"
+        );
+    }
+
     #[test]
     fn install_into_builder_succeeds() {
         // The install step must succeed against a fresh builder (the same call
@@ -690,6 +1092,14 @@ mod tests {
         assert!(
             bindings.iter().any(|b| b.hook_id == hook_id),
             "guard must be bound at BeforeCapability; saw {bindings:?}"
+        );
+        let observer_id =
+            HookId::for_builtin(TIANQUAN_GUARD_OBSERVER_CANONICAL_PATH, HookVersion::ONE);
+        let observer_bindings = dispatcher.active_bindings_snapshot(HookPointSpec::AfterCapability);
+        assert!(
+            observer_bindings.iter().any(|b| b.hook_id == observer_id),
+            "guard must share lifecycle state through an AfterCapability observer; saw \
+             {observer_bindings:?}"
         );
     }
 

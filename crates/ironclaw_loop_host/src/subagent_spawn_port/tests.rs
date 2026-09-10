@@ -81,7 +81,33 @@ struct NoopResultWriter;
 
 #[derive(Default)]
 struct RecordingResultWriter {
+    writes: std::sync::Mutex<Vec<(InvocationId, CapabilityId, serde_json::Value)>>,
+    updates: std::sync::Mutex<Vec<(LoopResultRef, serde_json::Value)>>,
+    readable_results: std::sync::Mutex<HashMap<String, serde_json::Value>>,
+    failure_previews: std::sync::Mutex<Vec<(InvocationId, CapabilityId, String)>>,
     delete_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl RecordingResultWriter {
+    fn writes(&self) -> Vec<(InvocationId, CapabilityId, serde_json::Value)> {
+        self.writes.lock().unwrap().clone()
+    }
+
+    fn updates(&self) -> Vec<(LoopResultRef, serde_json::Value)> {
+        self.updates.lock().unwrap().clone()
+    }
+
+    fn failure_previews(&self) -> Vec<(InvocationId, CapabilityId, String)> {
+        self.failure_previews.lock().unwrap().clone()
+    }
+
+    fn readable_result(&self, result_ref: &LoopResultRef) -> Option<serde_json::Value> {
+        self.readable_results
+            .lock()
+            .unwrap()
+            .get(result_ref.as_str())
+            .cloned()
+    }
 }
 
 struct NoopGoalStore;
@@ -144,10 +170,40 @@ struct RecordingGoalStore {
     deletes: std::sync::Mutex<Vec<(TurnScope, TurnRunId)>>,
 }
 
-#[derive(Default)]
-struct FailingMarkThreadService {
-    inner: InMemorySessionThreadService,
+#[derive(Debug, Clone, Copy)]
+enum SpawnThreadFailurePoint {
+    EnsureThread,
+    AcceptInboundMessage,
+    MarkMessageSubmitted,
 }
+
+#[derive(Debug, Clone, Copy)]
+enum PostPlaceholderFailureStage {
+    EnsureThread,
+    PutGoal,
+    RecordAwaitedChild,
+    AcceptInboundMessage,
+    SubmitChildRun,
+    MarkMessageSubmitted,
+}
+
+struct FailingSpawnThreadService {
+    inner: InMemorySessionThreadService,
+    failure_point: SpawnThreadFailurePoint,
+}
+
+impl FailingSpawnThreadService {
+    fn new(failure_point: SpawnThreadFailurePoint) -> Self {
+        Self {
+            inner: InMemorySessionThreadService::default(),
+            failure_point,
+        }
+    }
+}
+
+struct FailingGoalStore;
+struct FailingAwaitEdgeWriter;
+struct FailingChildRuns;
 
 impl StaticTurnStateStore {
     fn new(record: Option<TurnRunRecord>) -> Self {
@@ -587,12 +643,51 @@ impl LoopCapabilityResultWriter for NoopResultWriter {
 impl LoopCapabilityResultWriter for RecordingResultWriter {
     async fn write_capability_result(
         &self,
-        _write: CapabilityResultWrite<'_>,
+        write: CapabilityResultWrite<'_>,
     ) -> Result<CapabilityWriteResult, AgentLoopHostError> {
-        Ok(CapabilityWriteResult::without_output_digest(
-            LoopResultRef::new("result:spawn").unwrap(),
-            0,
-        ))
+        let result_ref = LoopResultRef::new("result:spawn").unwrap();
+        self.writes.lock().unwrap().push((
+            write.invocation_id,
+            write.capability_id.clone(),
+            write.output.clone(),
+        ));
+        self.readable_results
+            .lock()
+            .unwrap()
+            .insert(result_ref.as_str().to_string(), write.output);
+        Ok(CapabilityWriteResult::without_output_digest(result_ref, 0))
+    }
+
+    async fn update_capability_result(
+        &self,
+        _run_context: &LoopRunContext,
+        result_ref: &LoopResultRef,
+        output: serde_json::Value,
+    ) -> Result<u64, AgentLoopHostError> {
+        let byte_len = serde_json::to_vec(&output).unwrap().len() as u64;
+        self.updates
+            .lock()
+            .unwrap()
+            .push((result_ref.clone(), output.clone()));
+        self.readable_results
+            .lock()
+            .unwrap()
+            .insert(result_ref.as_str().to_string(), output);
+        Ok(byte_len)
+    }
+
+    async fn stage_capability_failure_preview(
+        &self,
+        _run_context: &LoopRunContext,
+        invocation_id: InvocationId,
+        capability_id: &CapabilityId,
+        summary: &str,
+    ) {
+        self.failure_previews.lock().unwrap().push((
+            invocation_id,
+            capability_id.clone(),
+            summary.to_string(),
+        ));
     }
 
     async fn delete_capability_result(
@@ -683,6 +778,51 @@ impl SubagentSpawnGoalStore for RecordingGoalStore {
 }
 
 #[async_trait]
+impl SubagentSpawnGoalStore for FailingGoalStore {
+    async fn put_goal(
+        &self,
+        _scope: &TurnScope,
+        _run_id: TurnRunId,
+        _goal: SubagentGoalRecord,
+    ) -> Result<(), AgentLoopHostError> {
+        Err(AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Unavailable,
+            "forced put_goal failure",
+        ))
+    }
+
+    async fn delete_goal(
+        &self,
+        _scope: &TurnScope,
+        _run_id: TurnRunId,
+    ) -> Result<(), AgentLoopHostError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::AwaitEdgeWriter for FailingAwaitEdgeWriter {
+    async fn record_awaited_child(
+        &self,
+        _record: AwaitedChildSetRecord,
+    ) -> Result<(), AgentLoopHostError> {
+        Err(AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Unavailable,
+            "forced record_awaited_child failure",
+        ))
+    }
+
+    async fn abandon_awaited_child(
+        &self,
+        _child_scope: &TurnScope,
+        _parent_run_id: TurnRunId,
+        _child_run_id: TurnRunId,
+    ) -> Result<(), AgentLoopHostError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl TurnCoordinator for StaticCoordinator {
     async fn prepare_turn(&self, _scope: TurnScope) -> Result<TurnRunId, TurnError> {
         Ok(TurnRunId::new())
@@ -758,11 +898,28 @@ impl TurnSpawnTreePort for RecordingChildRuns {
 }
 
 #[async_trait]
-impl SessionThreadService for FailingMarkThreadService {
+impl TurnSpawnTreePort for FailingChildRuns {
+    async fn submit_child_run(
+        &self,
+        _request: SubmitChildRunRequest,
+    ) -> Result<SubmitTurnResponse, TurnError> {
+        Err(TurnError::Unavailable {
+            reason: "forced submit_child_run failure".to_string(),
+        })
+    }
+}
+
+#[async_trait]
+impl SessionThreadService for FailingSpawnThreadService {
     async fn ensure_thread(
         &self,
         request: EnsureThreadRequest,
     ) -> Result<SessionThreadRecord, SessionThreadError> {
+        if matches!(self.failure_point, SpawnThreadFailurePoint::EnsureThread) {
+            return Err(SessionThreadError::Backend(
+                "forced ensure_thread failure".to_string(),
+            ));
+        }
         self.inner.ensure_thread(request).await
     }
 
@@ -770,6 +927,14 @@ impl SessionThreadService for FailingMarkThreadService {
         &self,
         request: AcceptInboundMessageRequest,
     ) -> Result<AcceptedInboundMessage, SessionThreadError> {
+        if matches!(
+            self.failure_point,
+            SpawnThreadFailurePoint::AcceptInboundMessage
+        ) {
+            return Err(SessionThreadError::Backend(
+                "forced accept_inbound_message failure".to_string(),
+            ));
+        }
         self.inner.accept_inbound_message(request).await
     }
 
@@ -782,15 +947,23 @@ impl SessionThreadService for FailingMarkThreadService {
 
     async fn mark_message_submitted(
         &self,
-        _scope: &ThreadScope,
-        _thread_id: &ThreadId,
-        _message_id: ThreadMessageId,
-        _turn_id: String,
-        _turn_run_id: String,
+        scope: &ThreadScope,
+        thread_id: &ThreadId,
+        message_id: ThreadMessageId,
+        turn_id: String,
+        turn_run_id: String,
     ) -> Result<ThreadMessageRecord, SessionThreadError> {
-        Err(SessionThreadError::Backend(
-            "forced mark_message_submitted failure".to_string(),
-        ))
+        if matches!(
+            self.failure_point,
+            SpawnThreadFailurePoint::MarkMessageSubmitted
+        ) {
+            return Err(SessionThreadError::Backend(
+                "forced mark_message_submitted failure".to_string(),
+            ));
+        }
+        self.inner
+            .mark_message_submitted(scope, thread_id, message_id, turn_id, turn_run_id)
+            .await
     }
 
     async fn mark_message_rejected_busy(
@@ -1344,6 +1517,48 @@ async fn invoke_spawn_for_activity(
     })
     .await
     .unwrap()
+}
+
+fn assert_post_placeholder_failure_is_compensated(
+    result_writer: &RecordingResultWriter,
+    activity_id: CapabilityActivityId,
+) {
+    let writes = result_writer.writes();
+    assert_eq!(
+        writes.len(),
+        1,
+        "spawned placeholder remains as audit evidence"
+    );
+    let (invocation_id, capability_id, original_payload) = &writes[0];
+    assert_eq!(
+        *invocation_id,
+        InvocationId::from_uuid(activity_id.as_uuid())
+    );
+    assert_eq!(capability_id.as_str(), DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID);
+    assert_eq!(original_payload["status"], "spawned");
+
+    let result_ref = LoopResultRef::new("result:spawn").expect("static result ref");
+    let readable = result_writer
+        .readable_result(&result_ref)
+        .expect("compensated result remains readable");
+    assert_eq!(readable["status"], "failed");
+    assert_eq!(readable["output_available"], false);
+    assert!(
+        readable["failure_summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("aborted"))
+    );
+
+    let updates = result_writer.updates();
+    assert_eq!(updates.len(), 1, "same result ref is updated exactly once");
+    assert_eq!(updates[0].0, result_ref);
+    assert_eq!(updates[0].1, readable);
+
+    let failure_previews = result_writer.failure_previews();
+    assert_eq!(failure_previews.len(), 1);
+    assert_eq!(failure_previews[0].0, *invocation_id);
+    assert_eq!(failure_previews[0].1, *capability_id);
+    assert!(failure_previews[0].2.contains("aborted"));
 }
 
 fn completed_outcome(label: &str) -> Resolution {
@@ -2250,11 +2465,21 @@ async fn invoke_spawn_preserves_parents_explicit_owner_on_child_await_edge_scope
 async fn invoke_spawn_surfaces_scope_recovery_in_progress_as_retryable_capability_failure() {
     let context = test_run_context_with_agent_actor("spawn-recovery-in-progress").await;
     let turn_store = Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0))));
+    let child_runs = Arc::new(RecordingChildRuns::default());
+    let thread_service = Arc::new(InMemorySessionThreadService::default());
+    let result_writer = Arc::new(RecordingResultWriter::default());
+    let child_thread_scope = ThreadScope {
+        tenant_id: context.scope.tenant_id.clone(),
+        agent_id: context.scope.agent_id.clone().expect("agent scope"),
+        project_id: context.scope.project_id.clone(),
+        owner_user_id: context.actor.as_ref().map(|actor| actor.user_id.clone()),
+        mission_id: None,
+    };
     let deps = Arc::new(SubagentSpawnDeps {
         coordinator: Arc::new(StaticCoordinator),
-        child_runs: Arc::new(RecordingChildRuns::default()),
+        child_runs: child_runs.clone(),
         turn_state_store: turn_store,
-        thread_service: Arc::new(InMemorySessionThreadService::default()),
+        thread_service: thread_service.clone(),
         goal_store: Arc::new(NoopGoalStore),
         await_edge_writer: Arc::new(AlwaysRecoveringAwaitEdgeWriter::default()),
         definition_resolver: Arc::new(StaticDefinitionResolver {
@@ -2264,13 +2489,16 @@ async fn invoke_spawn_surfaces_scope_recovery_in_progress_as_retryable_capabilit
         spawn_input_codec: Arc::new(StaticSpawnInputCodec {
             args: default_spawn_args(),
         }),
-        result_writer: Arc::new(NoopResultWriter),
+        result_writer: result_writer.clone(),
     });
     let port = SubagentSpawnCapabilityPort::new(
         Arc::new(AuthPassPort),
         context,
         CapabilityId::new(DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID).unwrap(),
-        SubagentSpawnLimits::default(),
+        SubagentSpawnLimits {
+            max_spawn_per_turn: 1,
+            ..SubagentSpawnLimits::default()
+        },
         deps,
         Vec::new(),
     );
@@ -2289,6 +2517,36 @@ async fn invoke_spawn_surfaces_scope_recovery_in_progress_as_retryable_capabilit
         done.summary.as_str().contains("scope recovery in progress"),
         "summary should explain the retryable condition: {}",
         done.summary.as_str()
+    );
+    assert!(
+        result_writer.writes().is_empty(),
+        "a transient scope-recovery rejection must not persist a spawned placeholder"
+    );
+    assert!(
+        child_runs.requests().is_empty(),
+        "a transient scope-recovery rejection must not submit a child run"
+    );
+    let listed = thread_service
+        .list_threads_for_scope(ListThreadsForScopeRequest {
+            scope: child_thread_scope,
+            limit: None,
+            cursor: None,
+        })
+        .await
+        .expect("list child threads");
+    assert!(
+        listed.threads.is_empty(),
+        "a transient scope-recovery rejection must not create a child thread"
+    );
+
+    let retry = invoke_spawn(&port).await;
+    let Resolution::Done(retry_done) = retry else {
+        panic!("expected the retry to reach scope recovery again, got {retry:?}");
+    };
+    assert_eq!(
+        retry_done.verdict.error_kind(),
+        Some(&ironclaw_host_api::FailureKind::Transient),
+        "a non-parking transient outcome must release the spawn slot for immediate retry"
     );
 }
 
@@ -2420,6 +2678,40 @@ async fn invoke_capability_batch_rolls_back_preceding_spawn_on_inner_batch_failu
         0,
         "rollback must retain durable tool results"
     );
+    let writes = result_writer.writes();
+    assert_eq!(
+        writes.len(),
+        1,
+        "the spawned placeholder remains as audit evidence"
+    );
+    let (invocation_id, capability_id, original_payload) = &writes[0];
+    assert_eq!(original_payload["status"], "spawned");
+    let updates = result_writer.updates();
+    assert_eq!(
+        updates.len(),
+        1,
+        "rollback must replace the readable placeholder"
+    );
+    assert_eq!(updates[0].0.as_str(), "result:spawn");
+    assert_eq!(updates[0].1["status"], "failed");
+    assert_eq!(
+        result_writer
+            .readable_result(&LoopResultRef::new("result:spawn").unwrap())
+            .expect("compensated result remains readable")["status"],
+        "failed",
+        "batch rollback must not leave a readable spawned result"
+    );
+    assert_eq!(updates[0].1["output_available"], false);
+    assert!(
+        updates[0].1["failure_summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("aborted"))
+    );
+    let failure_previews = result_writer.failure_previews();
+    assert_eq!(failure_previews.len(), 1);
+    assert_eq!(failure_previews[0].0, *invocation_id);
+    assert_eq!(failure_previews[0].1, *capability_id);
+    assert!(failure_previews[0].2.contains("aborted"));
 
     let child_thread_scope = ThreadScope {
         tenant_id: child_request.child_scope.tenant_id.clone(),
@@ -2459,6 +2751,7 @@ async fn invoke_capability_batch_stops_on_first_spawn_suspension_when_requested(
     let gate_store = Arc::new(InMemoryAwaitEdgeWriter::default());
     let thread_service = Arc::new(InMemorySessionThreadService::default());
     let inner = Arc::new(RecordingBatchPort::default());
+    let result_writer = Arc::new(RecordingResultWriter::default());
     let deps = Arc::new(SubagentSpawnDeps {
         coordinator: Arc::new(StaticCoordinator),
         child_runs: child_runs.clone(),
@@ -2473,7 +2766,7 @@ async fn invoke_capability_batch_stops_on_first_spawn_suspension_when_requested(
         spawn_input_codec: Arc::new(StaticSpawnInputCodec {
             args: default_spawn_args(),
         }),
-        result_writer: Arc::new(NoopResultWriter),
+        result_writer: result_writer.clone(),
     });
     let port = SubagentSpawnCapabilityPort::new(
         inner.clone(),
@@ -2506,6 +2799,15 @@ async fn invoke_capability_batch_stops_on_first_spawn_suspension_when_requested(
     assert!(goal_store.deletes().is_empty());
     assert_eq!(goal_store.puts().len(), 1);
     assert_eq!(gate_store.records().len(), 1);
+    assert_eq!(result_writer.writes().len(), 1);
+    assert!(
+        result_writer.updates().is_empty(),
+        "a successfully parked child must retain its spawned result"
+    );
+    assert!(
+        result_writer.failure_previews().is_empty(),
+        "a successfully parked child must not be displayed as failed"
+    );
 
     let child_request = &child_requests[0];
     let child_thread_scope = ThreadScope {
@@ -2619,14 +2921,101 @@ async fn invoke_capability_batch_preserves_spawns_on_inner_batch_suspension() {
 }
 
 #[tokio::test]
-async fn invoke_spawn_cancels_child_when_post_submit_thread_mark_fails() {
+async fn invoke_spawn_compensates_every_post_placeholder_failure_stage() {
+    for stage in [
+        PostPlaceholderFailureStage::EnsureThread,
+        PostPlaceholderFailureStage::PutGoal,
+        PostPlaceholderFailureStage::RecordAwaitedChild,
+        PostPlaceholderFailureStage::AcceptInboundMessage,
+        PostPlaceholderFailureStage::SubmitChildRun,
+        PostPlaceholderFailureStage::MarkMessageSubmitted,
+    ] {
+        let context = test_run_context_with_agent_actor("spawn-post-placeholder-failure").await;
+        let result_writer = Arc::new(RecordingResultWriter::default());
+        let turn_store = Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0))));
+        let thread_service: Arc<dyn SessionThreadService> = match stage {
+            PostPlaceholderFailureStage::EnsureThread => Arc::new(FailingSpawnThreadService::new(
+                SpawnThreadFailurePoint::EnsureThread,
+            )),
+            PostPlaceholderFailureStage::AcceptInboundMessage => Arc::new(
+                FailingSpawnThreadService::new(SpawnThreadFailurePoint::AcceptInboundMessage),
+            ),
+            PostPlaceholderFailureStage::MarkMessageSubmitted => Arc::new(
+                FailingSpawnThreadService::new(SpawnThreadFailurePoint::MarkMessageSubmitted),
+            ),
+            PostPlaceholderFailureStage::PutGoal
+            | PostPlaceholderFailureStage::RecordAwaitedChild
+            | PostPlaceholderFailureStage::SubmitChildRun => {
+                Arc::new(InMemorySessionThreadService::default())
+            }
+        };
+        let goal_store: Arc<dyn SubagentSpawnGoalStore> = match stage {
+            PostPlaceholderFailureStage::PutGoal => Arc::new(FailingGoalStore),
+            _ => Arc::new(NoopGoalStore),
+        };
+        let await_edge_writer: Arc<dyn crate::AwaitEdgeWriter> = match stage {
+            PostPlaceholderFailureStage::RecordAwaitedChild => Arc::new(FailingAwaitEdgeWriter),
+            _ => Arc::new(InMemoryAwaitEdgeWriter::default()),
+        };
+        let child_runs: Arc<dyn TurnSpawnTreePort> = match stage {
+            PostPlaceholderFailureStage::SubmitChildRun => Arc::new(FailingChildRuns),
+            _ => Arc::new(RecordingChildRuns::default()),
+        };
+        let deps = Arc::new(SubagentSpawnDeps {
+            coordinator: Arc::new(StaticCoordinator),
+            child_runs,
+            turn_state_store: turn_store,
+            thread_service,
+            goal_store,
+            await_edge_writer,
+            definition_resolver: Arc::new(StaticDefinitionResolver {
+                resolved: Some(subagent_definition(false)),
+                parent: None,
+            }),
+            spawn_input_codec: Arc::new(StaticSpawnInputCodec {
+                args: default_spawn_args(),
+            }),
+            result_writer: result_writer.clone(),
+        });
+        let port = SubagentSpawnCapabilityPort::new(
+            Arc::new(AuthPassPort),
+            context,
+            CapabilityId::new(DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID).unwrap(),
+            SubagentSpawnLimits::default(),
+            deps,
+            Vec::new(),
+        );
+        let activity_id = authorize_spawn_input(&port);
+
+        let error = port
+            .invoke_capability(CapabilityInvocation {
+                activity_id,
+                surface_version: CapabilitySurfaceVersion::new("surface:test").unwrap(),
+                capability_id: CapabilityId::new(DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID).unwrap(),
+                input_ref: input_ref(),
+                approval_resume: None,
+                auth_resume: None,
+            })
+            .await
+            .expect_err("post-placeholder setup failure must reject the spawn");
+
+        assert_eq!(error.kind, AgentLoopHostErrorKind::Unavailable);
+        assert_post_placeholder_failure_is_compensated(&result_writer, activity_id);
+    }
+}
+
+#[tokio::test]
+async fn invoke_spawn_retains_await_edge_when_post_submit_thread_mark_fails() {
     let context = test_run_context_with_agent_actor("spawn-mark-fails").await;
     let actor = context.actor.clone().unwrap();
     let turn_store = Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0))));
     let child_runs = Arc::new(RecordingChildRuns::default());
     let goal_store = Arc::new(RecordingGoalStore::default());
     let gate_store = Arc::new(InMemoryAwaitEdgeWriter::default());
-    let thread_service = Arc::new(FailingMarkThreadService::default());
+    let thread_service = Arc::new(FailingSpawnThreadService::new(
+        SpawnThreadFailurePoint::MarkMessageSubmitted,
+    ));
+    let result_writer = Arc::new(RecordingResultWriter::default());
     let deps = Arc::new(SubagentSpawnDeps {
         coordinator: Arc::new(StaticCoordinator),
         child_runs: child_runs.clone(),
@@ -2641,7 +3030,7 @@ async fn invoke_spawn_cancels_child_when_post_submit_thread_mark_fails() {
         spawn_input_codec: Arc::new(StaticSpawnInputCodec {
             args: default_spawn_args(),
         }),
-        result_writer: Arc::new(NoopResultWriter),
+        result_writer: result_writer.clone(),
     });
     let port = SubagentSpawnCapabilityPort::new(
         Arc::new(AuthPassPort),
@@ -2653,7 +3042,7 @@ async fn invoke_spawn_cancels_child_when_post_submit_thread_mark_fails() {
     );
     let activity_id = authorize_spawn_input(&port);
 
-    let error = port
+    let resolution = port
         .invoke_capability(CapabilityInvocation {
             activity_id,
             surface_version: CapabilitySurfaceVersion::new("surface:test").unwrap(),
@@ -2663,19 +3052,13 @@ async fn invoke_spawn_cancels_child_when_post_submit_thread_mark_fails() {
             auth_resume: None,
         })
         .await
-        .unwrap_err();
+        .expect("submitted child must remain awaitable when marker update fails");
 
-    assert_eq!(error.kind, AgentLoopHostErrorKind::Unavailable);
-    assert!(error.safe_summary.contains("mark_message_submitted"));
+    assert!(resolution.parks());
     assert_eq!(child_runs.requests().len(), 1);
-    let cancels = turn_store.cancels();
-    assert_eq!(cancels.len(), 1);
-    assert_eq!(
-        Some(cancels[0].run_id),
-        child_runs.requests()[0].requested_run_id
-    );
-    assert!(gate_store.records().is_empty());
-    assert_eq!(goal_store.deletes().len(), 1);
+    assert!(turn_store.cancels().is_empty());
+    assert_eq!(gate_store.records().len(), 1);
+    assert!(goal_store.deletes().is_empty());
     let child_requests = child_runs.requests();
     let child_request = &child_requests[0];
     let child_thread_scope = ThreadScope {
@@ -2691,10 +3074,19 @@ async fn invoke_spawn_cancels_child_when_post_submit_thread_mark_fails() {
             thread_id: child_request.child_scope.thread_id.clone(),
         })
         .await;
-    assert!(matches!(
-        read,
-        Err(SessionThreadError::UnknownThread { .. })
-    ));
+    assert!(read.is_ok(), "submitted child thread must remain available");
+
+    let writes = result_writer.writes();
+    assert_eq!(writes.len(), 1, "the spawned placeholder remains auditable");
+    let (invocation_id, capability_id, original_payload) = &writes[0];
+    assert_eq!(
+        *invocation_id,
+        InvocationId::from_uuid(activity_id.as_uuid())
+    );
+    assert_eq!(capability_id.as_str(), DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID);
+    assert_eq!(original_payload["status"], "spawned");
+    assert!(result_writer.updates().is_empty());
+    assert!(result_writer.failure_previews().is_empty());
 }
 
 #[tokio::test]

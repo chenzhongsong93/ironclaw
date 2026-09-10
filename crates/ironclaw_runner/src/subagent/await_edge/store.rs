@@ -50,6 +50,10 @@ where
         Self { fs }
     }
 
+    pub(super) fn filesystem(&self) -> Arc<ScopedFilesystem<F>> {
+        Arc::clone(&self.fs)
+    }
+
     fn resource_scope(&self, scope: &TurnScope) -> ResourceScope {
         scope.to_resource_scope()
     }
@@ -456,6 +460,31 @@ where
         Ok(())
     }
 
+    /// Prune this scope's roster marker when its entire edge tree is empty.
+    /// Boot recovery calls this even for a stale marker that never got as far
+    /// as writing a parent directory; close paths continue using their cheaper
+    /// parent-local check.
+    pub(crate) async fn prune_scope_roster(
+        &self,
+        scope: &TurnScope,
+    ) -> Result<(), AwaitEdgeStoreError> {
+        let root = super::edge_scope_root(
+            scope.agent_id.as_ref().map(|id| id.as_str()),
+            scope.project_id.as_ref().map(|id| id.as_str()),
+        )?;
+        let resource_scope = self.resource_scope(scope);
+        let is_empty = match self.fs.list_dir_bounded(&resource_scope, &root, 1).await {
+            Ok(entries) => entries.is_empty(),
+            Err(FilesystemError::NotFound { .. }) => true,
+            Err(error) => return Err(backend_error(error)),
+        };
+        if is_empty {
+            let roster_key = RosterKey::from_resource_scope(&resource_scope);
+            roster::prune_roster_marker(&self.fs, &roster_key).await?;
+        }
+        Ok(())
+    }
+
     /// §4.3: bounded, scope-isolated listing of every unclosed edge (`Open`,
     /// `Settled`, or terminal-but-undeleted `Drained`/`Abandoned`, §2's crash
     /// window) under this scope's axis-qualified prefix.
@@ -663,6 +692,7 @@ where
         let parent_run_id = record.parent_run_context.run_id;
         let child_run_id = record.child_run_id;
         let child_scope = record.child_scope.clone();
+        let created_at = Utc::now();
         let edge = AwaitEdge {
             child_scope: record.child_scope,
             child_thread_id: record.child_thread_id,
@@ -681,7 +711,10 @@ where
             terminal_byte_len: None,
             terminal_reason: None,
             reservation_release: ReservationReleaseState::Unclaimed,
-            created_at: Utc::now(),
+            created_at,
+            deadline: Some(
+                created_at + chrono::Duration::seconds(super::DEFAULT_AWAIT_EDGE_DEADLINE_SECONDS),
+            ),
             settled_at: None,
         };
         self.open(&child_scope, parent_run_id, child_run_id, edge)
@@ -803,8 +836,30 @@ mod tests {
             terminal_reason: None,
             reservation_release: ReservationReleaseState::Unclaimed,
             created_at: Utc::now(),
+            deadline: Some(
+                Utc::now()
+                    + chrono::Duration::seconds(super::super::DEFAULT_AWAIT_EDGE_DEADLINE_SECONDS),
+            ),
             settled_at: None,
         }
+    }
+
+    #[test]
+    fn await_edge_deserializes_legacy_payload_without_deadline() {
+        let mut value = serde_json::to_value(test_edge("gate:legacy")).unwrap();
+        value
+            .as_object_mut()
+            .expect("edge serializes as an object")
+            .remove("deadline");
+
+        let edge: AwaitEdge = serde_json::from_value(value).unwrap();
+
+        assert_eq!(edge.deadline, None);
+        assert_eq!(
+            edge.effective_deadline(),
+            edge.created_at
+                + chrono::Duration::seconds(super::super::DEFAULT_AWAIT_EDGE_DEADLINE_SECONDS,)
+        );
     }
 
     #[tokio::test]

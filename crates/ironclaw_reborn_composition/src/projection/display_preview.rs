@@ -294,38 +294,61 @@ impl CapabilityDisplayPreviewStore {
         // every other site, so holding both here cannot deadlock.
         let mut pending = self.lock_pending_inputs();
         let mut completed = self.lock_completed_previews();
+        let invocation_id = invocation_id.to_string();
         let input = {
-            let input_ref = pending
-                .input_ref_by_invocation
-                .remove(&invocation_id.to_string());
+            let input_ref = pending.input_ref_by_invocation.remove(&invocation_id);
             input_ref.and_then(|input_ref| pending.by_ref.remove(&input_ref))
         };
+        // A spawn placeholder is initially recorded as a completed capability
+        // result before the rest of child setup runs. If setup later aborts,
+        // preserve its correlation/audit fields while replacing the visible
+        // output with the failure. Otherwise the second write loses the
+        // result_ref and durable timeline message identity.
+        let previous = completed.by_invocation.remove(&invocation_id);
         let title = input
             .as_ref()
             .map(|input| input.title.clone())
+            .or_else(|| previous.as_ref().map(|record| record.title.clone()))
             .unwrap_or_else(|| safe_capability_title(capability_id.as_str()).to_string());
         let bounded = bounded_display_text(summary, CAPABILITY_DISPLAY_SUMMARY_MAX_BYTES);
         let record = CapabilityDisplayPreviewRecord {
-            timeline_message_id: None,
+            timeline_message_id: previous
+                .as_ref()
+                .and_then(|record| record.timeline_message_id),
             title,
-            subtitle: input.as_ref().and_then(|input| input.subtitle.clone()),
-            input_summary: input.as_ref().and_then(|input| input.input_summary.clone()),
+            subtitle: input
+                .as_ref()
+                .and_then(|input| input.subtitle.clone())
+                .or_else(|| previous.as_ref().and_then(|record| record.subtitle.clone())),
+            input_summary: input
+                .as_ref()
+                .and_then(|input| input.input_summary.clone())
+                .or_else(|| {
+                    previous
+                        .as_ref()
+                        .and_then(|record| record.input_summary.clone())
+                }),
             output_summary: Some(bounded.text.clone()),
             output_preview: Some(bounded.text),
             output_kind: Some("text".to_string()),
-            output_bytes: None,
-            result_ref: None,
-            truncated: bounded.truncated || input.as_ref().is_some_and(|input| input.truncated),
+            output_bytes: previous.as_ref().and_then(|record| record.output_bytes),
+            result_ref: previous
+                .as_ref()
+                .and_then(|record| record.result_ref.clone()),
+            truncated: bounded.truncated
+                || input.as_ref().is_some_and(|input| input.truncated)
+                || previous.as_ref().is_some_and(|record| record.truncated),
         };
-        let invocation_id = invocation_id.to_string();
         completed
             .by_invocation
             .insert(invocation_id.clone(), record);
-        completed
+        let run_invocations = completed
             .invocations_by_run
             .entry(run_id.to_string())
-            .or_default()
-            .push(invocation_id);
+            .or_default();
+        if !run_invocations.contains(&invocation_id) {
+            run_invocations.push(invocation_id);
+        }
     }
 
     pub(crate) fn prune_run(&self, run_id: &str) {

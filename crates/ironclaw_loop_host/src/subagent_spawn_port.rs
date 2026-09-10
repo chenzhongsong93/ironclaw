@@ -412,6 +412,16 @@ struct SpawnContext {
     gate_override: Option<GateRef>,
 }
 
+struct SpawnResultCompensation {
+    result_ref: LoopResultRef,
+    invocation_id: InvocationId,
+    capability_id: CapabilityId,
+    child_run_id: TurnRunId,
+    child_thread_id: ThreadId,
+    subagent_kind: SubagentKindId,
+    mode: SpawnSubagentMode,
+}
+
 #[derive(Default)]
 struct SpawnCompensationState {
     goal_written: Option<(TurnScope, TurnRunId)>,
@@ -419,7 +429,7 @@ struct SpawnCompensationState {
     /// `abandon_awaited_child` is the enclosing `run_context.run_id` at
     /// rollback time.
     edge_written: Option<(TurnScope, TurnRunId)>,
-    result_written: Option<LoopResultRef>,
+    result_written: Option<SpawnResultCompensation>,
     submitted_child_tree: Option<(TurnScope, TurnRunId)>,
     submitted_child_run: Option<(TurnScope, TurnActor, TurnRunId)>,
     thread_written: Option<(ThreadScope, ThreadId)>,
@@ -428,13 +438,38 @@ struct SpawnCompensationState {
 
 impl SpawnCompensationState {
     async fn rollback(&mut self, deps: &SubagentSpawnDeps, run_context: &LoopRunContext) {
+        if let Some(result) = self.result_written.as_ref() {
+            let failure_summary = "subagent spawn aborted before setup completed";
+            let output = spawn_failure_payload(result, failure_summary);
+            if let Err(error) = deps
+                .result_writer
+                .update_capability_result(run_context, &result.result_ref, output)
+                .await
+            {
+                tracing::warn!(
+                    run_id = %run_context.run_id,
+                    child_run_id = %result.child_run_id,
+                    result_ref = result.result_ref.as_str(),
+                    error = %error,
+                    "subagent rollback failed to mark spawned result as aborted"
+                );
+            }
+            deps.result_writer
+                .stage_capability_failure_preview(
+                    run_context,
+                    result.invocation_id,
+                    &result.capability_id,
+                    failure_summary,
+                )
+                .await;
+        }
         if let Some((scope, actor, run_id)) = self.submitted_child_run.as_ref() {
             match IdempotencyKey::new(format!(
                 "subagent-rollback-cancel:{}:{}",
                 run_context.run_id, run_id
             )) {
                 Ok(idempotency_key) => {
-                    let _ = deps
+                    if let Err(error) = deps
                         .turn_state_store
                         .request_cancel(CancelRunRequest {
                             scope: scope.clone(),
@@ -443,7 +478,15 @@ impl SpawnCompensationState {
                             reason: SanitizedCancelReason::Superseded,
                             idempotency_key,
                         })
-                        .await;
+                        .await
+                    {
+                        tracing::warn!(
+                            run_id = %run_context.run_id,
+                            child_run_id = %run_id,
+                            error = %error,
+                            "subagent rollback failed to cancel submitted child run"
+                        );
+                    }
                 }
                 Err(reason) => {
                     tracing::warn!(
@@ -455,14 +498,28 @@ impl SpawnCompensationState {
                 }
             }
         }
-        if let Some((child_scope, child_run_id)) = self.edge_written.as_ref() {
-            let _ = deps
+        if let Some((child_scope, child_run_id)) = self.edge_written.as_ref()
+            && let Err(error) = deps
                 .await_edge_writer
                 .abandon_awaited_child(child_scope, run_context.run_id, *child_run_id)
-                .await;
+                .await
+        {
+            tracing::warn!(
+                run_id = %run_context.run_id,
+                child_run_id = %child_run_id,
+                error = %error,
+                "subagent rollback failed to abandon await edge"
+            );
         }
-        if let Some((scope, run_id)) = self.goal_written.as_ref() {
-            let _ = deps.goal_store.delete_goal(scope, *run_id).await;
+        if let Some((scope, run_id)) = self.goal_written.as_ref()
+            && let Err(error) = deps.goal_store.delete_goal(scope, *run_id).await
+        {
+            tracing::warn!(
+                run_id = %run_context.run_id,
+                child_run_id = %run_id,
+                error = %error,
+                "subagent rollback failed to delete child goal"
+            );
         }
         if let Some((scope, tree_root)) = self.submitted_child_tree.as_ref() {
             // Idempotency key for the release-tree-descendants dedup guard
@@ -474,13 +531,29 @@ impl SpawnCompensationState {
                 .as_ref()
                 .map(|(_, _, run_id)| *run_id)
                 .unwrap_or(*tree_root);
-            let _ = deps
+            if let Err(error) = deps
                 .turn_state_store
                 .release_tree_descendants(scope, *tree_root, 1, idempotency_key)
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    run_id = %run_context.run_id,
+                    tree_root_run_id = %tree_root,
+                    child_run_id = %idempotency_key,
+                    error = %error,
+                    "subagent rollback failed to release spawn-tree descendant capacity"
+                );
+            }
         }
-        if let Some((scope, thread_id)) = self.thread_written.as_ref() {
-            let _ = deps.thread_service.delete_thread(scope, thread_id).await;
+        if let Some((scope, thread_id)) = self.thread_written.as_ref()
+            && let Err(error) = deps.thread_service.delete_thread(scope, thread_id).await
+        {
+            tracing::warn!(
+                run_id = %run_context.run_id,
+                child_thread_id = %thread_id,
+                error = %error,
+                "subagent rollback failed to delete child thread"
+            );
         }
     }
 }
@@ -818,8 +891,10 @@ impl SubagentSpawnCapabilityPort {
             .await;
         match result {
             Ok(outcome) => {
-                spawn_slot.commit();
-                compensation.spawn_slot_committed = true;
+                if outcome.parks() {
+                    spawn_slot.commit();
+                    compensation.spawn_slot_committed = true;
+                }
                 Ok(outcome)
             }
             Err(error) => {
@@ -919,34 +994,9 @@ impl SubagentSpawnCapabilityPort {
         } else {
             GateRef::new(format!("gate:subagent-{child_run_id}")).map_err(invalid_static_ref)?
         };
-        let payload = spawn_result_payload(
-            child_run_id,
-            &child_thread_id,
-            &definition.subagent_kind,
-            mode,
-            "spawned",
-            false,
-        );
-        let write_result = self
-            .deps
-            .result_writer
-            .write_capability_result(CapabilityResultWrite {
-                run_context: &self.run_context,
-                input_ref: &invocation.input_ref,
-                invocation_id: InvocationId::new(),
-                capability_id: &self.spawn_id,
-                output: payload,
-                display_preview: None,
-                durable_persistence: DurablePersistence::Persist,
-            })
-            .await?;
-        let result_ref = write_result.result_ref;
-        compensation.result_written = Some(result_ref.clone());
-        // 天权治本(2026-07-28):child_turn_scope 构造 + check_scope_recovered 提到 ensure_thread 之前。
-        // 原因:check_scope_recovered 失败(scope recovery in progress)时返 resolution::failed 不阻塞,
-        // 但原顺序 ensure_thread 在 check 之前,已创建孤儿子 thread(没 submit_child_run 没调度,
-        // 但 thread 残留)。提到前面后,scope recovery 失败时不创建子 thread(无孤儿)。
-        // child_thread_id 是 spawn 早期预生成,ensure_thread 用它(line 949),两者一致可安全提前用。
+        // Scope recovery must be checked before every spawn side effect,
+        // including the durable result placeholder. A transient rejection is a
+        // non-parking retry signal, not evidence that a child was dispatched.
         let child_turn_scope = match self.run_context.scope.explicit_owner_user_id() {
             Some(owner_user_id) => TurnScope::new_with_owner(
                 child_scope.tenant_id.clone(),
@@ -980,6 +1030,38 @@ impl SubagentSpawnCapabilityPort {
                 None,
             ));
         }
+        let payload = spawn_result_payload(
+            child_run_id,
+            &child_thread_id,
+            &definition.subagent_kind,
+            mode,
+            "spawned",
+            false,
+        );
+        let invocation_id = InvocationId::from_uuid(invocation.activity_id.as_uuid());
+        let write_result = self
+            .deps
+            .result_writer
+            .write_capability_result(CapabilityResultWrite {
+                run_context: &self.run_context,
+                input_ref: &invocation.input_ref,
+                invocation_id,
+                capability_id: &self.spawn_id,
+                output: payload,
+                display_preview: None,
+                durable_persistence: DurablePersistence::Persist,
+            })
+            .await?;
+        let result_ref = write_result.result_ref;
+        compensation.result_written = Some(SpawnResultCompensation {
+            result_ref: result_ref.clone(),
+            invocation_id,
+            capability_id: self.spawn_id.clone(),
+            child_run_id,
+            child_thread_id: child_thread_id.clone(),
+            subagent_kind: definition.subagent_kind.clone(),
+            mode,
+        });
         let child_thread = self
             .deps
             .thread_service
@@ -1097,7 +1179,12 @@ impl SubagentSpawnCapabilityPort {
             )
             .await
         {
-            return Err(map_thread_error(error));
+            tracing::warn!(
+                parent_run_id = %self.run_context.run_id,
+                child_run_id = %run_id,
+                error = %error,
+                "subagent child is submitted but its message marker update failed; retaining await edge for terminal recovery"
+            );
         }
 
         let loop_gate_ref = LoopGateRef::new(gate_ref.as_str()).map_err(invalid_static_ref)?;
@@ -1573,6 +1660,22 @@ fn spawn_result_payload(
         "status": status,
         "output_available": output_available
     })
+}
+
+fn spawn_failure_payload(
+    result: &SpawnResultCompensation,
+    failure_summary: &'static str,
+) -> serde_json::Value {
+    let mut payload = spawn_result_payload(
+        result.child_run_id,
+        &result.child_thread_id,
+        &result.subagent_kind,
+        result.mode,
+        "failed",
+        false,
+    );
+    payload["failure_summary"] = serde_json::Value::String(failure_summary.to_string());
+    payload
 }
 
 fn mode_label(mode: SpawnSubagentMode) -> &'static str {

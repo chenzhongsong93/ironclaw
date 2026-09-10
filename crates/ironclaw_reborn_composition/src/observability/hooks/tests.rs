@@ -217,8 +217,8 @@ fn enabled_config_with_no_extensions_yields_valid_factory() {
     // Flag ON + the first-party guard + no extension hooks must still compose
     // a valid dispatcher — the guard is the sole first-party binding, and the
     // extension-derived bindings are zero. This pins the
-    // no-extensions-is-valid contract. (The guard is bound at
-    // BeforeCapability, so AfterCapability has zero extension bindings.)
+    // no-extensions-is-valid contract. The guard's lifecycle pair contributes
+    // one BeforeCapability binding and one AfterCapability observer binding.
     let registry = projection(ExtensionRegistry::new());
     let factory =
         build_hook_dispatcher_builder_factory(HooksActivationConfig::enabled(), &registry)
@@ -226,10 +226,16 @@ fn enabled_config_with_no_extensions_yields_valid_factory() {
             .expect("flag ON yields a factory");
     let dispatcher = factory().expect("mint hook builder").build_arc();
     let after = dispatcher.active_bindings_snapshot(HookPointSpec::AfterCapability);
-    assert!(
-        after.is_empty(),
-        "no extension hooks must yield zero AfterCapability bindings, saw {after:?}"
+    let guard_observer_id = HookId::for_builtin(
+        super::tianquan_guard::TIANQUAN_GUARD_OBSERVER_CANONICAL_PATH,
+        HookVersion::ONE,
     );
+    assert_eq!(
+        after.len(),
+        1,
+        "no extensions must leave only the first-party guard observer; saw {after:?}"
+    );
+    assert_eq!(after[0].hook_id, guard_observer_id);
     // The first-party Tianquan guard IS bound at BeforeCapability.
     let before = dispatcher.active_bindings_snapshot(HookPointSpec::BeforeCapability);
     let guard_id = HookId::for_builtin(

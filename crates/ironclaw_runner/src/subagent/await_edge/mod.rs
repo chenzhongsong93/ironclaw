@@ -39,6 +39,13 @@ use ironclaw_turns::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Fresh await-edges wait this long for their child run record to appear before
+/// recovery concludes that submit never committed and settles the edge as a
+/// failed child. The value is deliberately longer than the runner's normal
+/// model-request and lease windows; it only governs the edge-before-child-submit
+/// crash window, never an existing queued/running child.
+pub(crate) const DEFAULT_AWAIT_EDGE_DEADLINE_SECONDS: i64 = 15 * 60;
+
 /// CAS state machine (§2): `Open -> Settled -> Drained`, `Open -> Abandoned`.
 /// `Drained`/`Abandoned`-final edges are deleted (§2) — these states are
 /// therefore transient on disk, never the long-lived resting state.
@@ -97,9 +104,9 @@ impl EdgeTerminalKind {
 }
 
 /// One await-edge: parent-awaits-child bookkeeping, §5.6 assembled — plus
-/// four additive fields beyond the design doc's exact list (`gate_ref`, the
-/// `source_binding_ref`/`reply_target_binding_ref` pair, `parent_run_context`,
-/// and `terminal_reason`), each named as a spec deviation in the PR:
+/// additive recovery fields beyond the design doc's original exact list
+/// (`gate_ref`, the `source_binding_ref`/`reply_target_binding_ref` pair,
+/// `parent_run_context`, `terminal_reason`, and `deadline`):
 ///
 /// - `gate_ref` (D3): the pre-existing shared-batch-gate mechanism (one
 ///   `GateRef` covering N children spawned in one call, parent resumes once
@@ -162,8 +169,21 @@ pub struct AwaitEdge {
     pub terminal_reason: Option<String>,
     pub reservation_release: ReservationReleaseState,
     pub created_at: DateTime<Utc>,
+    /// Deadline for the edge-before-child-submit crash window. Additive and
+    /// optional so existing persisted edges deserialize unchanged; legacy
+    /// `None` edges derive the same window from `created_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_at: Option<DateTime<Utc>>,
+}
+
+impl AwaitEdge {
+    pub(crate) fn effective_deadline(&self) -> DateTime<Utc> {
+        self.deadline.unwrap_or_else(|| {
+            self.created_at + chrono::Duration::seconds(DEFAULT_AWAIT_EDGE_DEADLINE_SECONDS)
+        })
+    }
 }
 
 /// Domain error for await-edge store operations. Follows the

@@ -693,11 +693,18 @@ fn serialize_observer_ctx(ctx: &ObserverHookContext) -> Vec<u8> {
         crate::points::ObservedKind::AfterCapability => "after_capability",
         crate::points::ObservedKind::AfterCheckpoint => "after_checkpoint",
     };
+    let capability_outcome = ctx.capability_outcome.map(|outcome| match outcome {
+        crate::points::ObservedCapabilityOutcome::Parked => "parked",
+        crate::points::ObservedCapabilityOutcome::Returned => "returned",
+        crate::points::ObservedCapabilityOutcome::Errored => "errored",
+    });
     let payload = serde_json::json!({
         "point": "observer",
         "tenant_id": ctx.tenant_id.as_str(),
         "observed_kind": observed_kind,
         "provider": ctx.provider.as_ref().map(|p| p.as_str()),
+        "capability_name": ctx.capability_name,
+        "capability_outcome": capability_outcome,
     });
     serialize_payload(&payload)
 }
@@ -1057,5 +1064,33 @@ fn note_category_for_code(code: i32) -> Option<NoteCategory> {
         2 => Some(NoteCategory::HookSlow),
         3 => Some(NoteCategory::HookProtocolViolation),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::points::ObservedCapabilityOutcome;
+    use ironclaw_host_api::TenantId;
+    use ironclaw_turns::CapabilityActivityId;
+
+    #[test]
+    fn observer_wasm_context_exposes_only_bounded_capability_metadata() {
+        let ctx = ObserverHookContext::after_capability(
+            TenantId::new("tenant-a").expect("valid tenant"),
+            "builtin.spawn_subagent".to_string(),
+            CapabilityActivityId::new(),
+            None,
+            ObservedCapabilityOutcome::Errored,
+        );
+
+        let payload: serde_json::Value =
+            serde_json::from_slice(&serialize_observer_ctx(&ctx)).expect("valid observer JSON");
+        assert_eq!(payload["capability_name"], "builtin.spawn_subagent");
+        assert_eq!(payload["capability_outcome"], "errored");
+        assert!(payload.get("capability_arguments_digest").is_none());
+        assert!(payload.get("input").is_none());
+        assert!(payload.get("output").is_none());
+        assert!(payload.get("error").is_none());
     }
 }

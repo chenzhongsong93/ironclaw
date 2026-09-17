@@ -111,9 +111,9 @@ use ironclaw_approvals::{
 pub use llm_config::{
     ActiveModelReader, CodexLoginStart, LlmActiveSelection, LlmConfigService,
     LlmConfigServiceError, LlmConfigSnapshot, LlmModelsResult, LlmProbeRequest, LlmProbeResult,
-    LlmProviderView, NearAiAuthProvider, NearAiLoginRequest, NearAiLoginStart,
-    NearAiWalletLoginRequest, NearAiWalletLoginResult, SetActiveLlmRequest,
-    UpsertLlmProviderRequest,
+    LlmProviderView, LlmSubjectKeyPutRequest, LlmSubjectKeyStatus, NearAiAuthProvider,
+    NearAiLoginRequest, NearAiLoginStart, NearAiWalletLoginRequest, NearAiWalletLoginResult,
+    SetActiveLlmRequest, UpsertLlmProviderRequest,
 };
 pub use project_fs::{
     ProjectFilesystemReader, ProjectFsEntry, ProjectFsEntryKind, ProjectFsError, ProjectFsFile,
@@ -2349,9 +2349,38 @@ pub trait RebornServicesApi: Send + Sync {
 
     /// LLM provider configuration: merged catalog + active selection.
     ///
-    /// The six LLM-config methods default to "service unavailable" so facade
+    /// The LLM-config methods default to "service unavailable" so facade
     /// impls (and test fakes) that don't wire an [`LlmConfigService`] inherit a
     /// safe surface; the default `RebornServices` overrides them all.
+    async fn put_llm_subject_key(
+        &self,
+        caller: WebUiAuthenticatedCaller,
+        request: LlmSubjectKeyPutRequest,
+    ) -> Result<LlmSubjectKeyStatus, RebornServicesError> {
+        let _ = (caller, request);
+        Err(llm_config::llm_config_unavailable())
+    }
+
+    async fn get_llm_subject_key_status(
+        &self,
+        caller: WebUiAuthenticatedCaller,
+        subject: String,
+        provider_id: String,
+    ) -> Result<LlmSubjectKeyStatus, RebornServicesError> {
+        let _ = (caller, subject, provider_id);
+        Err(llm_config::llm_config_unavailable())
+    }
+
+    async fn delete_llm_subject_key(
+        &self,
+        caller: WebUiAuthenticatedCaller,
+        subject: String,
+        provider_id: String,
+    ) -> Result<LlmSubjectKeyStatus, RebornServicesError> {
+        let _ = (caller, subject, provider_id);
+        Err(llm_config::llm_config_unavailable())
+    }
+
     async fn get_llm_config(
         &self,
         caller: WebUiAuthenticatedCaller,
@@ -3640,6 +3669,7 @@ impl RebornServicesApi for RebornServices {
             client_action_id,
             content,
             requested_model,
+            llm_subject,
         } = command
         else {
             return Err(RebornServicesError::internal_invariant());
@@ -3775,6 +3805,7 @@ impl RebornServicesApi for RebornServices {
         let product_context = ironclaw_product_context::resolve_web_ui(scope.product_owner(&actor));
         let submit = SubmitTurnRequest {
             requested_model,
+            llm_subject,
             scope: scope.clone(),
             actor,
             accepted_message_ref: accepted_message_ref.clone(),
@@ -5016,6 +5047,53 @@ impl RebornServicesApi for RebornServices {
             service_lifecycle: Some(service_lifecycle),
             diagnostics: Vec::new(),
         })
+    }
+
+    async fn put_llm_subject_key(
+        &self,
+        caller: WebUiAuthenticatedCaller,
+        request: LlmSubjectKeyPutRequest,
+    ) -> Result<LlmSubjectKeyStatus, RebornServicesError> {
+        let service = self
+            .llm_config
+            .as_ref()
+            .ok_or_else(llm_config::llm_config_unavailable)?;
+        service
+            .put_subject_key(caller, request)
+            .await
+            .map_err(llm_config::map_llm_config_error)
+    }
+
+    async fn get_llm_subject_key_status(
+        &self,
+        caller: WebUiAuthenticatedCaller,
+        subject: String,
+        provider_id: String,
+    ) -> Result<LlmSubjectKeyStatus, RebornServicesError> {
+        let service = self
+            .llm_config
+            .as_ref()
+            .ok_or_else(llm_config::llm_config_unavailable)?;
+        service
+            .get_subject_key_status(caller, subject, provider_id)
+            .await
+            .map_err(llm_config::map_llm_config_error)
+    }
+
+    async fn delete_llm_subject_key(
+        &self,
+        caller: WebUiAuthenticatedCaller,
+        subject: String,
+        provider_id: String,
+    ) -> Result<LlmSubjectKeyStatus, RebornServicesError> {
+        let service = self
+            .llm_config
+            .as_ref()
+            .ok_or_else(llm_config::llm_config_unavailable)?;
+        service
+            .delete_subject_key(caller, subject, provider_id)
+            .await
+            .map_err(llm_config::map_llm_config_error)
     }
 
     async fn get_llm_config(

@@ -73,6 +73,7 @@ fn submit_request_for(scope: TurnScope, key: &str) -> SubmitTurnRequest {
         spawn_tree_root_run_id: None,
         product_context: None,
         scope,
+        llm_subject: None,
     }
 }
 
@@ -814,6 +815,7 @@ async fn ownerless_runs_are_not_counted_against_cap() {
         subagent_depth: 0,
         spawn_tree_root_run_id: None,
         product_context: None,
+        llm_subject: None,
     };
 
     let resp1 = store
@@ -915,6 +917,7 @@ async fn actor_fallback_runs_are_capped_under_actor_user_id() {
         subagent_depth: 0,
         spawn_tree_root_run_id: None,
         product_context: None,
+        llm_subject: None,
     };
 
     let resp1 = store

@@ -392,6 +392,7 @@ struct RunRecord {
     subagent_depth: u32,
     spawn_tree_root_run_id: Option<TurnRunId>,
     product_context: Option<crate::ProductTurnContext>,
+    llm_subject: Option<String>,
     resume_disposition: Option<crate::GateResumeDisposition>,
 }
 
@@ -1213,6 +1214,7 @@ impl TurnStateStore for TurnStateEngine {
             subagent_depth: 0,
             spawn_tree_root_run_id: None,
             product_context: request.product_context,
+            llm_subject: request.llm_subject,
             resume_disposition: None,
         };
         inner.turns.insert(turn_id, turn_record);
@@ -1410,6 +1412,7 @@ impl TurnSpawnTreeStateStore for TurnStateEngine {
                     parent.spawn_tree_root_run_id.unwrap_or(parent.run_id),
                 ),
                 product_context: parent.product_context.clone(),
+                llm_subject: parent.llm_subject.clone(),
             }
         };
 
@@ -1503,6 +1506,7 @@ impl TurnSpawnTreeStateStore for TurnStateEngine {
         let subagent_depth = parent.subagent_depth + 1;
         let root_run_id = parent.spawn_tree_root_run_id.unwrap_or(parent.run_id);
         let parent_product_context = parent.product_context.clone();
+        let parent_llm_subject = parent.llm_subject.clone();
         let Some(root) = inner.records.get(&root_run_id) else {
             let response = Err(TurnError::ScopeNotFound);
             inner.remember_submit_idempotency(
@@ -1663,6 +1667,7 @@ impl TurnSpawnTreeStateStore for TurnStateEngine {
             subagent_depth,
             spawn_tree_root_run_id: Some(root_run_id),
             product_context: parent_product_context,
+            llm_subject: parent_llm_subject,
             resume_disposition: None,
         };
         inner.turns.insert(turn_id, turn_record);
@@ -2230,6 +2235,7 @@ impl Inner {
                     subagent_depth: run.subagent_depth,
                     spawn_tree_root_run_id: run.spawn_tree_root_run_id,
                     product_context: run.product_context,
+                    llm_subject: run.llm_subject,
                     resume_disposition: run.resume_disposition,
                 },
             );
@@ -2453,6 +2459,10 @@ impl Inner {
             sanitized_reason,
             retryable,
             detail,
+            // The terminal transition persists usage onto the record before
+            // this event is pushed, so Completed/Failed events carry it;
+            // earlier lifecycle kinds simply see None.
+            model_usage: record.model_usage,
         });
         if self.events.len() > self.limits.max_events {
             let excess = self.events.len() - self.limits.max_events;
@@ -2949,6 +2959,7 @@ impl Inner {
             subagent_depth,
             spawn_tree_root_run_id,
             product_context,
+            llm_subject,
         ) = {
             let Some(failed) = self.records.get(&request.run_id) else {
                 return Err(TurnError::ScopeNotFound);
@@ -2988,6 +2999,7 @@ impl Inner {
                 failed.subagent_depth,
                 failed.spawn_tree_root_run_id,
                 failed.product_context.clone(),
+                failed.llm_subject.clone(),
             )
         };
         if let Some(response) = self.thread_busy(&lock_key) {
@@ -3040,6 +3052,7 @@ impl Inner {
             subagent_depth,
             spawn_tree_root_run_id,
             product_context,
+            llm_subject,
             resume_disposition: None,
         };
         self.active_locks.insert(
@@ -3880,6 +3893,7 @@ impl RunRecord {
             subagent_depth: self.subagent_depth,
             spawn_tree_root_run_id: self.spawn_tree_root_run_id,
             product_context: self.product_context.clone(),
+            llm_subject: self.llm_subject.clone(),
             resume_disposition: self.resume_disposition.clone(),
         }
     }
@@ -3906,6 +3920,7 @@ impl RunRecord {
             failure: self.failure.clone(),
             event_cursor: self.event_cursor,
             product_context: self.product_context.clone(),
+            llm_subject: self.llm_subject.clone(),
             resume_disposition: self.resume_disposition.clone(),
         }
     }
@@ -4259,6 +4274,7 @@ mod tests {
                         subagent_depth: 0,
                         spawn_tree_root_run_id: None,
                         product_context: None,
+                        llm_subject: None,
                     },
                     &policy,
                     &resolver,
@@ -4335,6 +4351,7 @@ mod tests {
                     subagent_depth: 0,
                     spawn_tree_root_run_id: None,
                     product_context: None,
+                    llm_subject: None,
                 },
                 &policy,
                 &resolver,

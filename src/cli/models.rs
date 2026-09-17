@@ -197,6 +197,8 @@ async fn try_fetch_models(provider_id: &str, config_path: Option<&Path>) -> Opti
             base_url,
             extra_headers: Vec::new(),
             oauth_token: None,
+            auth_mode: None,
+            max_tokens: None,
             is_codex_chatgpt: false,
             refresh_token: None,
             auth_path: None,

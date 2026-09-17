@@ -62,6 +62,7 @@ fn flatten_config(
         runner: Some(config.runner.clone().unwrap_or_default()),
         skills: Some(config.skills.clone().unwrap_or_default()),
         storage: Some(config.storage.clone().unwrap_or_default()),
+        llm_subject_required: config.llm_subject_required,
         llm: Some(llm),
         webui: Some(config.webui.clone().unwrap_or_default()),
         slack: Some(config.slack.clone().unwrap_or_default()),

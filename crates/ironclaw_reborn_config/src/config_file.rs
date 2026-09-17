@@ -73,6 +73,13 @@ pub struct RebornConfigFile {
     /// Credential-bearing database URLs must stay env-only. This section names
     /// the backend and the environment variable that contains the URL.
     pub storage: Option<StorageSection>,
+    /// Deployment-wide gate for request-scoped LLM identity routing
+    /// (ISSUE-IRONCLAW-008). When true, turns without `llm_subject` and
+    /// subjects without a stored key fail closed; the process-wide shared key
+    /// is never used as fallback. Environment variable
+    /// `IRONCLAW_LLM_SUBJECT_REQUIRED` overrides this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_subject_required: Option<bool>,
     /// Per-slot LLM selection. Keyed by Reborn model slot name. Today
     /// composition wires only the `default` slot; the `mission` slot
     /// becomes live when the planned driver lands. Operators are free
@@ -685,6 +692,16 @@ pub struct LlmSlotSelection {
     pub api_key_env: Option<String>,
     /// Override the provider's `default_base_url`. Optional.
     pub base_url: Option<String>,
+    /// Explicit Anthropic auth-mode override: `"bearer"` (OAuth token,
+    /// tolerant path) or `"x-api-key"` (rig-core strict path). Optional;
+    /// absent keeps the legacy implicit routing keyed on the
+    /// `oauth-placeholder` sentinel. Anthropic-protocol providers only.
+    pub auth_mode: Option<String>,
+    /// Default `max_tokens` applied when a request leaves it unset.
+    /// Optional. For Anthropic-protocol providers a built-in fallback
+    /// applies even without this field; other protocols only use it when
+    /// configured here.
+    pub max_tokens: Option<u32>,
 }
 
 /// Field update for an existing LLM slot selection.
@@ -706,6 +723,11 @@ pub struct DefaultLlmSlotUpdate {
     pub model: LlmSlotFieldUpdate,
     pub api_key_env: LlmSlotFieldUpdate,
     pub base_url: LlmSlotFieldUpdate,
+    pub auth_mode: LlmSlotFieldUpdate,
+    /// String form of a `u32` (`Set("65536")`); parsed at apply time so a
+    /// malformed value fails the update instead of writing a TOML string
+    /// the loader would then reject.
+    pub max_tokens: LlmSlotFieldUpdate,
 }
 
 /// Held exclusive lock plus editable config document for one config update.
@@ -745,6 +767,14 @@ impl DefaultLlmSlotUpdateSession {
                 .get("base_url")
                 .and_then(toml_edit::Item::as_str)
                 .map(str::to_string),
+            auth_mode: default_slot
+                .get("auth_mode")
+                .and_then(toml_edit::Item::as_str)
+                .map(str::to_string),
+            max_tokens: default_slot
+                .get("max_tokens")
+                .and_then(toml_edit::Item::as_integer)
+                .and_then(|value| u32::try_from(value).ok()),
         }))
     }
 
@@ -756,7 +786,43 @@ impl DefaultLlmSlotUpdateSession {
         apply_llm_slot_field(&mut self.doc, "model", &update.model);
         apply_llm_slot_field(&mut self.doc, "api_key_env", &update.api_key_env);
         apply_llm_slot_field(&mut self.doc, "base_url", &update.base_url);
+        apply_llm_slot_field(&mut self.doc, "auth_mode", &update.auth_mode);
+        self.apply_max_tokens(&update.max_tokens)?;
         write_edit_document(&self.path, &self.doc)
+    }
+
+    /// `max_tokens` is a TOML integer, so its `Set` payload is parsed here —
+    /// a malformed string fails the whole update before anything is written.
+    fn apply_max_tokens(
+        &mut self,
+        update: &LlmSlotFieldUpdate,
+    ) -> Result<(), RebornConfigFileUpdateError> {
+        match update {
+            LlmSlotFieldUpdate::Keep => {}
+            LlmSlotFieldUpdate::Set(value) => {
+                let parsed = value.trim().parse::<u32>().map_err(|_| {
+                    RebornConfigFileUpdateError::Validate {
+                        path: self.path.clone(),
+                        source: Box::new(RebornConfigFileError::InvalidField {
+                            path: self.path.display().to_string(),
+                            field: "llm.default.max_tokens".to_string(),
+                            reason: format!(
+                                "'{value}' is not a valid max_tokens: expected a positive integer"
+                            ),
+                        }),
+                    }
+                })?;
+                ensure_llm_default_table(&mut self.doc);
+                self.doc["llm"]["default"]["max_tokens"] = toml_edit::value(i64::from(parsed));
+            }
+            LlmSlotFieldUpdate::Remove => {
+                ensure_llm_default_table(&mut self.doc);
+                if let Some(table) = self.doc["llm"]["default"].as_table_like_mut() {
+                    table.remove("max_tokens");
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1731,6 +1797,7 @@ provider_id = "anthropic"
                 model: LlmSlotFieldUpdate::Set("gpt-5.3-codex".to_string()),
                 api_key_env: LlmSlotFieldUpdate::Keep,
                 base_url: LlmSlotFieldUpdate::Remove,
+                ..Default::default()
             },
         )
         .expect("update config");
@@ -2505,5 +2572,141 @@ not_a_field = true
         let err = RebornConfigFile::parse_text(toml, &attributed())
             .expect_err("deny_unknown_fields must catch typos in [trigger_poller]");
         assert!(matches!(err, RebornConfigFileError::Toml { .. }));
+    }
+    // -- ISSUE-IRONCLAW-007: [llm.*] auth_mode / max_tokens schema --
+
+    #[test]
+    fn llm_slot_accepts_auth_mode_and_max_tokens() {
+        // Regression for the crash-loop: these fields previously tripped
+        // deny_unknown_fields and the gateway died on TOML parse.
+        let toml = r#"
+[llm.default]
+provider_id = "anthropic"
+model = "deepseek-v4-flash"
+api_key_env = "ANTHROPIC_API_KEY"
+base_url = "http://llm-router:3000"
+auth_mode = "bearer"
+max_tokens = 65536
+"#;
+        let cfg = RebornConfigFile::parse_text(toml, &attributed()).expect("must parse");
+        let slot = cfg.default_llm_slot().expect("default slot present");
+        assert_eq!(slot.auth_mode.as_deref(), Some("bearer"));
+        assert_eq!(slot.max_tokens, Some(65536));
+    }
+
+    #[test]
+    fn llm_slot_still_rejects_unknown_fields() {
+        let toml = r#"
+[llm.default]
+provider_id = "anthropic"
+max_token = 65536
+"#;
+        let error = RebornConfigFile::parse_text(toml, &attributed())
+            .expect_err("misspelled field must still be rejected");
+        assert!(
+            error.to_string().contains("max_token"),
+            "error should name the rejected field: {error}"
+        );
+    }
+
+    #[test]
+    fn default_llm_update_roundtrips_auth_mode_and_max_tokens() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[llm.default]
+provider_id = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+"#,
+        )
+        .expect("write config");
+
+        update_default_llm_slot(
+            &path,
+            &DefaultLlmSlotUpdate {
+                auth_mode: LlmSlotFieldUpdate::Set("bearer".to_string()),
+                max_tokens: LlmSlotFieldUpdate::Set("65536".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("update config");
+
+        let cfg = RebornConfigFile::load(&path)
+            .expect("valid config")
+            .expect("config present");
+        let slot = cfg.default_llm_slot().expect("default slot present");
+        assert_eq!(slot.auth_mode.as_deref(), Some("bearer"));
+        assert_eq!(slot.max_tokens, Some(65536));
+
+        update_default_llm_slot(
+            &path,
+            &DefaultLlmSlotUpdate {
+                auth_mode: LlmSlotFieldUpdate::Remove,
+                max_tokens: LlmSlotFieldUpdate::Remove,
+                ..Default::default()
+            },
+        )
+        .expect("remove fields");
+
+        let cfg = RebornConfigFile::load(&path)
+            .expect("valid config")
+            .expect("config present");
+        let slot = cfg.default_llm_slot().expect("default slot present");
+        assert_eq!(slot.auth_mode, None);
+        assert_eq!(slot.max_tokens, None);
+        assert_eq!(slot.provider_id.as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn default_llm_update_rejects_non_numeric_max_tokens() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[llm.default]
+provider_id = "anthropic"
+"#,
+        )
+        .expect("write config");
+
+        let err = update_default_llm_slot(
+            &path,
+            &DefaultLlmSlotUpdate {
+                max_tokens: LlmSlotFieldUpdate::Set("lots".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect_err("non-numeric max_tokens must fail the update");
+        assert!(
+            err.to_string().contains("max_tokens"),
+            "error should name the field: {err}"
+        );
+
+        // The failed update must not have written a TOML string the loader
+        // would later reject.
+        let cfg = RebornConfigFile::load(&path)
+            .expect("config still parses")
+            .expect("config present");
+        assert_eq!(cfg.default_llm_slot().unwrap().max_tokens, None);
+    }
+
+    #[test]
+    fn llm_subject_required_parses_as_deployment_level_gate() {
+        let cfg = RebornConfigFile::parse_text("llm_subject_required = true\n", &attributed())
+            .expect("subject gate must parse");
+        assert_eq!(cfg.llm_subject_required, Some(true));
+    }
+
+    #[test]
+    fn llm_subject_required_is_optional_for_legacy_configs() {
+        let cfg = RebornConfigFile::parse_text(
+            "[llm.default]\nprovider_id = \"anthropic\"\n",
+            &attributed(),
+        )
+        .expect("legacy config must parse");
+        assert_eq!(cfg.llm_subject_required, None);
     }
 }

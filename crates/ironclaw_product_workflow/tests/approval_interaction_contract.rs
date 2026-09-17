@@ -607,6 +607,7 @@ impl TurnCoordinator for FakeTurnCoordinator {
             event_cursor: EventCursor(17),
             product_context: None,
             resume_disposition: None,
+            llm_subject: None,
         })
     }
 }

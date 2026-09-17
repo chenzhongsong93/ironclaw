@@ -63,6 +63,11 @@ pub struct RigAdapter<M: CompletionModel> {
     /// and tool-call multi-turn both accept dropped reasoning. See
     /// `crates/ironclaw_llm` #3201 context and debt ironclaw-thinking-reasoning-integration.
     discard_reasoning: bool,
+    /// Default `max_tokens` applied when the incoming request leaves it unset.
+    /// Anthropic's rig-core client hard-fails client-side without `max_tokens`,
+    /// so the Anthropic factory always installs a fallback here; other
+    /// protocols only carry one when the operator configured it.
+    default_max_tokens: Option<u32>,
     /// Optional model-discovery endpoint. When set, [`LlmProvider::list_models`]
     /// issues a `GET` instead of returning the empty default. rig-core's
     /// `CompletionModel` does not expose model discovery, so this is wired
@@ -261,6 +266,7 @@ impl<M: CompletionModel> RigAdapter<M> {
             unsupported_params: HashSet::new(),
             default_additional_params: None,
             discard_reasoning: false,
+            default_max_tokens: None,
             models_endpoint: None,
         }
     }
@@ -319,6 +325,21 @@ impl<M: CompletionModel> RigAdapter<M> {
     pub fn with_unsupported_params(mut self, params: Vec<String>) -> Self {
         self.unsupported_params = params.into_iter().collect();
         self
+    }
+
+    /// Set the fallback `max_tokens` applied when a request leaves it unset.
+    ///
+    /// Applied *before* unsupported-param stripping, so a provider declaring
+    /// `"max_tokens"` unsupported still never sends it.
+    pub(crate) fn with_default_max_tokens(mut self, default_max_tokens: Option<u32>) -> Self {
+        self.default_max_tokens = default_max_tokens;
+        self
+    }
+
+    /// The request's own `max_tokens` wins; the configured/default fallback
+    /// only fills an unset request.
+    fn effective_max_tokens(&self, requested: Option<u32>) -> Option<u32> {
+        requested.or(self.default_max_tokens)
     }
 
     /// Set default additional parameters merged into every request.
@@ -995,6 +1016,7 @@ where
     ) -> Result<CompletionResponse, LlmError> {
         let model_override = request.take_model_override();
 
+        request.max_tokens = self.effective_max_tokens(request.max_tokens);
         self.strip_unsupported_completion_params(&mut request);
 
         let mut messages = request.messages;
@@ -1052,6 +1074,7 @@ where
     ) -> Result<ToolCompletionResponse, LlmError> {
         let model_override = request.take_model_override();
 
+        request.max_tokens = self.effective_max_tokens(request.max_tokens);
         self.strip_unsupported_tool_params(&mut request);
 
         let known_tool_names: HashSet<String> =
@@ -3520,5 +3543,72 @@ mod tests {
         assert!(msg.reasoning.is_none());
         let msg = ChatMessage::assistant("hi").with_reasoning(Some("real".to_string()));
         assert_eq!(msg.reasoning.as_deref(), Some("real"));
+    }
+    // -- ISSUE-IRONCLAW-007: default max_tokens fallback --
+
+    #[test]
+    fn test_default_max_tokens_fills_unset_request_only() {
+        use rig::client::CompletionClient;
+        use rig::providers::openai;
+
+        let client: openai::Client = openai::Client::builder()
+            .api_key("test-key")
+            .base_url("http://localhost:0")
+            .build()
+            .unwrap();
+        let client = client.completions_api();
+        let model = client.completion_model("test-model");
+        let adapter = RigAdapter::new(model, "test-model").with_default_max_tokens(Some(8192));
+
+        assert_eq!(adapter.effective_max_tokens(None), Some(8192));
+        assert_eq!(
+            adapter.effective_max_tokens(Some(100)),
+            Some(100),
+            "request-level max_tokens must win over the fallback"
+        );
+    }
+
+    #[test]
+    fn test_default_max_tokens_absent_by_default() {
+        use rig::client::CompletionClient;
+        use rig::providers::openai;
+
+        let client: openai::Client = openai::Client::builder()
+            .api_key("test-key")
+            .base_url("http://localhost:0")
+            .build()
+            .unwrap();
+        let client = client.completions_api();
+        let model = client.completion_model("test-model");
+        let adapter = RigAdapter::new(model, "test-model");
+
+        assert_eq!(adapter.effective_max_tokens(None), None);
+    }
+
+    #[test]
+    fn test_default_max_tokens_still_stripped_when_listed_unsupported() {
+        use rig::client::CompletionClient;
+        use rig::providers::openai;
+
+        let client: openai::Client = openai::Client::builder()
+            .api_key("test-key")
+            .base_url("http://localhost:0")
+            .build()
+            .unwrap();
+        let client = client.completions_api();
+        let model = client.completion_model("test-model");
+        let adapter = RigAdapter::new(model, "test-model")
+            .with_default_max_tokens(Some(8192))
+            .with_unsupported_params(vec!["max_tokens".to_string()]);
+
+        // Mirrors the complete() ordering: fallback first, then stripping.
+        let mut req = CompletionRequest::new(vec![ChatMessage::user("hi")]);
+        req.max_tokens = adapter.effective_max_tokens(req.max_tokens);
+        adapter.strip_unsupported_completion_params(&mut req);
+
+        assert!(
+            req.max_tokens.is_none(),
+            "a provider declaring max_tokens unsupported must never send it"
+        );
     }
 }

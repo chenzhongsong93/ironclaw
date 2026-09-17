@@ -84,11 +84,14 @@ const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 /// Required beta flag to enable OAuth Bearer auth on api.anthropic.com.
 /// Without this header, the API returns 401 "OAuth authentication is currently not supported."
 const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
-const DEFAULT_MAX_TOKENS: u32 = 8192;
+/// Fallback `max_tokens` when neither the request nor the provider config
+/// set one. Also reused by the rig-core Anthropic path (lib.rs factory).
+pub(crate) const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 /// Anthropic provider using OAuth Bearer authentication.
 pub(crate) struct AnthropicOAuthProvider {
     client: Client,
+    provider_id: String,
     /// OAuth token, wrapped in RwLock so it can be updated after a successful
     /// Keychain refresh (fixes #1136: stale token reuse after expiry).
     token: std::sync::RwLock<SecretString>,
@@ -97,6 +100,9 @@ pub(crate) struct AnthropicOAuthProvider {
     active_model: std::sync::RwLock<String>,
     /// Parameter names that this provider does not support.
     unsupported_params: HashSet<String>,
+    /// Fallback `max_tokens` when a request leaves it unset
+    /// (`config.max_tokens` at construction, else [`DEFAULT_MAX_TOKENS`]).
+    default_max_tokens: u32,
 }
 
 impl AnthropicOAuthProvider {
@@ -133,11 +139,13 @@ impl AnthropicOAuthProvider {
 
         Ok(Self {
             client,
+            provider_id: config.provider_id.clone(),
             token: std::sync::RwLock::new(token),
             model: config.model.clone(),
             base_url,
             active_model,
             unsupported_params,
+            default_max_tokens: config.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         })
     }
 
@@ -168,6 +176,54 @@ impl AnthropicOAuthProvider {
         }
     }
 
+    async fn token_for_request(
+        &self,
+        metadata: &std::collections::HashMap<String, String>,
+    ) -> Result<(String, bool), LlmError> {
+        let registered = crate::subject_keys::registered_subject_key_resolver();
+        let subject = metadata
+            .get("llm_subject")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        match (subject, registered) {
+            (Some(subject), Some((resolver, _policy))) => resolver
+                .resolve_bearer_token(subject, &self.provider_id)
+                .await
+                .map_err(|error| match error {
+                    crate::SubjectKeyResolveError::SubjectRequired => {
+                        LlmError::SubjectAuthRejected {
+                            code: "llm_subject_required",
+                        }
+                    }
+                    crate::SubjectKeyResolveError::UnknownSubject => {
+                        LlmError::SubjectAuthRejected {
+                            code: "llm_subject_unknown",
+                        }
+                    }
+                    crate::SubjectKeyResolveError::StoreUnavailable => {
+                        LlmError::SubjectAuthRejected {
+                            code: "llm_subject_store_unavailable",
+                        }
+                    }
+                })?
+                .map(|token| (token.expose_secret().to_string(), true))
+                .ok_or(LlmError::SubjectAuthRejected {
+                    code: "llm_subject_unknown",
+                }),
+            (Some(_), None) => Err(LlmError::SubjectAuthRejected {
+                code: "llm_subject_unknown",
+            }),
+            (None, Some((_resolver, policy))) if policy.required => {
+                Err(LlmError::SubjectAuthRejected {
+                    code: "llm_subject_required",
+                })
+            }
+            (None, _) => Ok((self.current_token(), false)),
+        }
+    }
+
     /// Update the stored token after a successful Keychain refresh.
     fn update_token(&self, new_token: SecretString) {
         match self.token.write() {
@@ -187,6 +243,8 @@ impl AnthropicOAuthProvider {
     async fn send_request_streaming(
         &self,
         body: &AnthropicRequest,
+        bearer_token: &str,
+        subject_scoped: bool,
     ) -> Result<AnthropicResponse, LlmError> {
         let url = self.api_url();
         let mut streamed = body.clone();
@@ -199,7 +257,7 @@ impl AnthropicOAuthProvider {
         let response = self
             .client
             .post(&url)
-            .bearer_auth(self.current_token())
+            .bearer_auth(bearer_token)
             .header("anthropic-version", ANTHROPIC_API_VERSION)
             .header("anthropic-beta", ANTHROPIC_OAUTH_BETA)
             .header("Content-Type", "application/json")
@@ -217,6 +275,11 @@ impl AnthropicOAuthProvider {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
+            if subject_scoped && status.as_u16() == 401 {
+                return Err(LlmError::SubjectAuthRejected {
+                    code: "llm_subject_key_invalid",
+                });
+            }
             return Err(LlmError::RequestFailed {
                 provider: "anthropic_oauth".to_string(),
                 reason: format!("streaming HTTP {status}: {response_text}"),
@@ -253,6 +316,8 @@ impl AnthropicOAuthProvider {
     async fn send_request<R: for<'de> Deserialize<'de>>(
         &self,
         body: &AnthropicRequest,
+        bearer_token: &str,
+        subject_scoped: bool,
     ) -> Result<R, LlmError> {
         let url = self.api_url();
 
@@ -261,7 +326,7 @@ impl AnthropicOAuthProvider {
         let response = self
             .client
             .post(&url)
-            .bearer_auth(self.current_token())
+            .bearer_auth(bearer_token)
             .header("anthropic-version", ANTHROPIC_API_VERSION)
             .header("anthropic-beta", ANTHROPIC_OAUTH_BETA)
             .header("Content-Type", "application/json")
@@ -287,6 +352,14 @@ impl AnthropicOAuthProvider {
                 .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
 
             if status.as_u16() == 401 {
+                // A subject-scoped key is authoritative for that subject. It
+                // must never fall back to or refresh the deployment shared key
+                // (ISSUE-IRONCLAW-008 fail-closed rule).
+                if subject_scoped {
+                    return Err(LlmError::SubjectAuthRejected {
+                        code: "llm_subject_key_invalid",
+                    });
+                }
                 // OAuth tokens from `claude login` expire in ~8-12h. Attempt
                 // to re-extract a fresh token from the OS credential store
                 // (macOS Keychain / Linux credentials file) before giving up.
@@ -384,12 +457,13 @@ impl AnthropicOAuthProvider {
 #[async_trait]
 impl LlmProvider for AnthropicOAuthProvider {
     async fn complete(&self, mut req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+        let (bearer_token, subject_scoped) = self.token_for_request(&req.metadata).await?;
         let model = req
             .take_model_override()
             .unwrap_or_else(|| self.active_model_name());
         self.strip_unsupported_completion_params(&mut req);
         let (system, messages) = convert_messages(req.messages);
-        let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
 
         let request = AnthropicRequest {
             stream: None,
@@ -403,7 +477,9 @@ impl LlmProvider for AnthropicOAuthProvider {
             tool_choice: None,
         };
 
-        let response: AnthropicResponse = self.send_request(&request).await?;
+        let response: AnthropicResponse = self
+            .send_request(&request, &bearer_token, subject_scoped)
+            .await?;
         let extracted = extract_response_content(&response);
 
         let finish_reason = match response.stop_reason.as_deref() {
@@ -428,6 +504,7 @@ impl LlmProvider for AnthropicOAuthProvider {
         &self,
         mut req: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
+        let (bearer_token, subject_scoped) = self.token_for_request(&req.metadata).await?;
         let model = req
             .take_model_override()
             .unwrap_or_else(|| self.active_model_name());
@@ -463,7 +540,7 @@ impl LlmProvider for AnthropicOAuthProvider {
                 name: Some(specific.to_string()),
             },
         });
-        let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
 
         // Suppress thinking for tool-capable requests to avoid signature round-trip issues.
         // Anthropic requires signed thinking blocks to be echoed back on subsequent tool_result
@@ -490,7 +567,9 @@ impl LlmProvider for AnthropicOAuthProvider {
 
         // 2026-08-28 天权补丁:tool-capable 请求走流式聚合(非流式长生成在兼容
         // 网关上慢且空,见 send_request_streaming 注释)。
-        let response: AnthropicResponse = self.send_request_streaming(&request).await?;
+        let response: AnthropicResponse = self
+            .send_request_streaming(&request, &bearer_token, subject_scoped)
+            .await?;
         let extracted = extract_response_content(&response);
 
         let finish_reason = match response.stop_reason.as_deref() {
@@ -1388,5 +1467,110 @@ mod streaming_tests {
     fn sse_empty_stream_errors() {
         let agg = SseAggregator::default();
         assert!(agg.finish().is_err(), "空流应报错(端点空响应铁证形态)");
+    }
+    // -- ISSUE-IRONCLAW-007: config-level max_tokens fallback --
+
+    fn oauth_test_config(max_tokens: Option<u32>) -> crate::config::RegistryProviderConfig {
+        let mut config = crate::config::RegistryProviderConfig::generic(
+            crate::registry::ProviderProtocol::Anthropic,
+            "anthropic",
+            Some(secrecy::SecretString::from(
+                crate::config::OAUTH_PLACEHOLDER,
+            )),
+            "",
+            "test-model",
+        )
+        .with_max_tokens(max_tokens);
+        config.oauth_token = Some(secrecy::SecretString::from("test-oauth-token"));
+        config
+    }
+
+    #[test]
+    fn provider_uses_config_max_tokens_as_fallback() {
+        let provider = AnthropicOAuthProvider::new(&oauth_test_config(Some(65536)), 60)
+            .expect("provider builds");
+        assert_eq!(provider.default_max_tokens, 65536);
+    }
+
+    #[test]
+    fn provider_falls_back_to_builtin_default_max_tokens() {
+        let provider =
+            AnthropicOAuthProvider::new(&oauth_test_config(None), 60).expect("provider builds");
+        assert_eq!(provider.default_max_tokens, DEFAULT_MAX_TOKENS);
+    }
+
+    struct TestSubjectResolver;
+
+    #[async_trait]
+    impl crate::SubjectKeyResolver for TestSubjectResolver {
+        async fn resolve_bearer_token(
+            &self,
+            subject: &str,
+            _provider_id: &str,
+        ) -> Result<Option<SecretString>, crate::SubjectKeyResolveError> {
+            Ok((subject == "known").then(|| SecretString::from("subject-token")))
+        }
+    }
+
+    static SUBJECT_RESOLVER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[tokio::test]
+    async fn optional_subject_policy_uses_shared_token_only_when_subject_absent() {
+        let _guard = SUBJECT_RESOLVER_TEST_LOCK.lock().unwrap();
+        crate::subject_keys::clear_subject_key_resolver();
+        crate::register_subject_key_resolver(
+            std::sync::Arc::new(TestSubjectResolver),
+            crate::SubjectKeyPolicy::OPTIONAL,
+        );
+        let provider = AnthropicOAuthProvider::new(&oauth_test_config(None), 60).unwrap();
+
+        let empty = std::collections::HashMap::new();
+        assert_eq!(
+            provider.token_for_request(&empty).await.unwrap(),
+            ("test-oauth-token".to_string(), false)
+        );
+        let known =
+            std::collections::HashMap::from([("llm_subject".to_string(), "known".to_string())]);
+        assert_eq!(
+            provider.token_for_request(&known).await.unwrap(),
+            ("subject-token".to_string(), true)
+        );
+        crate::subject_keys::clear_subject_key_resolver();
+    }
+
+    #[tokio::test]
+    async fn required_subject_policy_rejects_missing_and_unknown_without_fallback() {
+        let _guard = SUBJECT_RESOLVER_TEST_LOCK.lock().unwrap();
+        crate::subject_keys::clear_subject_key_resolver();
+        crate::register_subject_key_resolver(
+            std::sync::Arc::new(TestSubjectResolver),
+            crate::SubjectKeyPolicy::REQUIRED,
+        );
+        let provider = AnthropicOAuthProvider::new(&oauth_test_config(None), 60).unwrap();
+
+        let missing = provider
+            .token_for_request(&std::collections::HashMap::new())
+            .await
+            .expect_err("missing subject must fail closed");
+        assert!(matches!(
+            missing,
+            LlmError::SubjectAuthRejected {
+                code: "llm_subject_required"
+            }
+        ));
+
+        let unknown =
+            std::collections::HashMap::from([("llm_subject".to_string(), "unknown".to_string())]);
+        let error = provider
+            .token_for_request(&unknown)
+            .await
+            .expect_err("unknown subject must fail closed");
+        assert!(matches!(
+            error,
+            LlmError::SubjectAuthRejected {
+                code: "llm_subject_unknown"
+            }
+        ));
+        crate::subject_keys::clear_subject_key_resolver();
     }
 }

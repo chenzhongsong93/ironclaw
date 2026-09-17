@@ -2242,6 +2242,7 @@ mod reborn_support_tests {
             resolved_model_route: None,
             run_id: TurnRunId::new(),
             turn_id: TurnId::new(),
+            llm_subject: None,
         }
     }
 

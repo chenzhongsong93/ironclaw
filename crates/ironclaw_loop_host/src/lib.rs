@@ -1193,6 +1193,7 @@ where
             resolved_model_route: self.run_context.resolved_model_route.clone(),
             run_id: self.run_context.run_id,
             turn_id: self.run_context.turn_id,
+            llm_subject: self.run_context.llm_subject.clone(),
         };
         let gateway_result = if let Some(capabilities) = self.capabilities.as_ref() {
             let capabilities: Arc<dyn LoopCapabilityPort> =
@@ -1651,6 +1652,12 @@ pub struct HostManagedModelRequest {
     pub resolved_model_route: Option<HostManagedModelRouteSnapshot>,
     pub run_id: TurnRunId,
     pub turn_id: TurnId,
+    /// Per-subject LLM identity label (ISSUE-IRONCLAW-008), sourced from the
+    /// run context. The model gateway copies it into
+    /// `CompletionRequest.metadata` so the provider resolves the per-subject
+    /// key; the key value never transits here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_subject: Option<String>,
 }
 
 /// Boundary alias for the route snapshot carried from turn/run state into

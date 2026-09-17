@@ -154,6 +154,7 @@ where
             resolved_model_route: self.run_context.resolved_model_route.clone(),
             run_id: self.run_context.run_id,
             turn_id: self.run_context.turn_id,
+            llm_subject: self.run_context.llm_subject.clone(),
         };
 
         let response = tokio::time::timeout(

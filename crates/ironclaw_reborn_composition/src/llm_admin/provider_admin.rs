@@ -252,6 +252,7 @@ impl RebornProviderAdmin {
                     .map(LlmSlotFieldUpdate::Set)
                     .unwrap_or(LlmSlotFieldUpdate::Remove),
                 base_url: LlmSlotFieldUpdate::Remove,
+                ..Default::default()
             },
         )
         .map_err(|source| RebornProviderAdminError::UpdateConfig {

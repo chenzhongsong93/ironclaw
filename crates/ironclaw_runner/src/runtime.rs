@@ -1220,6 +1220,7 @@ mod tests {
             sanitized_reason: None,
             retryable: None,
             detail: None,
+            model_usage: None,
         })
         .await
         .expect("terminal lifecycle event is observed");

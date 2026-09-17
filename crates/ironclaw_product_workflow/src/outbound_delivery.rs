@@ -245,6 +245,8 @@ fn outbound_push_kind_for_payload(payload: &ProductOutboundPayload) -> Option<Ou
         | ProductOutboundPayload::CapabilityDisplayPreview(_)
         | ProductOutboundPayload::ProjectionSnapshot { .. }
         | ProductOutboundPayload::ProjectionUpdate { .. }
+        // Billing-channel usage frames never push to external channels.
+        | ProductOutboundPayload::TurnCost(_)
         | ProductOutboundPayload::KeepAlive => None,
     }
 }

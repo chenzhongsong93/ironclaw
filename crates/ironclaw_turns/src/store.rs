@@ -242,6 +242,10 @@ pub struct TurnRunRecord {
     pub spawn_tree_root_run_id: Option<TurnRunId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub product_context: Option<crate::ProductTurnContext>,
+    /// Server-to-server LLM identity label persisted with the run
+    /// (ISSUE-IRONCLAW-008). This is never secret material.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_subject: Option<String>,
     #[serde(
         rename = "auth_resume_disposition",
         default,
@@ -611,6 +615,7 @@ mod tests {
             subagent_depth: 0,
             spawn_tree_root_run_id: None,
             product_context: None,
+            llm_subject: None,
             resume_disposition: None,
         }
     }

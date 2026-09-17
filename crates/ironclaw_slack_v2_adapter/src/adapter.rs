@@ -252,6 +252,8 @@ fn render_supported_payload(
         | ProductOutboundPayload::CapabilityDisplayPreview(_)
         | ProductOutboundPayload::ProjectionSnapshot { .. }
         | ProductOutboundPayload::ProjectionUpdate { .. }
+        // Token-usage frames are billing-channel facts, not chat content.
+        | ProductOutboundPayload::TurnCost(_)
         | ProductOutboundPayload::KeepAlive => Ok(RenderedSlackOutbound::Deferred),
     }
 }
@@ -279,6 +281,7 @@ fn payload_run_id(payload: &ProductOutboundPayload) -> Option<TurnRunId> {
         | ProductOutboundPayload::CapabilityDisplayPreview(_)
         | ProductOutboundPayload::ProjectionSnapshot { .. }
         | ProductOutboundPayload::ProjectionUpdate { .. }
+        | ProductOutboundPayload::TurnCost(_)
         | ProductOutboundPayload::KeepAlive => None,
     }
 }

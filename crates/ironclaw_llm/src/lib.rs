@@ -41,6 +41,7 @@ mod rig_adapter;
 pub mod runtime;
 pub mod session;
 pub mod smart_routing;
+pub mod subject_keys;
 mod token_refreshing;
 // arch-exempt: scaffolding, Phase A helpers awaiting first per-provider caller, plan #4522
 // Remove the allow once any production call site references these items.
@@ -63,8 +64,8 @@ pub mod vision_models;
 
 pub use circuit_breaker::{CircuitBreakerConfig, CircuitBreakerProvider};
 pub use config::{
-    BedrockConfig, CacheRetention, GeminiOauthConfig, LlmBackendKind, LlmConfig, NearAiConfig,
-    OAUTH_PLACEHOLDER, OpenAiCodexConfig, RegistryProviderConfig,
+    AnthropicAuthMode, BedrockConfig, CacheRetention, GeminiOauthConfig, LlmBackendKind, LlmConfig,
+    NearAiConfig, OAUTH_PLACEHOLDER, OpenAiCodexConfig, RegistryProviderConfig,
 };
 pub use dual_model::DualModelRouter;
 pub use error::{LlmConfigError, LlmError, UNCONFIGURED_PROVIDER_ID};
@@ -112,6 +113,9 @@ pub use rig_adapter::RigAdapter;
 pub use runtime::{LlmReloadHandle, SwappableLlmProvider};
 pub use session::{NearWalletSignedMessage, SessionConfig, SessionManager, create_session_manager};
 pub use smart_routing::{SmartRoutingConfig, SmartRoutingProvider, TaskComplexity};
+pub use subject_keys::{
+    SubjectKeyPolicy, SubjectKeyResolveError, SubjectKeyResolver, register_subject_key_resolver,
+};
 pub use token_refreshing::TokenRefreshingProvider;
 
 #[cfg(feature = "registry-provider-factory")]
@@ -451,30 +455,82 @@ fn create_openai_compat_from_registry(
     };
     let adapter = RigAdapter::new(model, &config.model)
         .with_unsupported_params(config.unsupported_params.clone())
+        .with_default_max_tokens(config.max_tokens)
         .with_model_listing(models_endpoint);
     Ok(Arc::new(adapter))
+}
+
+/// Which client implementation serves an Anthropic-protocol provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnthropicRoute {
+    /// `AnthropicOAuthProvider` — Bearer auth, tolerant `max_tokens` fallback.
+    OAuth,
+    /// rig-core Anthropic client — `x-api-key` auth.
+    Rig,
+}
+
+/// Decide the Anthropic client implementation for a resolved provider config.
+///
+/// Explicit `auth_mode` wins. Without it, the legacy implicit routing keeps
+/// working: OAuth is used iff an `oauth_token` is present AND (`api_key` is
+/// absent or the [`crate::config::OAUTH_PLACEHOLDER`] sentinel). Filling a
+/// real key into `api_key` therefore still reroutes to the rig-core path —
+/// but that path now carries a `max_tokens` fallback (see
+/// [`RigAdapter::with_default_max_tokens`]), so the request no longer dies
+/// client-side. Both misconfigurations fail with a self-explaining reason
+/// instead of a downstream "`max_tokens` must be set" riddle.
+fn route_anthropic(config: &RegistryProviderConfig) -> Result<AnthropicRoute, LlmError> {
+    let api_key_is_placeholder = config
+        .api_key
+        .as_ref()
+        .is_some_and(|k| k.expose_secret() == crate::config::OAUTH_PLACEHOLDER);
+    match config.auth_mode {
+        Some(crate::config::AnthropicAuthMode::Bearer) => {
+            if config.oauth_token.is_none() {
+                return Err(LlmError::RequestFailed {
+                    provider: config.provider_id.clone(),
+                    reason: "auth_mode=bearer requires an OAuth token (ANTHROPIC_OAUTH_TOKEN); \
+                             remove auth_mode or set the token"
+                        .to_string(),
+                });
+            }
+            Ok(AnthropicRoute::OAuth)
+        }
+        Some(crate::config::AnthropicAuthMode::XApiKey) => {
+            if config.api_key.is_none() || api_key_is_placeholder {
+                return Err(LlmError::RequestFailed {
+                    provider: config.provider_id.clone(),
+                    reason: "auth_mode=x-api-key requires a real api_key; \
+                             the 'oauth-placeholder' sentinel is a routing marker, not a key"
+                        .to_string(),
+                });
+            }
+            Ok(AnthropicRoute::Rig)
+        }
+        None => {
+            if config.oauth_token.is_some() && (config.api_key.is_none() || api_key_is_placeholder)
+            {
+                Ok(AnthropicRoute::OAuth)
+            } else {
+                Ok(AnthropicRoute::Rig)
+            }
+        }
+    }
 }
 
 fn create_anthropic_from_registry(
     config: &RegistryProviderConfig,
     request_timeout_secs: u64,
 ) -> Result<Arc<dyn LlmProvider>, LlmError> {
-    // Route to OAuth provider when an OAuth token is present and no real API
-    // key was provided. When both are set, the API key takes priority (standard
-    // x-api-key auth via rig-core).
-    let api_key_is_placeholder = config
-        .api_key
-        .as_ref()
-        .is_some_and(|k| k.expose_secret() == crate::config::OAUTH_PLACEHOLDER);
-    if config.oauth_token.is_some() && (config.api_key.is_none() || api_key_is_placeholder) {
+    if route_anthropic(config)? == AnthropicRoute::OAuth {
         tracing::debug!(
             provider = %config.provider_id,
             model = %config.model,
+            auth_mode = ?config.auth_mode,
             base_url = if config.base_url.is_empty() { "default" } else { &config.base_url },
             "Using Anthropic OAuth API"
         );
-        let provider =
-            anthropic_oauth::AnthropicOAuthProvider::new(config, request_timeout_secs)?;
+        let provider = anthropic_oauth::AnthropicOAuthProvider::new(config, request_timeout_secs)?;
         return Ok(Arc::new(provider));
     }
 
@@ -556,6 +612,15 @@ fn create_anthropic_from_registry(
         RigAdapter::new(model, &config.model)
             .with_cache_retention(cache_retention)
             .with_unsupported_params(config.unsupported_params.clone())
+            // rig-core's Anthropic client hard-fails client-side without
+            // max_tokens (the request never leaves the process); fall back to
+            // the same default the OAuth path uses so a configured real key
+            // can never strand the turn on a client-side validation error.
+            .with_default_max_tokens(Some(
+                config
+                    .max_tokens
+                    .unwrap_or(anthropic_oauth::DEFAULT_MAX_TOKENS),
+            ))
             .with_model_listing(models_endpoint),
     ))
 }
@@ -606,6 +671,7 @@ fn create_ollama_from_registry(
 
     let mut adapter = RigAdapter::new(model, &config.model)
         .with_unsupported_params(config.unsupported_params.clone())
+        .with_default_max_tokens(config.max_tokens)
         .with_model_listing(models_endpoint);
     // Ollama's /api/chat enables extended reasoning via `think: true`, but
     // rejects that parameter with HTTP 400 ("does not support thinking") for
@@ -670,6 +736,7 @@ fn create_deepseek_from_registry(
     Ok(Arc::new(
         RigAdapter::new(model, &config.model)
             .with_unsupported_params(config.unsupported_params.clone())
+            .with_default_max_tokens(config.max_tokens)
             .with_discard_reasoning(),
     ))
 }
@@ -761,7 +828,8 @@ fn create_openrouter_from_registry(
 
     Ok(Arc::new(
         RigAdapter::new(model, &config.model)
-            .with_unsupported_params(config.unsupported_params.clone()),
+            .with_unsupported_params(config.unsupported_params.clone())
+            .with_default_max_tokens(config.max_tokens),
     ))
 }
 
@@ -825,7 +893,8 @@ fn create_gemini_from_registry(
 
     Ok(Arc::new(
         RigAdapter::new(model, &config.model)
-            .with_unsupported_params(config.unsupported_params.clone()),
+            .with_unsupported_params(config.unsupported_params.clone())
+            .with_default_max_tokens(config.max_tokens),
     ))
 }
 
@@ -1866,5 +1935,97 @@ mod tests {
              (60 s) is being used, `create_registry_provider_inner` is not \
              forwarding `request_timeout_secs` to `provider_http_client`.",
         );
+    }
+    // -- ISSUE-IRONCLAW-007: anthropic provider routing --
+
+    fn anthropic_registry_config() -> RegistryProviderConfig {
+        RegistryProviderConfig::generic(
+            crate::registry::ProviderProtocol::Anthropic,
+            "anthropic",
+            None,
+            "http://localhost:0",
+            "test-model",
+        )
+    }
+
+    #[test]
+    fn route_anthropic_explicit_bearer_requires_oauth_token() {
+        let config = anthropic_registry_config()
+            .with_auth_mode(Some(crate::config::AnthropicAuthMode::Bearer));
+        let err = route_anthropic(&config).expect_err("bearer without token must fail");
+        match err {
+            LlmError::RequestFailed { reason, .. } => {
+                assert!(
+                    reason.contains("ANTHROPIC_OAUTH_TOKEN"),
+                    "error must name the missing token env: {reason}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_anthropic_explicit_bearer_with_token_routes_oauth() {
+        let mut config = anthropic_registry_config()
+            .with_auth_mode(Some(crate::config::AnthropicAuthMode::Bearer));
+        config.oauth_token = Some(secrecy::SecretString::from("real-oauth-token"));
+        // A real key in api_key must NOT reroute away from an explicit bearer choice.
+        config.api_key = Some(secrecy::SecretString::from("sk-real-distribution-key"));
+        assert_eq!(route_anthropic(&config).unwrap(), AnthropicRoute::OAuth);
+    }
+
+    #[test]
+    fn route_anthropic_explicit_x_api_key_rejects_placeholder() {
+        let mut config = anthropic_registry_config()
+            .with_auth_mode(Some(crate::config::AnthropicAuthMode::XApiKey));
+        config.api_key = Some(secrecy::SecretString::from(
+            crate::config::OAUTH_PLACEHOLDER,
+        ));
+        let err = route_anthropic(&config).expect_err("placeholder is not a real key");
+        match err {
+            LlmError::RequestFailed { reason, .. } => {
+                assert!(
+                    reason.contains("oauth-placeholder"),
+                    "error must explain the sentinel: {reason}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_anthropic_explicit_x_api_key_with_real_key_routes_rig() {
+        let mut config = anthropic_registry_config()
+            .with_auth_mode(Some(crate::config::AnthropicAuthMode::XApiKey));
+        config.api_key = Some(secrecy::SecretString::from("sk-real"));
+        assert_eq!(route_anthropic(&config).unwrap(), AnthropicRoute::Rig);
+    }
+
+    #[test]
+    fn route_anthropic_legacy_placeholder_semantics_preserved() {
+        // token + placeholder api_key (the current TianQuan production shape) → OAuth
+        let mut config = anthropic_registry_config();
+        config.oauth_token = Some(secrecy::SecretString::from("real-oauth-token"));
+        config.api_key = Some(secrecy::SecretString::from(
+            crate::config::OAUTH_PLACEHOLDER,
+        ));
+        assert_eq!(route_anthropic(&config).unwrap(), AnthropicRoute::OAuth);
+
+        // token + no api_key → OAuth
+        let mut config = anthropic_registry_config();
+        config.oauth_token = Some(secrecy::SecretString::from("real-oauth-token"));
+        assert_eq!(route_anthropic(&config).unwrap(), AnthropicRoute::OAuth);
+
+        // token + REAL api_key → rig (legacy implicit reroute, now backed by
+        // the max_tokens fallback instead of a client-side hard failure)
+        let mut config = anthropic_registry_config();
+        config.oauth_token = Some(secrecy::SecretString::from("real-oauth-token"));
+        config.api_key = Some(secrecy::SecretString::from("sk-real"));
+        assert_eq!(route_anthropic(&config).unwrap(), AnthropicRoute::Rig);
+
+        // no token + real api_key → rig
+        let mut config = anthropic_registry_config();
+        config.api_key = Some(secrecy::SecretString::from("sk-real"));
+        assert_eq!(route_anthropic(&config).unwrap(), AnthropicRoute::Rig);
     }
 }

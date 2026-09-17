@@ -161,6 +161,15 @@ pub struct WebUiSendMessageRequest {
     /// selection". `None` for clients that don't pick a model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Server-to-server identity label for per-user LLM key resolution
+    /// (ISSUE-IRONCLAW-008). Only the *label* crosses the wire — the key value
+    /// is resolved server-side from the LLM key store, never transmitted.
+    /// `serde(default)` keeps pre-008 callers (and the standalone webui, which
+    /// never sets it) working unchanged; when the deployment enables the
+    /// subject-required switch, an absent label is rejected downstream rather
+    /// than falling back to the shared process key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_subject: Option<String>,
 }
 
 impl WebUiSendMessageRequest {
@@ -439,6 +448,10 @@ pub enum WebUiInboundCommand {
         /// Normalized caller-requested model hint (`"default"`/empty already
         /// dropped to `None`). Set on the submitted turn's `requested_model`.
         requested_model: Option<String>,
+        /// Normalized LLM identity label (empty/whitespace dropped to `None`).
+        /// Carried to the turn so the model gateway can resolve a per-subject
+        /// key (ISSUE-IRONCLAW-008).
+        llm_subject: Option<String>,
     },
     CancelRun {
         request: CancelRunRequest,
@@ -501,6 +514,12 @@ impl WebUiSendMessageRequest {
                 .model
                 .as_deref()
                 .and_then(ironclaw_common::model_selection::requested_model_hint),
+            llm_subject: self
+                .llm_subject
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
         })
     }
 }

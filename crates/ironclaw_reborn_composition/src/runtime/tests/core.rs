@@ -1490,6 +1490,7 @@ fn nearai_gateway_test_request() -> HostManagedModelRequest {
         resolved_model_route: None,
         run_id: TurnRunId::new(),
         turn_id: TurnId::new(),
+        llm_subject: None,
     }
 }
 
@@ -3577,6 +3578,7 @@ async fn cancel_run_propagates_to_subagent_children() {
             subagent_depth: 0,
             spawn_tree_root_run_id: None,
             product_context: None,
+            llm_subject: None,
         })
         .await
         .expect("parent submitted");
@@ -4909,6 +4911,7 @@ async fn local_dev_runtime_webui_bundle_reuses_thread_and_turn_facades() {
                 content: Some("hello webui stream".to_string()),
                 attachments: Vec::new(),
                 model: None,
+                llm_subject: None,
             },
         )
         .await
@@ -6039,6 +6042,7 @@ async fn local_dev_webui_spawn_approval_emits_redacted_audit_and_grants_process(
             subagent_depth: 0,
             spawn_tree_root_run_id: None,
             product_context: None,
+            llm_subject: None,
         })
         .await
         .expect("submit turn");
@@ -6257,6 +6261,7 @@ async fn local_dev_webui_bundle_records_selectable_filesystem_skill_context() {
                 content: Some("$webui-helper please help".to_string()),
                 attachments: Vec::new(),
                 model: None,
+                llm_subject: None,
             },
         )
         .await
@@ -6627,6 +6632,7 @@ async fn rejected_busy_message_not_auto_resubmitted_after_run_cancellation() {
             subagent_depth: 0,
             spawn_tree_root_run_id: None,
             product_context: None,
+            llm_subject: None,
         })
         .await
         .expect("message A submitted");
@@ -6645,6 +6651,7 @@ async fn rejected_busy_message_not_auto_resubmitted_after_run_cancellation() {
                 content: Some("message B while thread is busy".to_string()),
                 attachments: Vec::new(),
                 model: None,
+                llm_subject: None,
             },
         )
         .await
@@ -6756,6 +6763,7 @@ async fn rejected_busy_message_not_auto_resubmitted_after_run_cancellation() {
                 content: Some("message C after thread is free".to_string()),
                 attachments: Vec::new(),
                 model: None,
+                llm_subject: None,
             },
         )
         .await

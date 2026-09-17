@@ -67,6 +67,7 @@ fn send_message_maps_body_to_turn_scope_actor_and_content() {
         client_action_id,
         content,
         requested_model,
+        llm_subject,
     } = command
     else {
         panic!("expected send-message command");
@@ -78,8 +79,47 @@ fn send_message_maps_body_to_turn_scope_actor_and_content() {
     assert_eq!(actor.user_id.as_str(), "user-alpha");
     assert_eq!(client_action_id.as_str(), "send-1");
     assert_eq!(content, "hello\nworld");
-    // No `model` in the request → no requested-model hint.
+    // No `model`/`llm_subject` in the legacy request: both stay absent.
     assert_eq!(requested_model, None);
+    assert_eq!(llm_subject, None);
+}
+
+#[test]
+fn send_message_carries_normalized_llm_subject_without_a_key() {
+    let request: WebUiSendMessageRequest = serde_json::from_value(json!({
+        "client_action_id": "send-subject",
+        "thread_id": "thread-alpha",
+        "content": "hello",
+        "llm_subject": "  tq-user-42  "
+    }))
+    .expect("request json");
+
+    let WebUiInboundCommand::SendMessage { llm_subject, .. } =
+        request.into_command(caller()).expect("valid command")
+    else {
+        panic!("expected send-message command");
+    };
+    assert_eq!(llm_subject.as_deref(), Some("tq-user-42"));
+}
+
+#[test]
+fn send_message_drops_blank_llm_subject() {
+    for blank in ["", "   ", "\t\n"] {
+        let request = WebUiSendMessageRequest {
+            client_action_id: Some("send-blank-subject".to_string()),
+            thread_id: Some("thread-alpha".to_string()),
+            content: Some("hello".to_string()),
+            attachments: Vec::new(),
+            model: None,
+            llm_subject: Some(blank.to_string()),
+        };
+        let WebUiInboundCommand::SendMessage { llm_subject, .. } =
+            request.into_command(caller()).expect("valid command")
+        else {
+            panic!("expected send-message command");
+        };
+        assert_eq!(llm_subject, None, "blank subject {blank:?} must drop");
+    }
 }
 
 #[test]
@@ -91,6 +131,7 @@ fn send_message_carries_requested_model_and_drops_default_alias() {
         content: Some("hi".to_string()),
         attachments: Vec::new(),
         model: Some("gpt-4o".to_string()),
+        llm_subject: None,
     };
     let WebUiInboundCommand::SendMessage {
         requested_model, ..
@@ -109,6 +150,7 @@ fn send_message_carries_requested_model_and_drops_default_alias() {
             content: Some("hi".to_string()),
             attachments: Vec::new(),
             model: Some(alias.to_string()),
+            llm_subject: None,
         };
         let WebUiInboundCommand::SendMessage {
             requested_model, ..
@@ -338,6 +380,7 @@ fn command_serializes_with_stable_command_tag() {
         content: Some("hello".to_string()),
         attachments: Vec::new(),
         model: None,
+        llm_subject: None,
     };
     let command = request.into_command(caller()).expect("valid command");
 
@@ -356,6 +399,7 @@ fn token_fields_reject_control_characters() {
         content: Some("hello".to_string()),
         attachments: Vec::new(),
         model: None,
+        llm_subject: None,
     };
 
     let err = request.into_command(caller()).expect_err("control char");
@@ -440,6 +484,7 @@ fn send_with_attachments(attachments: Vec<WebUiInboundAttachment>) -> WebUiSendM
         content: Some("see attached".to_string()),
         attachments,
         model: None,
+        llm_subject: None,
     }
 }
 

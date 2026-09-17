@@ -30,8 +30,9 @@ use ironclaw_llm::{
 use ironclaw_product_workflow::{
     CodexLoginStart, LlmActiveSelection, LlmConfigService, LlmConfigServiceError,
     LlmConfigSnapshot, LlmModelsResult, LlmProbeRequest, LlmProbeResult, LlmProviderView,
-    NearAiLoginRequest, NearAiLoginStart, NearAiWalletLoginRequest, NearAiWalletLoginResult,
-    SetActiveLlmRequest, UpsertLlmProviderRequest, WebUiAuthenticatedCaller,
+    LlmSubjectKeyPutRequest, LlmSubjectKeyStatus, NearAiLoginRequest, NearAiLoginStart,
+    NearAiWalletLoginRequest, NearAiWalletLoginResult, SetActiveLlmRequest,
+    UpsertLlmProviderRequest, WebUiAuthenticatedCaller,
 };
 use ironclaw_reborn_config::{LlmSlotSelection, RebornBootConfig};
 use secrecy::{ExposeSecret as _, SecretString};
@@ -368,6 +369,8 @@ impl RebornLlmConfigService {
                 .filter(|model| !model.trim().is_empty()),
             api_key_env: None,
             base_url,
+            auth_mode: None,
+            max_tokens: None,
         };
         let mut config = resolve_against_registry(&selection, &registry).map_err(|error| {
             LlmConfigServiceError::InvalidRequest {
@@ -516,6 +519,78 @@ impl RebornLlmConfigService {
 
 #[async_trait]
 impl LlmConfigService for RebornLlmConfigService {
+    async fn put_subject_key(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        request: LlmSubjectKeyPutRequest,
+    ) -> Result<LlmSubjectKeyStatus, LlmConfigServiceError> {
+        let subject = validate_subject(&request.subject)?;
+        let provider_id = validate_provider_id(&request.provider_id)?;
+        self.keys
+            .put_subject_key(
+                &subject,
+                &provider_id,
+                ironclaw_secrets::SecretMaterial::from(
+                    request.key.expose_secret().to_string(),
+                ),
+            )
+            .await
+            .map_err(|error| {
+                tracing::error!(provider_id = %provider_id, %error, "storing subject LLM key failed");
+                LlmConfigServiceError::Unavailable
+            })?;
+        Ok(LlmSubjectKeyStatus {
+            subject,
+            provider_id,
+            key_set: true,
+        })
+    }
+
+    async fn get_subject_key_status(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        subject: String,
+        provider_id: String,
+    ) -> Result<LlmSubjectKeyStatus, LlmConfigServiceError> {
+        let subject = validate_subject(&subject)?;
+        let provider_id = validate_provider_id(&provider_id)?;
+        let key_set = self
+            .keys
+            .subject_key_exists(&subject, &provider_id)
+            .await
+            .map_err(|error| {
+                tracing::error!(provider_id = %provider_id, %error, "checking subject LLM key failed");
+                LlmConfigServiceError::Unavailable
+            })?;
+        Ok(LlmSubjectKeyStatus {
+            subject,
+            provider_id,
+            key_set,
+        })
+    }
+
+    async fn delete_subject_key(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        subject: String,
+        provider_id: String,
+    ) -> Result<LlmSubjectKeyStatus, LlmConfigServiceError> {
+        let subject = validate_subject(&subject)?;
+        let provider_id = validate_provider_id(&provider_id)?;
+        self.keys
+            .delete_subject_key(&subject, &provider_id)
+            .await
+            .map_err(|error| {
+                tracing::error!(provider_id = %provider_id, %error, "deleting subject LLM key failed");
+                LlmConfigServiceError::Unavailable
+            })?;
+        Ok(LlmSubjectKeyStatus {
+            subject,
+            provider_id,
+            key_set: false,
+        })
+    }
+
     async fn snapshot(
         &self,
         _caller: WebUiAuthenticatedCaller,
@@ -1121,6 +1196,8 @@ pub(crate) async fn probe_candidate_provider(
             .filter(|model| !model.trim().is_empty()),
         api_key_env: None,
         base_url,
+        auth_mode: None,
+        max_tokens: None,
     };
     let mut config = match resolve_against_registry(&selection, &registry) {
         Ok(config) => config,
@@ -1290,6 +1367,17 @@ fn synthetic_model_env(id: &str) -> String {
 /// The masked sentinel the UI sends for "key unchanged".
 fn is_masked_sentinel(value: &SecretString) -> bool {
     value.expose_secret().chars().all(|c| c == '\u{2022}')
+}
+
+fn validate_subject(subject: &str) -> Result<String, LlmConfigServiceError> {
+    let trimmed = subject.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 || trimmed.chars().any(char::is_control) {
+        return Err(LlmConfigServiceError::InvalidRequest {
+            field: Some("subject".to_string()),
+            reason: "subject must be 1-128 bytes without control characters".to_string(),
+        });
+    }
+    Ok(trimmed.to_string())
 }
 
 fn validate_provider_id(id: &str) -> Result<String, LlmConfigServiceError> {

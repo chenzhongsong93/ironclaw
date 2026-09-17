@@ -174,6 +174,7 @@ fn test_run_state(status: TurnStatus) -> TurnRunState {
         event_cursor: EventCursor(1),
         product_context: None,
         resume_disposition: None,
+        llm_subject: None,
     }
 }
 

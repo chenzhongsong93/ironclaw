@@ -476,6 +476,27 @@ pub(crate) fn build_llm_config_service(
 ) -> Option<Arc<dyn ironclaw_product_workflow::LlmConfigService>> {
     let boot = runtime.webui_boot_config()?;
     let keys = crate::LlmKeyStore::new(runtime.services().secret_store());
+    let config_subject_required =
+        ironclaw_reborn_config::RebornConfigFile::load(&boot.home().config_file_path())
+            .ok()
+            .flatten()
+            .and_then(|config| config.llm_subject_required)
+            .unwrap_or(false);
+    let subject_required = std::env::var("IRONCLAW_LLM_SUBJECT_REQUIRED")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(config_subject_required);
+    ironclaw_llm::register_subject_key_resolver(
+        Arc::new(keys.clone()),
+        ironclaw_llm::SubjectKeyPolicy {
+            required: subject_required,
+        },
+    );
     let mut llm_config = crate::RebornLlmConfigService::new(boot.clone(), keys);
     if let Some(reload) = runtime.webui_llm_reload_trigger() {
         llm_config = llm_config.with_reload_trigger(reload);

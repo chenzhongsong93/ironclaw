@@ -11,8 +11,8 @@ use secrecy::SecretString;
 
 use crate::auth::{self, CredentialSource};
 use crate::config::{
-    BedrockConfig, CacheRetention, GeminiOauthConfig, LlmConfig, NearAiConfig, OAUTH_PLACEHOLDER,
-    OpenAiCodexConfig, RegistryProviderConfig,
+    AnthropicAuthMode, BedrockConfig, CacheRetention, GeminiOauthConfig, LlmConfig, NearAiConfig,
+    OAUTH_PLACEHOLDER, OpenAiCodexConfig, RegistryProviderConfig,
 };
 use crate::error::{LlmConfigError, LlmError};
 use crate::registry::{ProviderDefinition, ProviderProtocol, ProviderRegistry};
@@ -77,6 +77,12 @@ pub struct ProviderSelection {
     pub api_key_env: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    /// Explicit Anthropic auth-mode override (`"bearer"` / `"x-api-key"`).
+    /// Parsed into [`crate::config::AnthropicAuthMode`] during resolution;
+    /// `None` keeps the legacy placeholder-sentinel routing.
+    pub auth_mode: Option<String>,
+    /// Default `max_tokens` applied when a request leaves it unset.
+    pub max_tokens: Option<u32>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -165,6 +171,8 @@ pub fn resolve_provider_config_from_selection(
         selection.api_key_env.as_deref(),
         selection.base_url,
         selection.model,
+        selection.auth_mode.as_deref(),
+        selection.max_tokens,
         false,
     )
 }
@@ -280,7 +288,7 @@ pub fn build_registry_provider_config_from_resolved_provider(
 fn resolve_provider_definition_from_env(
     provider: &ProviderDefinition,
 ) -> Result<ResolvedProviderConfig, LlmError> {
-    resolve_provider_definition(provider, None, None, None, true)
+    resolve_provider_definition(provider, None, None, None, None, None, true)
         .map_err(ProviderResolutionError::into_llm_error)
 }
 
@@ -289,6 +297,8 @@ fn resolve_provider_definition(
     api_key_env_override: Option<&str>,
     base_url_override: Option<String>,
     model_override: Option<String>,
+    auth_mode_override: Option<&str>,
+    max_tokens_override: Option<u32>,
     allow_llm_model_fallback: bool,
 ) -> Result<ResolvedProviderConfig, ProviderResolutionError> {
     let api_key_env = api_key_env_override.or(provider.api_key_env.as_deref());
@@ -360,6 +370,22 @@ fn resolve_provider_definition(
         .with_extra_headers(extra_headers)
         .with_unsupported_params(provider.unsupported_params.clone());
         apply_registry_provider_env(&mut config).map_err(ProviderResolutionError::Llm)?;
+        // Selection-level overrides win over the ambient env fallbacks applied
+        // above — same precedence rule as model/base_url (the operator's
+        // explicit config.toml choice must not be silently overridden by env).
+        if let Some(auth_mode) = auth_mode_override {
+            let parsed: AnthropicAuthMode =
+                auth_mode
+                    .parse()
+                    .map_err(|reason| LlmError::RequestFailed {
+                        provider: config.provider_id.clone(),
+                        reason,
+                    })?;
+            config.auth_mode = Some(parsed);
+        }
+        if let Some(max_tokens) = max_tokens_override {
+            config.max_tokens = Some(max_tokens);
+        }
         Ok(ResolvedProviderConfig::Registry(config))
     } else {
         Ok(ResolvedProviderConfig::Dedicated(resolved))
@@ -419,6 +445,28 @@ fn apply_registry_provider_env(config: &mut RegistryProviderConfig) -> Result<()
             })
             .transpose()?
             .unwrap_or_default();
+
+        if let Some(auth_mode) = nonempty_env("ANTHROPIC_AUTH_MODE") {
+            config.auth_mode =
+                Some(
+                    auth_mode
+                        .parse()
+                        .map_err(|reason| LlmError::RequestFailed {
+                            provider: config.provider_id.clone(),
+                            reason: format!("invalid ANTHROPIC_AUTH_MODE: {reason}"),
+                        })?,
+                );
+        }
+        if let Some(max_tokens) = nonempty_env("ANTHROPIC_MAX_TOKENS") {
+            config.max_tokens = Some(max_tokens.parse::<u32>().map_err(|_| {
+                LlmError::RequestFailed {
+                    provider: config.provider_id.clone(),
+                    reason: format!(
+                        "invalid ANTHROPIC_MAX_TOKENS '{max_tokens}': expected a positive integer"
+                    ),
+                }
+            })?);
+        }
 
         if let Some(token) = nonempty_env("ANTHROPIC_OAUTH_TOKEN") {
             config.oauth_token = Some(SecretString::from(token));
@@ -923,6 +971,8 @@ mod tests {
                 api_key_env: None,
                 base_url: Some("https://cloud-api.near.ai".to_string()),
                 model: Some("deepseek-ai/DeepSeek-V4-Flash".to_string()),
+                auth_mode: None,
+                max_tokens: None,
             },
             &registry,
         )
@@ -955,5 +1005,152 @@ mod tests {
         };
         assert_eq!(dedicated.model, "Qwen/Qwen3.5-122B-A10B");
         assert_eq!(dedicated.base_url, "https://private.near.ai");
+    }
+    // -- ISSUE-IRONCLAW-007: selection-level auth_mode / max_tokens --
+
+    fn anthropic_test_definition() -> crate::registry::ProviderDefinition {
+        crate::registry::ProviderDefinition {
+            id: "anthropic".to_string(),
+            aliases: Vec::new(),
+            protocol: crate::registry::ProviderProtocol::Anthropic,
+            default_base_url: Some("https://api.anthropic.com".to_string()),
+            base_url_env: None,
+            base_url_required: false,
+            api_key_env: Some("TEST_ANTHROPIC_KEY".to_string()),
+            api_key_required: true,
+            model_env: "TEST_ANTHROPIC_MODEL".to_string(),
+            default_model: "claude-test".to_string(),
+            description: "test".to_string(),
+            extra_headers_env: None,
+            unsupported_params: Vec::new(),
+            setup: None,
+        }
+    }
+
+    const AUTH_SELECTION_ENV_VARS: &[&str] = &[
+        "TEST_ANTHROPIC_KEY",
+        "ANTHROPIC_AUTH_MODE",
+        "ANTHROPIC_MAX_TOKENS",
+        "ANTHROPIC_OAUTH_TOKEN",
+        "ANTHROPIC_CACHE_RETENTION",
+    ];
+
+    #[test]
+    fn selection_auth_mode_and_max_tokens_reach_registry_config() {
+        let _env_lock = ironclaw_common::env_helpers::lock_env();
+        let env = EnvGuard::clear(AUTH_SELECTION_ENV_VARS);
+        env.set("TEST_ANTHROPIC_KEY", "sk-test");
+
+        let registry = ProviderRegistry::new(vec![anthropic_test_definition()]);
+        let resolved = resolve_provider_config_from_selection(
+            ProviderSelection {
+                provider_id: "anthropic".to_string(),
+                api_key_env: None,
+                base_url: Some("http://llm-router:3000".to_string()),
+                model: Some("deepseek-v4-flash".to_string()),
+                auth_mode: Some("bearer".to_string()),
+                max_tokens: Some(65536),
+            },
+            &registry,
+        )
+        .expect("selection should resolve");
+
+        let ResolvedProviderConfig::Registry(config) = resolved else {
+            panic!("anthropic must resolve as a registry provider config");
+        };
+        assert_eq!(
+            config.auth_mode,
+            Some(crate::config::AnthropicAuthMode::Bearer)
+        );
+        assert_eq!(config.max_tokens, Some(65536));
+    }
+
+    #[test]
+    fn selection_invalid_auth_mode_fails_with_guidance() {
+        let _env_lock = ironclaw_common::env_helpers::lock_env();
+        let env = EnvGuard::clear(AUTH_SELECTION_ENV_VARS);
+        env.set("TEST_ANTHROPIC_KEY", "sk-test");
+
+        let registry = ProviderRegistry::new(vec![anthropic_test_definition()]);
+        let err = resolve_provider_config_from_selection(
+            ProviderSelection {
+                provider_id: "anthropic".to_string(),
+                api_key_env: None,
+                base_url: None,
+                model: None,
+                auth_mode: Some("oauth2".to_string()),
+                max_tokens: None,
+            },
+            &registry,
+        )
+        .expect_err("invalid auth_mode must fail resolution");
+        let message = err.into_llm_error().to_string();
+        assert!(
+            message.contains("bearer") && message.contains("x-api-key"),
+            "error must name the valid values: {message}"
+        );
+    }
+
+    #[test]
+    fn env_auth_mode_and_max_tokens_apply_when_selection_silent() {
+        let _env_lock = ironclaw_common::env_helpers::lock_env();
+        let env = EnvGuard::clear(AUTH_SELECTION_ENV_VARS);
+        env.set("TEST_ANTHROPIC_KEY", "sk-test");
+        env.set("ANTHROPIC_AUTH_MODE", "x-api-key");
+        env.set("ANTHROPIC_MAX_TOKENS", "8192");
+
+        let registry = ProviderRegistry::new(vec![anthropic_test_definition()]);
+        let resolved = resolve_provider_config_from_selection(
+            ProviderSelection {
+                provider_id: "anthropic".to_string(),
+                api_key_env: None,
+                base_url: None,
+                model: None,
+                auth_mode: None,
+                max_tokens: None,
+            },
+            &registry,
+        )
+        .expect("selection should resolve");
+
+        let ResolvedProviderConfig::Registry(config) = resolved else {
+            panic!("anthropic must resolve as a registry provider config");
+        };
+        assert_eq!(
+            config.auth_mode,
+            Some(crate::config::AnthropicAuthMode::XApiKey)
+        );
+        assert_eq!(config.max_tokens, Some(8192));
+    }
+
+    #[test]
+    fn selection_max_tokens_overrides_env() {
+        let _env_lock = ironclaw_common::env_helpers::lock_env();
+        let env = EnvGuard::clear(AUTH_SELECTION_ENV_VARS);
+        env.set("TEST_ANTHROPIC_KEY", "sk-test");
+        env.set("ANTHROPIC_MAX_TOKENS", "8192");
+
+        let registry = ProviderRegistry::new(vec![anthropic_test_definition()]);
+        let resolved = resolve_provider_config_from_selection(
+            ProviderSelection {
+                provider_id: "anthropic".to_string(),
+                api_key_env: None,
+                base_url: None,
+                model: None,
+                auth_mode: None,
+                max_tokens: Some(65536),
+            },
+            &registry,
+        )
+        .expect("selection should resolve");
+
+        let ResolvedProviderConfig::Registry(config) = resolved else {
+            panic!("anthropic must resolve as a registry provider config");
+        };
+        assert_eq!(
+            config.max_tokens,
+            Some(65536),
+            "selection must win over env (same precedence as model/base_url)"
+        );
     }
 }

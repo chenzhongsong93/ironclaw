@@ -101,6 +101,14 @@ pub struct TurnLifecycleEvent {
     /// do not expose it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Cumulative model token usage reported by the loop, copied from the run
+    /// record at emission time. Present once the terminal transition has
+    /// persisted usage (typically on `Completed`/`Failed`). Same serde shape
+    /// as the other optional fields: persisted pre-usage event rows rehydrate
+    /// as `None` without migration. Downstream billing consumers (e.g. the
+    /// webchat v2 `turn_cost` frame, ISSUE-IRONCLAW-006) key off this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_usage: Option<crate::run_profile::LoopModelUsage>,
 }
 
 impl TurnLifecycleEvent {
@@ -147,6 +155,7 @@ impl TurnLifecycleEvent {
             sanitized_reason,
             retryable,
             detail,
+            model_usage: state.model_usage,
         }
     }
 
@@ -581,6 +590,7 @@ mod tests {
             sanitized_reason: Some("approval_required".to_string()),
             retryable: None,
             detail: None,
+            model_usage: None,
         }
     }
 
@@ -698,6 +708,7 @@ mod tests {
             failure: None,
             event_cursor: EventCursor(1),
             product_context: None,
+            llm_subject: None,
             resume_disposition: None,
         };
 
@@ -742,6 +753,7 @@ mod tests {
             ),
             event_cursor: EventCursor(1),
             product_context: None,
+            llm_subject: None,
             resume_disposition: None,
         };
 
@@ -930,5 +942,77 @@ mod tests {
             snapshot.entries[0].owner_user_id,
             Some(UserId::new("owner-a").expect("owner"))
         );
+    }
+    #[test]
+    fn lifecycle_event_from_run_state_carries_terminal_model_usage() {
+        // ISSUE-IRONCLAW-006: usage persisted on the terminal transition must
+        // ride the lifecycle event so the billing projection can emit
+        // turn_cost without re-reading the run state.
+        let state = TurnRunState {
+            scope: scope("thread-usage"),
+            actor: Some(TurnActor::new(UserId::new("user:actor").expect("actor"))),
+            turn_id: TurnId::new(),
+            run_id: TurnRunId::new(),
+            status: TurnStatus::Completed,
+            accepted_message_ref: AcceptedMessageRef::new("accepted-a").expect("accepted ref"),
+            source_binding_ref: SourceBindingRef::new("source-a").expect("source ref"),
+            reply_target_binding_ref: ReplyTargetBindingRef::new("reply-a").expect("reply ref"),
+            resolved_run_profile_id: RunProfileId::default_profile(),
+            resolved_run_profile_version: RunProfileVersion::new(1),
+            resolved_model_route: None,
+            model_usage: Some(crate::run_profile::LoopModelUsage {
+                input_tokens: 1234,
+                output_tokens: 567,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            }),
+            received_at: chrono::Utc::now(),
+            checkpoint_id: None,
+            gate_ref: None,
+            blocked_activity_id: None,
+            credential_requirements: Vec::new(),
+            failure: None,
+            event_cursor: EventCursor(9),
+            product_context: None,
+            resume_disposition: None,
+            llm_subject: None,
+        };
+
+        let event = TurnLifecycleEvent::from_run_state(&state, TurnEventKind::Completed, None);
+
+        let usage = event.model_usage.expect("terminal event carries usage");
+        assert_eq!(usage.input_tokens, 1234);
+        assert_eq!(usage.output_tokens, 567);
+    }
+
+    #[test]
+    fn lifecycle_event_legacy_row_without_model_usage_round_trips() {
+        // Rows persisted before ISSUE-IRONCLAW-006 omit the field; consumers
+        // must rehydrate None and never re-emit it.
+        let json = r#"{"cursor":7,"scope":{"tenant_id":"tenant-a","agent_id":"agent-a","project_id":"project-a","thread_id":"thread-a"},"run_id":"00000000-0000-0000-0000-000000000001","status":"Completed","kind":"Completed"}"#;
+        let event: TurnLifecycleEvent =
+            serde_json::from_str(json).expect("legacy event row must deserialize");
+        assert_eq!(event.model_usage, None);
+
+        let reserialized = serde_json::to_string(&event).expect("serialize");
+        assert!(
+            !reserialized.contains("model_usage"),
+            "absent model_usage must not be re-introduced on serialize: {reserialized}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_event_model_usage_survives_wire_roundtrip() {
+        let json = r#"{"cursor":7,"scope":{"tenant_id":"tenant-a","agent_id":"agent-a","project_id":"project-a","thread_id":"thread-a"},"run_id":"00000000-0000-0000-0000-000000000001","status":"Completed","kind":"Completed","model_usage":{"input_tokens":10,"output_tokens":20}}"#;
+        let event: TurnLifecycleEvent =
+            serde_json::from_str(json).expect("event with usage must deserialize");
+        let usage = event.model_usage.expect("usage present");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 20);
+
+        let reserialized = serde_json::to_string(&event).expect("serialize");
+        let reparsed: TurnLifecycleEvent =
+            serde_json::from_str(&reserialized).expect("roundtrip must parse");
+        assert_eq!(reparsed.model_usage, event.model_usage);
     }
 }

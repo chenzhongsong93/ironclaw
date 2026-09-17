@@ -2002,6 +2002,7 @@ async fn turn_runner_worker_completes_after_libsql_turn_and_thread_services_reop
                     subagent_depth: 0,
                     spawn_tree_root_run_id: None,
                     product_context: None,
+                    llm_subject: None,
                 },
                 &ironclaw_turns::AllowAllTurnAdmissionPolicy,
                 &resolver,
@@ -3636,6 +3637,7 @@ async fn default_planned_runtime_composes_no_profile_coordinator_and_profiled_ho
             subagent_depth: 0,
             spawn_tree_root_run_id: None,
             product_context: None,
+            llm_subject: None,
         })
         .await
         .unwrap();
@@ -3813,6 +3815,7 @@ async fn pre_minted_scheduler_wake_wiring_drives_scheduler_on_coordinator_submit
             subagent_depth: 0,
             spawn_tree_root_run_id: None,
             product_context: None,
+            llm_subject: None,
         })
         .await
         .unwrap();
@@ -8819,6 +8822,7 @@ async fn queue_fixture_turn(
                 subagent_depth: 0,
                 spawn_tree_root_run_id: None,
                 product_context: None,
+                llm_subject: None,
             },
             &ironclaw_turns::AllowAllTurnAdmissionPolicy,
             resolver,
@@ -8950,6 +8954,7 @@ impl HostFixture {
             event_cursor: EventCursor(1),
             product_context: None,
             resume_disposition: None,
+            llm_subject: None,
         };
         let claimed = ClaimedTurnRun {
             state,

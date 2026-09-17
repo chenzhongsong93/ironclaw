@@ -67,7 +67,7 @@ pub use outbound::{
     PROJECTION_TEXT_MAX_BYTES, ProductGateKind, ProductOutboundEnvelope, ProductOutboundPayload,
     ProductOutboundTarget, ProductProjectionItem, ProductProjectionState, ProductRenderOutcome,
     ProductSynchronousResponse, ProductWorkSummaryPhase, ProgressKind, ProgressUpdateView,
-    ProjectionCursor,
+    ProjectionCursor, TurnCostView,
 };
 pub use projection::{
     ProductProjectionReadInput, ProductProjectionSubject, ProductProjectionSubscribeInput,

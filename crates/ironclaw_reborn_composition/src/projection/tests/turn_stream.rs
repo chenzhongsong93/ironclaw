@@ -109,6 +109,7 @@ async fn webui_event_stream_resumes_mixed_batch_without_skipping_turn_event() {
                 sanitized_reason: Some("GitHub authentication required".to_string()),
                 detail: None,
                 retryable: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -263,6 +264,7 @@ async fn webui_event_stream_offers_always_for_typed_approval_gate() {
                 sanitized_reason: Some("capability requires approval".to_string()),
                 detail: None,
                 retryable: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -405,6 +407,7 @@ async fn webui_event_stream_projects_network_approval_context() {
                 sanitized_reason: Some("network requires approval".to_string()),
                 detail: None,
                 retryable: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -522,6 +525,7 @@ async fn webui_event_stream_projects_spawn_approval_context() {
                 sanitized_reason: Some("spawn requires approval".to_string()),
                 detail: None,
                 retryable: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -601,6 +605,7 @@ async fn webui_event_stream_fails_transiently_when_approval_request_lookup_fails
                 sanitized_reason: Some("capability requires approval".to_string()),
                 detail: None,
                 retryable: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -670,6 +675,7 @@ async fn webui_event_stream_fails_closed_for_projection_allow_always_without_pro
                 sanitized_reason: Some("capability requires approval".to_string()),
                 detail: None,
                 retryable: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -756,6 +762,7 @@ async fn webui_event_stream_does_not_offer_always_for_generic_approval_gate() {
                 sanitized_reason: Some("generic approval required".to_string()),
                 detail: None,
                 retryable: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -828,6 +835,7 @@ async fn webui_event_stream_projects_blocked_dependent_run_status() {
                 sanitized_reason: Some("Waiting for dependent run".to_string()),
                 detail: None,
                 retryable: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -1139,6 +1147,7 @@ async fn webui_event_stream_emits_keepalive_when_only_turn_cursor_advances() {
                 sanitized_reason: None,
                 detail: None,
                 retryable: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -1199,6 +1208,7 @@ async fn webui_event_stream_reads_past_filtered_turn_event_pages() {
             sanitized_reason: None,
             detail: None,
             retryable: None,
+            model_usage: None,
         })
         .collect::<Vec<_>>();
     events.push(TurnLifecycleEvent {
@@ -1218,6 +1228,7 @@ async fn webui_event_stream_reads_past_filtered_turn_event_pages() {
         sanitized_reason: Some("GitHub authentication required".to_string()),
         detail: None,
         retryable: None,
+        model_usage: None,
     });
     let event_log: Arc<dyn DurableEventLog> = Arc::new(InMemoryDurableEventLog::new());
     let services = build_reborn_projection_services(
@@ -1316,6 +1327,7 @@ async fn webui_event_stream_does_not_prompt_for_stale_blocked_event() {
                 sanitized_reason: Some("stale auth gate".to_string()),
                 detail: None,
                 retryable: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator { state }),
@@ -1422,6 +1434,7 @@ async fn webui_event_stream_filters_turn_events_by_owner_user() {
                 sanitized_reason: None,
                 detail: None,
                 retryable: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -1444,5 +1457,172 @@ async fn webui_event_stream_filters_turn_events_by_owner_user() {
             .iter()
             .all(|event| matches!(event.payload(), ProductOutboundPayload::KeepAlive)),
         "turn event bridge must not emit another user's lifecycle event payload"
+    );
+}
+
+fn completed_state(
+    scope: &TurnScope,
+    user_id: &UserId,
+    run_id: TurnRunId,
+    status: TurnStatus,
+    usage: Option<ironclaw_turns::run_profile::LoopModelUsage>,
+) -> TurnRunState {
+    TurnRunState {
+        scope: scope.clone(),
+        actor: Some(TurnActor::new(user_id.clone())),
+        turn_id: ironclaw_turns::TurnId::new(),
+        run_id,
+        status,
+        accepted_message_ref: AcceptedMessageRef::new("accepted-cost").unwrap(),
+        source_binding_ref: SourceBindingRef::new("source-cost").unwrap(),
+        reply_target_binding_ref: ReplyTargetBindingRef::new("reply-cost").unwrap(),
+        resolved_run_profile_id: RunProfileId::default_profile(),
+        resolved_run_profile_version: RunProfileVersion::new(1),
+        resolved_model_route: None,
+        model_usage: usage,
+        received_at: chrono::Utc::now(),
+        checkpoint_id: None,
+        gate_ref: None,
+        blocked_activity_id: None,
+        credential_requirements: Vec::new(),
+        failure: None,
+        event_cursor: TurnEventCursor(1),
+        product_context: None,
+        resume_disposition: None,
+        llm_subject: None,
+    }
+}
+
+async fn drain_single_event(
+    status: TurnStatus,
+    kind: TurnEventKind,
+    usage: Option<ironclaw_turns::run_profile::LoopModelUsage>,
+) -> Vec<ProductOutboundEnvelope> {
+    let tenant_id = TenantId::new("webui-cost-tenant").unwrap();
+    let user_id = UserId::new("webui-cost-user").unwrap();
+    let agent_id = AgentId::new("webui-cost-agent").unwrap();
+    let thread_id = ThreadId::new("webui-cost-thread").unwrap();
+    let turn_run = TurnRunId::new();
+    let event_log = Arc::new(InMemoryDurableEventLog::new());
+    let scope = TurnScope::new(tenant_id, Some(agent_id), None, thread_id);
+    let event_log_dyn: Arc<dyn DurableEventLog> = event_log;
+    let services = build_reborn_projection_services(
+        event_log_dyn,
+        ReplyTargetBindingRef::new("webui-cost-reply").unwrap(),
+    )
+    .with_turn_events(
+        Arc::new(FakeTurnEventSource {
+            events: vec![TurnLifecycleEvent {
+                cursor: TurnEventCursor(1),
+                scope: scope.clone(),
+                occurred_at: Some(chrono::Utc::now()),
+                owner_user_id: Some(user_id.clone()),
+                run_id: turn_run,
+                status,
+                kind,
+                blocked_gate: None,
+                sanitized_reason: None,
+                detail: None,
+                retryable: None,
+                model_usage: usage,
+            }],
+        }),
+        Arc::new(FakeTurnCoordinator {
+            state: completed_state(&scope, &user_id, turn_run, status, usage),
+        }),
+    );
+    services
+        .webui_event_stream()
+        .drain(ProjectionSubscriptionRequest {
+            actor: TurnActor::new(user_id),
+            scope,
+            after_cursor: None,
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn terminal_event_with_usage_emits_turn_cost_payload() {
+    // ISSUE-IRONCLAW-006: a Completed turn carrying model usage must surface a
+    // TurnCost payload so billing consumers can charge real usage.
+    let usage = ironclaw_turns::run_profile::LoopModelUsage {
+        input_tokens: 1234,
+        output_tokens: 567,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+    };
+    let events =
+        drain_single_event(TurnStatus::Completed, TurnEventKind::Completed, Some(usage)).await;
+
+    let cost_index = events
+        .iter()
+        .position(|event| matches!(event.payload(), ProductOutboundPayload::TurnCost(_)))
+        .expect("terminal usage event must emit TurnCost");
+    let terminal_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event.payload(),
+                ProductOutboundPayload::ProjectionUpdate { state }
+                    if state.items.iter().any(|item| matches!(
+                        item,
+                        ProductProjectionItem::RunStatus { status, .. } if status == "completed"
+                    ))
+            )
+        })
+        .expect("terminal status update present");
+    assert!(
+        cost_index < terminal_index,
+        "TurnCost must precede terminal status so stop-on-terminal consumers can settle billing"
+    );
+    let ProductOutboundPayload::TurnCost(cost) = events[cost_index].payload() else {
+        unreachable!("cost index points at TurnCost")
+    };
+    assert_eq!(cost.input_tokens, 1234);
+    assert_eq!(cost.output_tokens, 567);
+    assert_eq!(cost.thread_id, "webui-cost-thread");
+    assert!(cost.cost_usd.is_empty());
+}
+
+#[tokio::test]
+async fn failed_event_with_usage_also_emits_turn_cost() {
+    let usage = ironclaw_turns::run_profile::LoopModelUsage {
+        input_tokens: 10,
+        output_tokens: 3,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+    };
+    let events = drain_single_event(TurnStatus::Failed, TurnEventKind::Failed, Some(usage)).await;
+    assert!(events.iter().any(|event| matches!(
+        event.payload(),
+        ProductOutboundPayload::TurnCost(view)
+            if view.input_tokens == 10 && view.output_tokens == 3
+    )));
+}
+
+#[tokio::test]
+async fn terminal_event_without_usage_emits_no_turn_cost() {
+    let events = drain_single_event(TurnStatus::Completed, TurnEventKind::Completed, None).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.payload(), ProductOutboundPayload::TurnCost(_)))
+    );
+}
+
+#[tokio::test]
+async fn non_terminal_event_with_usage_emits_no_turn_cost() {
+    let usage = ironclaw_turns::run_profile::LoopModelUsage::default();
+    let events = drain_single_event(
+        TurnStatus::Running,
+        TurnEventKind::RunnerClaimed,
+        Some(usage),
+    )
+    .await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.payload(), ProductOutboundPayload::TurnCost(_)))
     );
 }

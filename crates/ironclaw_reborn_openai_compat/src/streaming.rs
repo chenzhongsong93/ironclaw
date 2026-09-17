@@ -472,7 +472,9 @@ fn payload_view(payload: &ProductOutboundPayload) -> PayloadView<'_> {
         | ProductOutboundPayload::CapabilityActivity(_)
         | ProductOutboundPayload::CapabilityDisplayPreview(_)
         | ProductOutboundPayload::GatePrompt(_)
-        | ProductOutboundPayload::AuthPrompt(_) => PayloadView {
+        | ProductOutboundPayload::AuthPrompt(_)
+        // Usage frames carry no assistant text for the OpenAI-compat stream.
+        | ProductOutboundPayload::TurnCost(_) => PayloadView {
             text: PayloadText::None,
             terminal_status: TerminalStatus::None,
         },

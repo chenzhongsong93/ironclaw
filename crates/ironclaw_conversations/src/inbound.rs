@@ -262,6 +262,7 @@ where
                     surface_type,
                     resolution.turn_scope.product_owner(&accepted_message.actor),
                 )),
+                llm_subject: None,
             })
             .await;
         let turn_submission = match turn_submission_result {

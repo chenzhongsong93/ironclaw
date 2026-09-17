@@ -474,6 +474,7 @@ async fn webui_event_stream_projects_retryable_flag_for_failed_run() {
                 sanitized_reason: Some("lease_expired".to_string()),
                 retryable: Some(true),
                 detail: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -547,6 +548,7 @@ async fn assert_failed_run_status_summary_internal(
                 sanitized_reason: Some(failure_category.to_string()),
                 retryable: None,
                 detail: detail.map(str::to_string),
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -665,6 +667,7 @@ async fn webui_event_stream_uses_model_failure_explanation_when_available() {
                 sanitized_reason: Some("driver_invalid_request".to_string()),
                 retryable: None,
                 detail: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -742,6 +745,7 @@ async fn webui_event_stream_caches_model_failure_explanation_across_replay() {
                 sanitized_reason: Some("driver_invalid_request".to_string()),
                 retryable: None,
                 detail: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -818,6 +822,7 @@ async fn webui_event_stream_projects_recovery_required_failure_summary() {
                 sanitized_reason: Some("driver_failed".to_string()),
                 retryable: None,
                 detail: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -892,6 +897,7 @@ async fn failure_details_returns_fallback_when_model_gateway_times_out() {
                 sanitized_reason: Some("scheduler_executor_panic".to_string()),
                 retryable: None,
                 detail: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {

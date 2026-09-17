@@ -158,6 +158,7 @@ mod tests {
             resolved_model_route: None,
             run_id: ironclaw_turns::TurnRunId::new(),
             turn_id: ironclaw_turns::TurnId::new(),
+            llm_subject: None,
         }
     }
 

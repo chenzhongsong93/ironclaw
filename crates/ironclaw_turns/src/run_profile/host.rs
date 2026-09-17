@@ -656,6 +656,13 @@ pub struct LoopRunContext {
     pub checkpoint_schema_version: RunProfileVersion,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub product_context: Option<ProductTurnContext>,
+    /// Server-to-server LLM identity label carried from the turn request
+    /// (ISSUE-IRONCLAW-008). Only the label is stored; the per-subject key is
+    /// resolved from the key store at the provider boundary, never persisted
+    /// here. `None` keeps legacy shared-key behaviour unless the deployment
+    /// requires a subject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_subject: Option<String>,
 }
 
 impl LoopRunContext {
@@ -684,6 +691,7 @@ impl LoopRunContext {
             checkpoint_schema_id,
             checkpoint_schema_version,
             product_context: None,
+            llm_subject: None,
         }
     }
 
@@ -708,6 +716,11 @@ impl LoopRunContext {
 
     pub fn with_product_context(mut self, product_context: ProductTurnContext) -> Self {
         self.product_context = Some(product_context);
+        self
+    }
+
+    pub fn with_llm_subject(mut self, llm_subject: Option<String>) -> Self {
+        self.llm_subject = llm_subject;
         self
     }
 }

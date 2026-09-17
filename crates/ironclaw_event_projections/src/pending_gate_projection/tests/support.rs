@@ -261,6 +261,7 @@ pub(super) fn blocked_event_with(
         sanitized_reason: Some("approval_required".to_string()),
         retryable: None,
         detail: None,
+        model_usage: None,
     }
 }
 
@@ -283,6 +284,7 @@ pub(super) fn lifecycle_event(
         sanitized_reason: None,
         retryable: None,
         detail: None,
+        model_usage: None,
     }
 }
 

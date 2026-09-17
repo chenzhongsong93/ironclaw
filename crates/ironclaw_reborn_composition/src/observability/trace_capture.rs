@@ -594,6 +594,7 @@ mod tests {
             sanitized_reason: None,
             detail: None,
             retryable: None,
+            model_usage: None,
         }
     }
 

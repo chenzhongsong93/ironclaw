@@ -198,6 +198,20 @@ pub struct ProgressUpdateView {
     pub generated_at: DateTime<Utc>,
 }
 
+/// Per-turn model token usage, emitted once when a run reaches a terminal
+/// state with recorded usage (ISSUE-IRONCLAW-006). Downstream billing
+/// consumers (e.g. TianQuan's `usage::record_and_notify_quota`) key off this
+/// frame; `cost_usd` stays empty until a pricing table is wired, consumers
+/// tolerate `""`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnCostView {
+    pub turn_run_id: TurnRunId,
+    pub thread_id: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProgressKind {
@@ -1564,6 +1578,7 @@ pub enum ProductOutboundPayload {
     CapabilityDisplayPreview(CapabilityDisplayPreviewView),
     GatePrompt(GatePromptView),
     AuthPrompt(AuthPromptView),
+    TurnCost(TurnCostView),
     ProjectionSnapshot { state: ProductProjectionState },
     ProjectionUpdate { state: ProductProjectionState },
     KeepAlive,

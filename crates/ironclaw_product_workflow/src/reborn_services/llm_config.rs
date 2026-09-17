@@ -47,6 +47,34 @@ pub trait ActiveModelReader: Send + Sync {
 /// Operator-wide LLM configuration management.
 #[async_trait]
 pub trait LlmConfigService: Send + Sync {
+    /// Store/replace one subject-scoped Bearer token. The response exposes only
+    /// existence, never key material (ISSUE-IRONCLAW-008).
+    async fn put_subject_key(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        _request: LlmSubjectKeyPutRequest,
+    ) -> Result<LlmSubjectKeyStatus, LlmConfigServiceError> {
+        Err(LlmConfigServiceError::Unavailable)
+    }
+
+    async fn get_subject_key_status(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        _subject: String,
+        _provider_id: String,
+    ) -> Result<LlmSubjectKeyStatus, LlmConfigServiceError> {
+        Err(LlmConfigServiceError::Unavailable)
+    }
+
+    async fn delete_subject_key(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        _subject: String,
+        _provider_id: String,
+    ) -> Result<LlmSubjectKeyStatus, LlmConfigServiceError> {
+        Err(LlmConfigServiceError::Unavailable)
+    }
+
     /// Current merged catalog + active selection, keys masked.
     async fn snapshot(
         &self,
@@ -232,6 +260,22 @@ pub struct LlmActiveSelection {
     pub provider_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+}
+
+/// Admin request to store one subject-scoped LLM key. Deserialize-only because
+/// it carries secret material. Neither responses nor debug output expose it.
+#[derive(Deserialize)]
+pub struct LlmSubjectKeyPutRequest {
+    pub subject: String,
+    pub provider_id: String,
+    pub key: SecretString,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmSubjectKeyStatus {
+    pub subject: String,
+    pub provider_id: String,
+    pub key_set: bool,
 }
 
 /// Add or update a custom provider. Deserialize-only (carries a secret).

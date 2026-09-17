@@ -7229,6 +7229,7 @@ mod tests {
             subagent_depth: 0,
             spawn_tree_root_run_id: None,
             product_context: None,
+            llm_subject: None,
         };
         ironclaw_turns::TurnStateStore::submit_turn(
             graph.turn_state.as_ref(),
@@ -7353,6 +7354,7 @@ mod tests {
             subagent_depth: 0,
             spawn_tree_root_run_id: None,
             product_context: None,
+            llm_subject: None,
         };
         ironclaw_turns::TurnStateStore::submit_turn(
             graph.turn_state.as_ref(),

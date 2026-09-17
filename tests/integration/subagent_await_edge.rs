@@ -462,6 +462,7 @@ async fn fast_child_terminal_before_parent_block_recovers_without_lost_wakeup_10
                 subagent_depth: 0,
                 spawn_tree_root_run_id: None,
                 product_context: None,
+                llm_subject: None,
             })
             .await
             .unwrap();
@@ -721,6 +722,7 @@ async fn rollback_deleted_edge_is_reconstructed_so_the_parent_still_gets_the_res
             subagent_depth: 0,
             spawn_tree_root_run_id: None,
             product_context: None,
+            llm_subject: None,
         })
         .await
         .unwrap();
@@ -944,6 +946,7 @@ async fn rollback_deleted_edge_is_reconstructed_so_the_parent_still_gets_the_res
         sanitized_reason: None,
         retryable: None,
         detail: None,
+        model_usage: None,
     };
     let outcome = resolver
         .handle_child_terminal(&event)
@@ -1018,6 +1021,7 @@ async fn mixed_status_batch_group_reports_each_members_own_status_and_reason() {
             subagent_depth: 0,
             spawn_tree_root_run_id: None,
             product_context: None,
+            llm_subject: None,
         })
         .await
         .unwrap();
@@ -1260,6 +1264,7 @@ async fn mixed_status_batch_group_reports_each_members_own_status_and_reason() {
         sanitized_reason: Some(child_a_failure_reason.to_string()),
         retryable: None,
         detail: None,
+        model_usage: None,
     };
     let outcome_a = resolver
         .handle_child_terminal(&event_a)
@@ -1283,6 +1288,7 @@ async fn mixed_status_batch_group_reports_each_members_own_status_and_reason() {
         sanitized_reason: None,
         retryable: None,
         detail: None,
+        model_usage: None,
     };
     let outcome_b = resolver
         .handle_child_terminal(&event_b)

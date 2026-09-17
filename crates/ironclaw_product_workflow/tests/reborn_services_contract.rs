@@ -568,6 +568,7 @@ impl TurnCoordinator for FakeTurnCoordinator {
             failure: self.run_state_failure.lock().expect("lock").clone(),
             event_cursor: EventCursor(17),
             product_context: None,
+            llm_subject: None,
             resume_disposition: None,
         })
     }
@@ -674,6 +675,7 @@ impl TurnCoordinator for BlockingSubmitCoordinator {
             event_cursor: EventCursor(29),
             product_context: None,
             resume_disposition: None,
+            llm_subject: None,
         })
     }
 }

@@ -9,7 +9,7 @@ use ironclaw_host_api::{InvocationId, UserId};
 use ironclaw_product_adapters::{
     ApprovalPromptContextView, AuthPromptContextView, AuthPromptView, GatePromptView,
     ProductAdapterError, ProductGateKind, ProductOutboundPayload, ProductProjectionItem,
-    ProductProjectionState, ProductWorkflowRejectionKind, RedactedString,
+    ProductProjectionState, ProductWorkflowRejectionKind, RedactedString, TurnCostView,
 };
 use ironclaw_product_workflow::{
     approval_prompt_lookup, enrich_auth_prompt_view, is_approval_gate_ref,
@@ -304,6 +304,23 @@ async fn turn_event_payloads(
     } else {
         None
     };
+    // ISSUE-IRONCLAW-006: emit usage before the terminal RunStatus frame.
+    // Downstream SSE consumers commonly stop as soon as they observe
+    // `completed`/`failed`; putting TurnCost second would strand billing even
+    // though both payloads share the same durable event cursor.
+    if matches!(event.kind, TurnEventKind::Completed | TurnEventKind::Failed)
+        && let Some(usage) = &event.model_usage
+    {
+        payloads.push(ProductOutboundPayload::TurnCost(TurnCostView {
+            turn_run_id: event.run_id,
+            thread_id: event.scope.thread_id.to_string(),
+            input_tokens: u64::from(usage.input_tokens),
+            output_tokens: u64::from(usage.output_tokens),
+            // No pricing table is wired in the projection layer; consumers
+            // only settle on the two token fields and tolerate an empty cost.
+            cost_usd: String::new(),
+        }));
+    }
     if projects_run_status(&event.kind) {
         let failure_details =
             failure_details_for_turn_event(failure_explainer, failure_explanation_cache, event)

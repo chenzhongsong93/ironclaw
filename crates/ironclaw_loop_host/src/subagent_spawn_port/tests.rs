@@ -1364,6 +1364,7 @@ fn turn_record(run_context: &LoopRunContext, subagent_depth: u32) -> TurnRunReco
         spawn_tree_root_run_id: lineage_root,
         product_context: None,
         resume_disposition: None,
+        llm_subject: None,
     }
 }
 

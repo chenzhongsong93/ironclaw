@@ -305,6 +305,7 @@ fn turn_run_state_actor_is_serde_backward_compatible() {
         event_cursor: EventCursor(1),
         product_context: None,
         resume_disposition: None,
+        llm_subject: None,
     };
 
     let legacy_wire = serde_json::to_value(&state).unwrap();
@@ -358,6 +359,7 @@ fn turn_checkpoint_public_status_does_not_expose_checkpoint_payload() {
         event_cursor: EventCursor(1),
         product_context: None,
         resume_disposition: None,
+        llm_subject: None,
     };
     let event = TurnLifecycleEvent {
         cursor: EventCursor(2),
@@ -376,6 +378,7 @@ fn turn_checkpoint_public_status_does_not_expose_checkpoint_payload() {
         sanitized_reason: Some("checkpointed".to_string()),
         retryable: None,
         detail: None,
+        model_usage: None,
     };
     let snapshot = TurnPersistenceSnapshot::default()
         .set_checkpoints(vec![TurnCheckpointRecord {
@@ -543,6 +546,7 @@ fn turn_persistence_snapshot_legacy_run_defaults_resume_disposition_to_none() {
         spawn_tree_root_run_id: None,
         product_context: None,
         resume_disposition: None,
+        llm_subject: None,
     };
 
     // Serialize the snapshot — auth_resume_disposition (the wire key) must be absent
@@ -682,6 +686,7 @@ fn turn_persistence_snapshot_legacy_run_preserves_denied_resume_disposition() {
         spawn_tree_root_run_id: None,
         product_context: None,
         resume_disposition: None,
+        llm_subject: None,
     };
 
     let snapshot = TurnPersistenceSnapshot::default().set_runs(vec![record]);

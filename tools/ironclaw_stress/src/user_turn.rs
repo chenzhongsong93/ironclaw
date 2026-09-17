@@ -738,6 +738,7 @@ where
                     .map_err(|error| OperationFailure::invalid_request("prefill_submit", error))?,
                 requested_run_profile: None,
                 requested_model: None,
+                llm_subject: None,
                 idempotency_key: IdempotencyKey::new(format!(
                     "ironclaw-stress-prefill:{operation_ref}"
                 ))
@@ -918,6 +919,7 @@ where
                         .map_err(|error| OperationFailure::invalid_request("submit_turn", error))?,
                     requested_run_profile: None,
                     requested_model: None,
+                    llm_subject: None,
                     idempotency_key: IdempotencyKey::new(format!(
                         "ironclaw-stress:{operation_ref}"
                     ))
@@ -1035,6 +1037,7 @@ where
                         .map_err(|error| OperationFailure::invalid_request("submit_turn", error))?,
                     requested_run_profile: None,
                     requested_model: None,
+                    llm_subject: None,
                     idempotency_key: IdempotencyKey::new(format!(
                         "ironclaw-stress:{operation_ref}"
                     ))
@@ -1991,7 +1994,8 @@ fn provider_latency_failure(error: LlmError) -> OperationFailure {
         LlmError::RateLimited { .. } => "model_provider_rate_limited",
         LlmError::AuthFailed { .. }
         | LlmError::SessionExpired { .. }
-        | LlmError::SessionRenewalFailed { .. } => "model_provider_auth",
+        | LlmError::SessionRenewalFailed { .. }
+        | LlmError::SubjectAuthRejected { .. } => "model_provider_auth",
         LlmError::ContextLengthExceeded { .. } => "model_provider_context_length",
         LlmError::ModelNotAvailable { .. } => "model_provider_model_unavailable",
         LlmError::BadGateway { .. }

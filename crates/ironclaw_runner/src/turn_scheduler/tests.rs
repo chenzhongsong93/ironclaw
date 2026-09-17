@@ -490,6 +490,7 @@ async fn claimed_test_run(thread_id: &str) -> ClaimedTurnRun {
         failure: None,
         event_cursor: EventCursor(1),
         product_context: None,
+        llm_subject: None,
         resume_disposition: None,
     };
     ClaimedTurnRun {

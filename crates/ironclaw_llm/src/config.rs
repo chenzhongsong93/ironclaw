@@ -21,6 +21,46 @@ use ironclaw_common::paths::ironclaw_base_dir;
 /// placeholder is never sent over the wire.
 pub const OAUTH_PLACEHOLDER: &str = "oauth-placeholder";
 
+/// Explicit auth-mode override for Anthropic-protocol providers.
+///
+/// When `None`, the provider factory keeps its legacy implicit routing:
+/// OAuth Bearer is used iff an `oauth_token` is present AND (`api_key` is
+/// absent or equal to the [`OAUTH_PLACEHOLDER`] sentinel). Setting this
+/// field makes the choice explicit, so filling a real API key into
+/// `api_key` no longer silently reroutes to the strict rig-core x-api-key
+/// path (which client-side hard-fails without `max_tokens`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicAuthMode {
+    /// `Authorization: Bearer <oauth_token>` via the OAuth-tolerant
+    /// `AnthropicOAuthProvider` (max_tokens has a built-in fallback).
+    Bearer,
+    /// `x-api-key: <api_key>` via the rig-core Anthropic client.
+    XApiKey,
+}
+
+impl std::str::FromStr for AnthropicAuthMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "bearer" | "oauth" => Ok(Self::Bearer),
+            "x-api-key" | "x_api_key" | "api_key" | "api-key" => Ok(Self::XApiKey),
+            _ => Err(format!(
+                "invalid anthropic auth_mode '{s}', expected one of: bearer, x-api-key"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for AnthropicAuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bearer => write!(f, "bearer"),
+            Self::XApiKey => write!(f, "x-api-key"),
+        }
+    }
+}
+
 /// Prompt cache retention policy for Anthropic.
 ///
 /// Controls Anthropic's automatic prompt caching via a top-level
@@ -89,6 +129,18 @@ pub struct RegistryProviderConfig {
     /// OAuth token for providers that support Bearer auth (e.g. Anthropic via `claude login`).
     /// When set, the provider factory routes to the OAuth-specific provider implementation.
     pub oauth_token: Option<SecretString>,
+    /// Explicit Anthropic auth-mode override. `None` keeps the legacy
+    /// implicit routing keyed on the [`OAUTH_PLACEHOLDER`] sentinel; see
+    /// [`AnthropicAuthMode`].
+    pub auth_mode: Option<AnthropicAuthMode>,
+    /// Default `max_tokens` applied when a request does not set one.
+    ///
+    /// Anthropic's rig-core client hard-fails client-side without
+    /// `max_tokens` (the request never leaves the process), so the
+    /// Anthropic factory additionally falls back to a built-in default
+    /// when neither request nor config provide a value. Other protocols
+    /// only use this field when explicitly configured.
+    pub max_tokens: Option<u32>,
     /// When true, route OpenAI-compatible traffic to the Codex ChatGPT
     /// Responses API provider instead of rig-core's Chat Completions path.
     pub is_codex_chatgpt: bool,
@@ -122,6 +174,8 @@ impl RegistryProviderConfig {
             model: model.into(),
             extra_headers: Vec::new(),
             oauth_token: None,
+            auth_mode: None,
+            max_tokens: None,
             is_codex_chatgpt: false,
             refresh_token: None,
             auth_path: None,
@@ -132,6 +186,16 @@ impl RegistryProviderConfig {
 
     pub fn with_extra_headers(mut self, extra_headers: Vec<(String, String)>) -> Self {
         self.extra_headers = extra_headers;
+        self
+    }
+
+    pub fn with_auth_mode(mut self, auth_mode: Option<AnthropicAuthMode>) -> Self {
+        self.auth_mode = auth_mode;
+        self
+    }
+
+    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens;
         self
     }
 

@@ -407,6 +407,8 @@ impl ProductLiveAgentLoopHarness {
             subagent_definition_resolver: Arc::new(
                 ironclaw_runner::subagent::flavors::StaticSubagentDefinitionResolver,
             ),
+            subagent_prompt_source: None,
+            subagent_flavor_catalog: None,
             subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(Arc::new(
                 ProductLiveCapabilityIo::default(),
             ))),

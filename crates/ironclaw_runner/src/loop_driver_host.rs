@@ -2337,6 +2337,7 @@ where
         if let Some(product_context) = claimed.state.product_context.clone() {
             loop_run_context = loop_run_context.with_product_context(product_context);
         }
+        loop_run_context = loop_run_context.with_llm_subject(claimed.state.llm_subject.clone());
         let request = RebornLoopDriverHostRequest {
             claimed_run: claimed.clone(),
             loop_run_context,

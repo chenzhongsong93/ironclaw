@@ -2430,6 +2430,7 @@ impl RebornRuntime {
                 product_context: Some(ironclaw_product_context::resolve_web_ui(
                     scope.product_owner(&TurnActor::new(self.actor_user_id.clone())),
                 )),
+                llm_subject: None,
             })
             .await
         {

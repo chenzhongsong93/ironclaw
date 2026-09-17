@@ -6639,6 +6639,7 @@ async fn in_memory_event_sink_retains_a_bounded_tail() {
             sanitized_reason: None,
             retryable: None,
             detail: None,
+            model_usage: None,
         })
         .await
         .unwrap();
@@ -7094,6 +7095,44 @@ async fn complete_queued_run(store: &TurnStore, run_id: TurnRunId, thread: &str)
         .unwrap();
 }
 
+#[tokio::test]
+async fn llm_subject_survives_run_state_and_persistence_restore() {
+    let (coordinator, store) = coordinator();
+    let mut request = submit_request("thread-llm-subject", "idem-llm-subject");
+    request.llm_subject = Some("tq-user-42".to_string());
+    let run_id = accepted_run_id(&coordinator.submit_turn(request).await.unwrap());
+    let run_scope = scope("thread-llm-subject");
+
+    let state = coordinator
+        .get_run_state(GetRunStateRequest {
+            scope: run_scope.clone(),
+            run_id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(state.llm_subject.as_deref(), Some("tq-user-42"));
+
+    let snapshot = store.persistence_snapshot().await.unwrap();
+    let persisted = snapshot
+        .runs
+        .iter()
+        .find(|record| record.run_id == run_id)
+        .expect("run persisted");
+    assert_eq!(persisted.llm_subject.as_deref(), Some("tq-user-42"));
+
+    let restored = DefaultTurnCoordinator::new(Arc::new(FilesystemTurnStateRowStore::new(
+        turns_fs_seeded_with(&snapshot).await,
+    )));
+    let restored_state = restored
+        .get_run_state(GetRunStateRequest {
+            scope: run_scope,
+            run_id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(restored_state.llm_subject.as_deref(), Some("tq-user-42"));
+}
+
 fn submit_request(thread: &str, idempotency_key: &str) -> SubmitTurnRequest {
     SubmitTurnRequest {
         requested_model: None,
@@ -7110,6 +7149,7 @@ fn submit_request(thread: &str, idempotency_key: &str) -> SubmitTurnRequest {
         subagent_depth: 0,
         spawn_tree_root_run_id: None,
         product_context: None,
+        llm_subject: None,
     }
 }
 
@@ -7578,6 +7618,7 @@ impl TurnRunTransitionPort for AtomicLoopExitPort {
             event_cursor: EventCursor(1),
             product_context: None,
             resume_disposition: None,
+            llm_subject: None,
         })
     }
 }

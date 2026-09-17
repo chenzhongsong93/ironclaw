@@ -448,6 +448,7 @@ where
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(model_override);
         add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
+        add_llm_subject_metadata(&mut completion, request.llm_subject.as_deref());
 
         complete_model_request(
             self.provider.as_ref(),
@@ -492,6 +493,7 @@ where
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(model_override);
         add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
+        add_llm_subject_metadata(&mut completion, request.llm_subject.as_deref());
 
         complete_model_request(
             self.provider.as_ref(),
@@ -536,6 +538,7 @@ where
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(model_override);
         add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
+        add_llm_subject_metadata(&mut completion, request.llm_subject.as_deref());
 
         let provider_turn_scope = format!(
             "run={run_id}\nturn={turn_id}\nmodel_call={}",
@@ -585,6 +588,7 @@ where
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(model_override);
         add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
+        add_llm_subject_metadata(&mut completion, request.llm_subject.as_deref());
 
         let provider_turn_scope = format!(
             "run={run_id}\nturn={turn_id}\nmodel_call={}",
@@ -761,6 +765,7 @@ where
         completion.model = Some(snapshot.route().model_id().to_string());
         validate_provider_model_binding_matches_route(snapshot.route(), provider.as_ref())?;
         add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
+        add_llm_subject_metadata(&mut completion, request.llm_subject.as_deref());
         add_route_metadata(&mut completion, &snapshot);
 
         complete_model_request(
@@ -800,6 +805,7 @@ where
         completion.model = Some(snapshot.route().model_id().to_string());
         validate_provider_model_binding_matches_route(snapshot.route(), provider.as_ref())?;
         add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
+        add_llm_subject_metadata(&mut completion, request.llm_subject.as_deref());
         add_route_metadata(&mut completion, &snapshot);
 
         complete_model_request(
@@ -839,6 +845,7 @@ where
         completion.model = Some(snapshot.route().model_id().to_string());
         validate_provider_model_binding_matches_route(snapshot.route(), provider.as_ref())?;
         add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
+        add_llm_subject_metadata(&mut completion, request.llm_subject.as_deref());
         add_route_metadata(&mut completion, &snapshot);
 
         let provider_turn_scope = format!(
@@ -883,6 +890,7 @@ where
         completion.model = Some(snapshot.route().model_id().to_string());
         validate_provider_model_binding_matches_route(snapshot.route(), provider.as_ref())?;
         add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
+        add_llm_subject_metadata(&mut completion, request.llm_subject.as_deref());
         add_route_metadata(&mut completion, &snapshot);
 
         let provider_turn_scope = format!(
@@ -935,6 +943,18 @@ fn add_request_metadata(
     completion
         .metadata
         .insert("run_id".to_string(), run_id.to_string());
+}
+
+/// Attach the per-subject LLM identity label (ISSUE-IRONCLAW-008) so the
+/// provider can resolve a subject-scoped key server-side. Only the label is
+/// attached — never the key value. A `None`/absent subject leaves metadata
+/// untouched (legacy shared-key behaviour unless the deployment requires one).
+fn add_llm_subject_metadata(completion: &mut CompletionRequest, llm_subject: Option<&str>) {
+    if let Some(subject) = llm_subject {
+        completion
+            .metadata
+            .insert("llm_subject".to_string(), subject.to_string());
+    }
 }
 
 fn add_route_metadata(completion: &mut CompletionRequest, snapshot: &ResolvedModelRouteSnapshot) {
@@ -2707,6 +2727,11 @@ fn map_provider_error(error: LlmError) -> HostManagedModelError {
                 "model credentials are unavailable",
             )
         }
+        LlmError::SubjectAuthRejected { code } => HostManagedModelError::safe(
+            HostManagedModelErrorKind::ConfigurationError,
+            "subject-scoped model credentials are unavailable",
+        )
+        .safe_with_detail(code),
         _ => HostManagedModelError::safe(
             HostManagedModelErrorKind::Unavailable,
             "model service is unavailable",

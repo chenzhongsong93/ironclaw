@@ -70,6 +70,7 @@ pub(super) fn run_state_from_record(run: TurnRunRecord, actor: TurnActor) -> Tur
         failure: run.failure,
         event_cursor: run.event_cursor,
         product_context: run.product_context,
+        llm_subject: run.llm_subject,
         resume_disposition: run.resume_disposition,
     }
 }

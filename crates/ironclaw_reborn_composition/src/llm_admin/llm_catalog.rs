@@ -105,6 +105,13 @@ pub enum RebornLlmCatalogError {
         #[source]
         source: ironclaw_llm::LlmError,
     },
+    /// A selection-level field failed value validation (safe to echo: these
+    /// fields are enums/integers, never secret material).
+    #[error("llm slot selection field `{field}` is invalid: {reason}")]
+    SelectionFieldInvalid {
+        field: &'static str,
+        reason: String,
+    },
 }
 
 /// Resolve the default Reborn runtime LLM from boot config, TOML selection,
@@ -301,6 +308,8 @@ pub fn resolve_against_registry(
             api_key_env: selection.api_key_env.clone(),
             base_url: selection.base_url.clone(),
             model: selection.model.clone(),
+            auth_mode: selection.auth_mode.clone(),
+            max_tokens: selection.max_tokens,
         },
         registry,
     )
@@ -361,6 +370,27 @@ fn validate_selection(
     }
     if let Some(model) = selection.model.as_deref() {
         validate_catalog_text(provider, catalog_index, "selection_model", model)?;
+    }
+    if let Some(auth_mode) = selection.auth_mode.as_deref() {
+        let trimmed = auth_mode.trim();
+        if trimmed.is_empty()
+            || trimmed
+                .parse::<ironclaw_llm::AnthropicAuthMode>()
+                .is_err()
+        {
+            return Err(RebornLlmCatalogError::SelectionFieldInvalid {
+                field: "auth_mode",
+                reason: format!(
+                    "'{auth_mode}' is not a valid auth_mode; expected \"bearer\" or \"x-api-key\""
+                ),
+            });
+        }
+    }
+    if let Some(0) = selection.max_tokens {
+        return Err(RebornLlmCatalogError::SelectionFieldInvalid {
+            field: "max_tokens",
+            reason: "max_tokens must be >= 1".to_string(),
+        });
     }
     Ok(())
 }
@@ -894,6 +924,7 @@ mod tests {
             model: Some("custom-model".to_string()),
             base_url: Some("https://override.test/v1".to_string()),
             api_key_env: None,
+            ..Default::default()
         };
 
         let config = resolve_against_registry(&selection, &registry).expect("must resolve");
@@ -948,6 +979,7 @@ mod tests {
             model: Some("nearai/test-model".to_string()),
             base_url: Some("https://private.near.ai".to_string()),
             api_key_env: None,
+            ..Default::default()
         };
 
         let config = resolve_against_registry(&selection, &registry).expect("must resolve");
@@ -1097,5 +1129,61 @@ mod tests {
         let err = resolve_llm_selection_against_catalog(&selection, Some(&providers))
             .expect_err("malformed explicit provider overlay must fail");
         assert!(matches!(err, RebornLlmCatalogError::CatalogLoad { .. }));
+    }
+    // -- ISSUE-IRONCLAW-007: selection field validation --
+
+    #[test]
+    fn invalid_auth_mode_is_rejected_with_valid_values() {
+        let registry =
+            ProviderRegistry::new(vec![provider_with_required_key("alpha", "ALPHA_KEY")]);
+        let selection = LlmSlotSelection {
+            provider_id: Some("alpha".to_string()),
+            auth_mode: Some("oauth2".to_string()),
+            ..Default::default()
+        };
+        let err = resolve_against_registry(&selection, &registry).expect_err("must error");
+        match err {
+            RebornLlmCatalogError::SelectionFieldInvalid { field, reason } => {
+                assert_eq!(field, "auth_mode");
+                assert!(
+                    reason.contains("bearer") && reason.contains("x-api-key"),
+                    "reason must name the valid values: {reason}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_max_tokens_is_rejected() {
+        let registry =
+            ProviderRegistry::new(vec![provider_with_required_key("alpha", "ALPHA_KEY")]);
+        let selection = LlmSlotSelection {
+            provider_id: Some("alpha".to_string()),
+            max_tokens: Some(0),
+            ..Default::default()
+        };
+        let err = resolve_against_registry(&selection, &registry).expect_err("must error");
+        match err {
+            RebornLlmCatalogError::SelectionFieldInvalid { field, .. } => {
+                assert_eq!(field, "max_tokens");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn valid_auth_mode_and_max_tokens_pass_validation() {
+        let registry =
+            ProviderRegistry::new(vec![provider_no_key_required("local")]);
+        let selection = LlmSlotSelection {
+            provider_id: Some("local".to_string()),
+            auth_mode: Some("bearer".to_string()),
+            max_tokens: Some(65536),
+            ..Default::default()
+        };
+        // Validation passes; resolution may still proceed (ollama protocol
+        // ignores anthropic auth_mode by design — the field is inert there).
+        resolve_against_registry(&selection, &registry).expect("must resolve");
     }
 }

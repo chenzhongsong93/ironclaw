@@ -1193,6 +1193,7 @@ mod tests {
             spawn_tree_root_run_id: Some(parent_run_id),
             product_context: None,
             resume_disposition: None,
+            llm_subject: None,
         }
     }
 
@@ -1213,6 +1214,7 @@ mod tests {
             sanitized_reason: None,
             retryable: None,
             detail: None,
+            model_usage: None,
         }
     }
 
@@ -1583,6 +1585,7 @@ mod tests {
                 subagent_depth: 0,
                 spawn_tree_root_run_id: None,
                 product_context: None,
+                llm_subject: None,
             })
             .await
             .unwrap()
@@ -1903,6 +1906,7 @@ fn terminal_event_from_record(
             .map(|failure| failure.category().to_string()),
         retryable: None,
         detail: None,
+        model_usage: record.model_usage,
     })
 }
 
@@ -1927,6 +1931,7 @@ fn missing_child_deadline_event(
         sanitized_reason: Some("subagent_child_submission_missing".to_string()),
         retryable: Some(false),
         detail: None,
+        model_usage: None,
     })
 }
 
@@ -1949,6 +1954,7 @@ fn terminal_event_from_state(
             .map(|failure| failure.category().to_string()),
         retryable: None,
         detail: None,
+        model_usage: state.model_usage,
     })
 }
 

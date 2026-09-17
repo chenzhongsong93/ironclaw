@@ -1191,6 +1191,7 @@ fn response_status_from_projection_events(
         | ProductOutboundPayload::CapabilityDisplayPreview(_)
         | ProductOutboundPayload::GatePrompt(_)
         | ProductOutboundPayload::AuthPrompt(_)
+        | ProductOutboundPayload::TurnCost(_)
         | ProductOutboundPayload::KeepAlive => None,
     })
 }

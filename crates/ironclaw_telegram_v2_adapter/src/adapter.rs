@@ -333,6 +333,8 @@ impl ProductAdapter for TelegramV2Adapter {
             | ProductOutboundPayload::CapabilityDisplayPreview(_)
             | ProductOutboundPayload::ProjectionSnapshot { .. }
             | ProductOutboundPayload::ProjectionUpdate { .. }
+            // Token-usage frames are billing-channel facts, not chat content.
+            | ProductOutboundPayload::TurnCost(_)
             | ProductOutboundPayload::KeepAlive => {
                 // Telegram never consumes projection subscriptions; the
                 // workflow should not route these to a Telegram installation.

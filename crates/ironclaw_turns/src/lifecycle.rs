@@ -368,6 +368,7 @@ fn submit_event(request: &SubmitTurnRequest, response: &SubmitTurnResponse) -> T
         sanitized_reason: None,
         retryable: None,
         detail: None,
+        model_usage: None,
     }
 }
 
@@ -393,6 +394,7 @@ fn child_submit_event(
         sanitized_reason: None,
         retryable: None,
         detail: None,
+        model_usage: None,
     }
 }
 
@@ -409,6 +411,7 @@ fn resume_event(request: &ResumeTurnRequest, response: &ResumeTurnResponse) -> T
         sanitized_reason: None,
         retryable: None,
         detail: None,
+        model_usage: None,
     }
 }
 
@@ -425,6 +428,7 @@ fn retry_event(request: &RetryTurnRequest, response: &RetryTurnResponse) -> Turn
         sanitized_reason: None,
         retryable: None,
         detail: None,
+        model_usage: None,
     }
 }
 
@@ -455,6 +459,7 @@ fn cancel_event(
         sanitized_reason: Some(request.reason.category().to_string()),
         retryable: None,
         detail: None,
+        model_usage: None,
     })
 }
 

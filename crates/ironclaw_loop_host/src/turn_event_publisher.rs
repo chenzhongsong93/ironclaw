@@ -66,6 +66,9 @@ impl EventPublishingTurnRunTransitionPort {
             sanitized_reason,
             retryable,
             detail,
+            // The terminal transition persists usage onto the run state before
+            // this port republishes it, so Completed/Failed events carry it.
+            model_usage: state.model_usage,
         };
         if let Err(error) = self.sink.publish(event).await {
             tracing::debug!(error = %error, "turn transition event sink publish failed");

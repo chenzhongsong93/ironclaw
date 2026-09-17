@@ -794,6 +794,7 @@ impl AcceptedProductInboundTurn {
             subagent_depth: 0,
             spawn_tree_root_run_id: None,
             product_context: Some(product_context),
+            llm_subject: None,
         };
 
         match turn_coordinator.submit_turn(request).await {

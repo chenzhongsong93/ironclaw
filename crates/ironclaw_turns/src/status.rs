@@ -531,6 +531,11 @@ pub struct TurnRunState {
     pub event_cursor: EventCursor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub product_context: Option<ProductTurnContext>,
+    /// Server-to-server LLM identity label persisted with the run so every
+    /// model call (including child/subagent runs) resolves the same subject key
+    /// (ISSUE-IRONCLAW-008). This is a label, never secret material.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_subject: Option<String>,
     #[serde(
         rename = "auth_resume_disposition",
         default,

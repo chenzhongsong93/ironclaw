@@ -73,6 +73,12 @@ pub enum LlmError {
     #[error("Session renewal failed for provider {provider}: {reason}")]
     SessionRenewalFailed { provider: String, reason: String },
 
+    /// Stable fail-closed errors for request-scoped LLM identity routing
+    /// (ISSUE-IRONCLAW-008). `code` is intentionally enumerable and contains
+    /// no subject or secret material so callers can translate it safely.
+    #[error("LLM subject authentication rejected: {code}")]
+    SubjectAuthRejected { code: &'static str },
+
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 

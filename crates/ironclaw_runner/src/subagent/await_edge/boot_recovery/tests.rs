@@ -554,6 +554,7 @@ async fn recover_open_edge(
             subagent_depth: 0,
             spawn_tree_root_run_id: None,
             product_context: None,
+            llm_subject: None,
         })
         .await
         .unwrap();
@@ -868,6 +869,7 @@ async fn recover_scope_redrives_write_and_resume_for_a_crash_settled_undrained_e
             subagent_depth: 0,
             spawn_tree_root_run_id: None,
             product_context: None,
+            llm_subject: None,
         })
         .await
         .unwrap();

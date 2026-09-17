@@ -413,5 +413,6 @@ fn turn_run_state(
         event_cursor: cursor,
         product_context: None,
         resume_disposition: None,
+        llm_subject: None,
     }
 }

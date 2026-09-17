@@ -123,6 +123,78 @@ impl LlmKeyStore {
             .await
             .map_err(LlmKeyStoreError::Store)
     }
+
+    /// Store (or replace) the Bearer token for one LLM subject/provider pair.
+    /// The secret handle uses a deterministic hash so subject identifiers are
+    /// not exposed through secret-store metadata listings.
+    pub async fn put_subject_key(
+        &self,
+        subject: &str,
+        provider_id: &str,
+        value: SecretMaterial,
+    ) -> Result<(), LlmKeyStoreError> {
+        let handle = subject_handle_for(subject, provider_id)?;
+        self.store
+            .put(scope(), handle, value, None)
+            .await
+            .map(|_| ())
+            .map_err(LlmKeyStoreError::Store)
+    }
+
+    pub async fn put_subject_key_plaintext(
+        &self,
+        subject: &str,
+        provider_id: &str,
+        value: String,
+    ) -> Result<(), LlmKeyStoreError> {
+        self.put_subject_key(subject, provider_id, SecretMaterial::from(value))
+            .await
+    }
+
+    pub async fn subject_key_exists(
+        &self,
+        subject: &str,
+        provider_id: &str,
+    ) -> Result<bool, LlmKeyStoreError> {
+        let handle = subject_handle_for(subject, provider_id)?;
+        Ok(self
+            .store
+            .metadata(&scope(), &handle)
+            .await
+            .map_err(LlmKeyStoreError::Store)?
+            .is_some())
+    }
+
+    pub async fn read_subject_key(
+        &self,
+        subject: &str,
+        provider_id: &str,
+    ) -> Result<Option<SecretMaterial>, LlmKeyStoreError> {
+        let handle = subject_handle_for(subject, provider_id)?;
+        let scope = scope();
+        let lease = match self.store.lease_once(&scope, &handle).await {
+            Ok(lease) => lease,
+            Err(error) if error.is_unknown_secret() => return Ok(None),
+            Err(error) => return Err(LlmKeyStoreError::Store(error)),
+        };
+        self.store
+            .consume(&scope, lease.id)
+            .await
+            .map(Some)
+            .map_err(LlmKeyStoreError::Store)
+    }
+
+    pub async fn delete_subject_key(
+        &self,
+        subject: &str,
+        provider_id: &str,
+    ) -> Result<bool, LlmKeyStoreError> {
+        let handle = subject_handle_for(subject, provider_id)?;
+        self.store
+            .delete(&scope(), &handle)
+            .await
+            .map_err(LlmKeyStoreError::Store)
+    }
 }
 
 fn scope() -> ResourceScope {
@@ -138,11 +210,61 @@ fn handle_for(provider_id: &str) -> Result<SecretHandle, LlmKeyStoreError> {
     })
 }
 
+fn subject_handle_for(subject: &str, provider_id: &str) -> Result<SecretHandle, LlmKeyStoreError> {
+    use sha2::{Digest, Sha256};
+
+    let subject = subject.trim();
+    let provider_id = provider_id.trim();
+    if subject.is_empty() {
+        return Err(LlmKeyStoreError::InvalidSubject);
+    }
+    if provider_id.is_empty() {
+        return Err(LlmKeyStoreError::InvalidProviderId {
+            provider_id: provider_id.to_string(),
+            reason: "provider id is empty".to_string(),
+        });
+    }
+    let digest = Sha256::digest(format!("{provider_id}\0{subject}").as_bytes());
+    let digest_hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    SecretHandle::new(format!("llm_subject_{digest_hex}_api_key")).map_err(|source| {
+        LlmKeyStoreError::InvalidSubjectHandle {
+            reason: source.to_string(),
+        }
+    })
+}
+
+#[async_trait::async_trait]
+impl ironclaw_llm::SubjectKeyResolver for LlmKeyStore {
+    async fn resolve_bearer_token(
+        &self,
+        subject: &str,
+        provider_id: &str,
+    ) -> Result<Option<secrecy::SecretString>, ironclaw_llm::SubjectKeyResolveError> {
+        self.read_subject_key(subject, provider_id)
+            .await
+            .map(|material| {
+                material.map(|value| {
+                    secrecy::SecretString::from(
+                        secrecy::ExposeSecret::expose_secret(&value).to_string(),
+                    )
+                })
+            })
+            .map_err(|_| ironclaw_llm::SubjectKeyResolveError::StoreUnavailable)
+    }
+}
+
 /// Errors surfaced when storing or reading LLM key values.
 #[derive(Debug, Error)]
 pub enum LlmKeyStoreError {
     #[error("invalid provider id `{provider_id}` for secret handle: {reason}")]
     InvalidProviderId { provider_id: String, reason: String },
+    #[error("LLM subject must not be empty")]
+    InvalidSubject,
+    #[error("invalid LLM subject secret handle: {reason}")]
+    InvalidSubjectHandle { reason: String },
     #[error("secret store error: {0}")]
     Store(#[source] SecretStoreError),
 }
@@ -242,5 +364,67 @@ mod tests {
             .await
             .expect_err("must reject");
         assert!(matches!(err, LlmKeyStoreError::InvalidProviderId { .. }));
+    }
+
+    #[tokio::test]
+    async fn subject_keys_round_trip_and_stay_isolated() {
+        let keys = store();
+        keys.put_subject_key_plaintext("user-a", "anthropic", "key-a".to_string())
+            .await
+            .expect("put a");
+        keys.put_subject_key_plaintext("user-b", "anthropic", "key-b".to_string())
+            .await
+            .expect("put b");
+
+        let a = keys
+            .read_subject_key("user-a", "anthropic")
+            .await
+            .expect("read a")
+            .expect("a exists");
+        let b = keys
+            .read_subject_key("user-b", "anthropic")
+            .await
+            .expect("read b")
+            .expect("b exists");
+        assert_eq!(secrecy::ExposeSecret::expose_secret(&a), "key-a");
+        assert_eq!(secrecy::ExposeSecret::expose_secret(&b), "key-b");
+        assert!(
+            keys.subject_key_exists("user-a", "anthropic")
+                .await
+                .unwrap()
+        );
+
+        assert!(
+            keys.delete_subject_key("user-a", "anthropic")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !keys
+                .subject_key_exists("user-a", "anthropic")
+                .await
+                .unwrap()
+        );
+        assert!(
+            keys.subject_key_exists("user-b", "anthropic")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn subject_handle_does_not_expose_subject_or_provider() {
+        let handle = subject_handle_for("user-secret-label", "anthropic").expect("handle");
+        assert!(!handle.as_str().contains("user-secret-label"));
+        assert!(!handle.as_str().contains("anthropic"));
+        assert!(handle.as_str().starts_with("llm_subject_"));
+    }
+
+    #[test]
+    fn subject_handle_rejects_blank_subject() {
+        assert!(matches!(
+            subject_handle_for("   ", "anthropic"),
+            Err(LlmKeyStoreError::InvalidSubject)
+        ));
     }
 }

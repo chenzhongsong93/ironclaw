@@ -73,6 +73,12 @@ pub struct SubmitTurnRequest {
     /// can't be resolved the run falls back to the deployment's active model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_model: Option<String>,
+    /// Server-to-server LLM identity label for per-user key resolution
+    /// (ISSUE-IRONCLAW-008). Only the label crosses the wire; the key value is
+    /// resolved server-side from the key store. `None`/absent keeps legacy
+    /// shared-key behaviour unless the deployment requires a subject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_subject: Option<String>,
     pub idempotency_key: IdempotencyKey,
     pub received_at: TurnTimestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]

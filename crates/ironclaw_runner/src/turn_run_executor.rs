@@ -672,6 +672,7 @@ mod tests {
             failure: None,
             event_cursor: EventCursor(0),
             product_context: None,
+            llm_subject: None,
             resume_disposition: None,
         }
     }
@@ -845,6 +846,7 @@ mod tests {
             failure: None,
             event_cursor: EventCursor(0),
             product_context: None,
+            llm_subject: None,
             resume_disposition: None,
         };
         ClaimedTurnRun {

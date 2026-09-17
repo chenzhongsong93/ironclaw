@@ -38,6 +38,7 @@ async fn webui_event_stream_enriches_auth_prompt_through_projection_stream() {
                 sanitized_reason: Some("GitHub authentication required".to_string()),
                 detail: None,
                 retryable: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -134,6 +135,7 @@ async fn webui_event_stream_uses_credential_requirement_for_manual_token_auth_pr
                 sanitized_reason: Some("GitHub authentication required".to_string()),
                 detail: None,
                 retryable: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -232,6 +234,7 @@ async fn webui_event_stream_keeps_retired_channel_pairing_requirement_generic() 
                 sanitized_reason: Some("Slack connection required".to_string()),
                 retryable: None,
                 detail: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -321,6 +324,7 @@ async fn webui_event_stream_keeps_oauth_requirement_as_oauth_prompt_without_url(
                 sanitized_reason: Some("Google authentication required".to_string()),
                 detail: None,
                 retryable: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -394,6 +398,7 @@ async fn webui_event_stream_surfaces_auth_challenge_lookup_failure() {
                 sanitized_reason: Some("GitHub authentication required".to_string()),
                 detail: None,
                 retryable: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -506,6 +511,7 @@ async fn webui_event_stream_creates_google_oauth_prompt_for_runtime_credential_g
                 sanitized_reason: Some("Google authentication required".to_string()),
                 detail: None,
                 retryable: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -683,6 +689,7 @@ async fn webui_event_stream_creates_notion_dcr_oauth_prompt_for_runtime_credenti
                 sanitized_reason: Some("Notion authentication required".to_string()),
                 detail: None,
                 retryable: None,
+                model_usage: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {

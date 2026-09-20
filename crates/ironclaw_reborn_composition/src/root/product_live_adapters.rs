@@ -45,6 +45,7 @@ use crate::{
     RebornServices,
     projection::{CapabilityDisplayPreviewResult, CapabilityDisplayPreviewStore},
 };
+use crate::tianquan_capability_policy::{filter_tianquan_grants, tianquan_surface_policy};
 
 #[derive(Debug, Error)]
 pub enum ProductLivePlannedRuntimeAdapterError {
@@ -601,8 +602,12 @@ impl ProductLiveVisibleCapabilityRequestConfig {
 /// reported as `InvalidCapabilityScope` errors.
 pub fn visible_capability_request_for_run(
     run_context: &LoopRunContext,
-    config: ProductLiveVisibleCapabilityRequestConfig,
+    mut config: ProductLiveVisibleCapabilityRequestConfig,
 ) -> Result<VisibleCapabilityRequest, ProductLivePlannedRuntimeAdapterError> {
+    filter_tianquan_grants(&run_context.scope.tenant_id, &mut config.grants);
+    if run_context.scope.tenant_id.as_str() == crate::tianquan_capability_policy::TIANQUAN_TENANT_ID {
+        config.policy = tianquan_surface_policy();
+    }
     let extension_id = loop_driver_execution_extension_id(run_context).map_err(|error| {
         ProductLivePlannedRuntimeAdapterError::InvalidCapabilityScope {
             reason: error.to_string(),

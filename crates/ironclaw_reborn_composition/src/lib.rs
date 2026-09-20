@@ -60,6 +60,7 @@ mod runtime_profile_approval_policy;
 mod support;
 #[cfg(feature = "test-support")]
 pub mod test_support;
+mod tianquan_capability_policy;
 mod turn_run_snapshot;
 mod web_access;
 mod webui;

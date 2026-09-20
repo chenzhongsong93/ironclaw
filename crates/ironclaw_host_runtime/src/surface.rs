@@ -66,6 +66,11 @@ pub struct CapabilitySurfacePolicy {
     /// This is informational only. It does not issue approval leases or widen
     /// direct invocation authority.
     pub include_requires_approval: bool,
+    /// Capability IDs that must never appear on this surface, even when their
+    /// runtime/effect and authorization would otherwise permit visibility.
+    /// This is a narrowing policy only; invocation authority is still checked
+    /// independently by the host.
+    pub denied_capabilities: Vec<ironclaw_host_api::CapabilityId>,
     /// Maximum visible capabilities returned after filtering, in registry
     /// order. `Some(0)` returns an empty surface without authorizer calls.
     pub max_capabilities: Option<usize>,
@@ -77,6 +82,7 @@ impl CapabilitySurfacePolicy {
             allowed_runtimes: ALL_RUNTIME_KINDS.to_vec(),
             allowed_effects: ALL_EFFECT_KINDS.to_vec(),
             include_requires_approval: true,
+            denied_capabilities: Vec::new(),
             max_capabilities: None,
         }
     }
@@ -162,6 +168,9 @@ impl<'a> CapabilityCatalog<'a> {
             if capabilities.len() >= max_capabilities {
                 break;
             }
+            if request.policy.denied_capabilities.contains(&descriptor.id) {
+                continue;
+            }
             if !self.is_model_visible(descriptor)
                 || !request.policy.allows_runtime(descriptor.runtime)
                 || !request.policy.allows_effects(&descriptor.effects)
@@ -202,7 +211,8 @@ impl<'a> CapabilityCatalog<'a> {
             .registry
             .capabilities()
             .filter(|descriptor| {
-                self.is_model_visible(descriptor)
+                !request.policy.denied_capabilities.contains(&descriptor.id)
+                    && self.is_model_visible(descriptor)
                     && request.policy.allows_runtime(descriptor.runtime)
                     && request.policy.allows_effects(&descriptor.effects)
                     && plan_capability(descriptor, self.runtime_policy).is_ok()
@@ -399,6 +409,7 @@ fn surface_version(
             "allowed_runtimes": canonical_runtime_kinds(&request.policy.allowed_runtimes),
             "allowed_effects": canonical_effect_kinds(&request.policy.allowed_effects),
             "include_requires_approval": request.policy.include_requires_approval,
+            "denied_capabilities": canonical_capability_ids(&request.policy.denied_capabilities),
             "max_capabilities": request.policy.max_capabilities,
         },
         "runtime_policy": runtime_policy,
@@ -475,6 +486,18 @@ fn capability_version_key(
         runtime_kind_token(capability.descriptor.runtime),
         access_token(capability.access),
     )
+}
+
+fn canonical_capability_ids(
+    capabilities: &[ironclaw_host_api::CapabilityId],
+) -> Vec<String> {
+    let mut values = capabilities
+        .iter()
+        .map(|capability| capability.as_str().to_string())
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+    values
 }
 
 fn canonical_runtime_kinds(runtimes: &[RuntimeKind]) -> Vec<&'static str> {

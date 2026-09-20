@@ -109,7 +109,14 @@ pub(crate) const REPEAT_CALL_LIMIT: u32 = 6;
 /// contributing nothing to the composed decision).
 const CAPABILITY_SPAWN_SUBAGENT: &str = "builtin.spawn_subagent";
 const CAPABILITY_RESULT_READ: &str = "builtin.result_read";
+const CAPABILITY_READ_FILE: &str = "builtin.read_file";
+const CAPABILITY_WRITE_FILE: &str = "builtin.write_file";
+const CAPABILITY_LIST_DIR: &str = "builtin.list_dir";
+const CAPABILITY_GLOB: &str = "builtin.glob";
+const CAPABILITY_GREP: &str = "builtin.grep";
+const CAPABILITY_APPLY_PATCH: &str = "builtin.apply_patch";
 const CAPABILITY_SHELL: &str = "builtin.shell";
+const TIANQUAN_TENANT_ID: &str = "tianquan";
 
 /// Deny reasons. These are `&'static str` because
 /// [`PrivilegedGateSink::deny`] requires them to flow through the rustc literal
@@ -118,6 +125,8 @@ const REASON_RESULT_READ_DURING_PENDING_SPAWN: &str =
     "spawn 是 blocking,等 resume 不要 result_read 轮询";
 const REASON_DUPLICATE_SPAWN: &str = "已 spawn,等 resume 不要重复 spawn";
 const REASON_SHELL_RATE_LIMITED: &str = "builtin.shell 调用过多,用 MCP 工具而非 shell";
+const REASON_TIANQUAN_FILE_WRITE_DISABLED: &str =
+    "天权生产 profile 已关闭任意文件写入,请使用 Artifact API/MCP";
 const REASON_REPEAT_CALL: &str = "同工具连续调用过多,勿空转重试:conforms 稳定则 advance_stage(to=approve) 进 committer,或 L7 完成切 loop:prose spawn_subagent 进 L8;真问题请报告而非重复调用";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +313,23 @@ impl PrivilegedBeforeCapabilityHook for TianquanBuiltinGuard {
         let repeats_previous_capability =
             state.last_capability.as_deref() == Some(ctx.capability_name.as_str());
         state.last_capability = Some(ctx.capability_name.clone());
+
+        if ctx.tenant_id.as_str() == TIANQUAN_TENANT_ID
+            && matches!(
+                ctx.capability_name.as_str(),
+                CAPABILITY_READ_FILE
+                    | CAPABILITY_WRITE_FILE
+                    | CAPABILITY_LIST_DIR
+                    | CAPABILITY_GLOB
+                    | CAPABILITY_GREP
+                    | CAPABILITY_APPLY_PATCH
+                    | CAPABILITY_SHELL
+            )
+        {
+            drop(state);
+            sink.deny(REASON_TIANQUAN_FILE_WRITE_DISABLED);
+            return;
+        }
 
         match ctx.capability_name.as_str() {
             CAPABILITY_SPAWN_SUBAGENT => {
@@ -509,8 +535,15 @@ mod tests {
     /// guard does not read arguments, so an unresolved view is fine and matches
     /// the no-resolver middleware path.
     fn ctx_for(capability_name: &str) -> BeforeCapabilityHookContext {
+        ctx_for_tenant("tianquan-test", capability_name)
+    }
+
+    fn ctx_for_tenant(
+        tenant: &str,
+        capability_name: &str,
+    ) -> BeforeCapabilityHookContext {
         BeforeCapabilityHookContext::new_unresolved(
-            TenantId::new("tianquan-test".to_string()).expect("valid tenant"),
+            TenantId::new(tenant.to_string()).expect("valid tenant"),
             capability_name.to_string(),
             [0u8; 32],
         )
@@ -578,6 +611,38 @@ mod tests {
             CapturedOutcome::Passed,
             "expected the guard to pass"
         );
+    }
+
+    #[test]
+    fn tianquan_tenant_denies_all_coding_and_shell_capabilities() {
+        let guard = TianquanBuiltinGuard::new();
+        for capability in [
+            CAPABILITY_READ_FILE,
+            CAPABILITY_WRITE_FILE,
+            CAPABILITY_LIST_DIR,
+            CAPABILITY_GLOB,
+            CAPABILITY_GREP,
+            CAPABILITY_APPLY_PATCH,
+            CAPABILITY_SHELL,
+        ] {
+            assert_denied(evaluate(&guard, &ctx_for_tenant(TIANQUAN_TENANT_ID, capability)));
+        }
+    }
+
+    #[test]
+    fn non_tianquan_tenant_is_not_affected_by_tianquan_coding_deny() {
+        let guard = TianquanBuiltinGuard::new();
+        for capability in [
+            CAPABILITY_READ_FILE,
+            CAPABILITY_WRITE_FILE,
+            CAPABILITY_LIST_DIR,
+            CAPABILITY_GLOB,
+            CAPABILITY_GREP,
+            CAPABILITY_APPLY_PATCH,
+            CAPABILITY_SHELL,
+        ] {
+            assert_passed(evaluate(&guard, &ctx_for_tenant("other-tenant", capability)));
+        }
     }
 
     #[test]

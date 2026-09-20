@@ -83,7 +83,7 @@ pub struct TianquanSoulFlavor {
 /// - META/WORLD(规划+世界):读 + delegate(派下游),不写 canon
 /// - LOOP plot/event/discourse(剧情层):读 + delegate + validate(调左脑校验)
 /// - LOOP pack(章节层):读 + delegate
-/// - LOOP prose(novelist 写正文 / auditor 审计 / committer 提交):读 + 写
+/// - LOOP prose(novelist/auditor/committer/polisher):只读输入，产物统一经 Artifact API/MCP 写入
 pub const TIANQUAN_SOUL_FLAVORS: &[TianquanSoulFlavor] = &[
     // META greenlight (L0)
     TianquanSoulFlavor {
@@ -91,21 +91,21 @@ pub const TIANQUAN_SOUL_FLAVORS: &[TianquanSoulFlavor] = &[
         tier: TianquanTier::MetaGreenlight,
         allow_nesting: false,
         summary: "市场调研+题材可爆性分析(L0 立项)",
-        tool_allowlist: &["builtin.read_file", "builtin.list_dir", "builtin.grep", "builtin.http"],
+        tool_allowlist: &["builtin.http"],
     },
     TianquanSoulFlavor {
         kind: "story-architect",
         tier: TianquanTier::MetaGreenlight,
         allow_nesting: false,
         summary: "项目身份立项+故事架构(L0)",
-        tool_allowlist: &["builtin.read_file", "builtin.list_dir", "builtin.grep"],
+        tool_allowlist: &[],
     },
     TianquanSoulFlavor {
         kind: "market-evaluator",
         tier: TianquanTier::MetaGreenlight,
         allow_nesting: false,
         summary: "立项审批+市场评估(L0)",
-        tool_allowlist: &["builtin.read_file", "builtin.list_dir", "builtin.grep"],
+        tool_allowlist: &[],
     },
     // META ontology (L1+L2)
     TianquanSoulFlavor {
@@ -113,14 +113,14 @@ pub const TIANQUAN_SOUL_FLAVORS: &[TianquanSoulFlavor] = &[
         tier: TianquanTier::MetaOntology,
         allow_nesting: false,
         summary: "本体类层定义+SHACL(L1)",
-        tool_allowlist: &["builtin.read_file", "builtin.list_dir", "builtin.grep", "builtin.write_file"],
+        tool_allowlist: &[],
     },
     TianquanSoulFlavor {
         kind: "ontologist",
         tier: TianquanTier::MetaOntology,
         allow_nesting: false,
         summary: "本体补丁+叙事契约(L2)",
-        tool_allowlist: &["builtin.read_file", "builtin.list_dir", "builtin.grep", "builtin.write_file"],
+        tool_allowlist: &[],
     },
     // WORLD (L3)
     TianquanSoulFlavor {
@@ -128,7 +128,7 @@ pub const TIANQUAN_SOUL_FLAVORS: &[TianquanSoulFlavor] = &[
         tier: TianquanTier::WorldStatic,
         allow_nesting: false,
         summary: "世界实体+运行时态(L3 world:static + loop:state)",
-        tool_allowlist: &["builtin.read_file", "builtin.list_dir", "builtin.grep", "builtin.write_file"],
+        tool_allowlist: &[],
     },
     // LOOP plot (L5)
     TianquanSoulFlavor {
@@ -136,7 +136,7 @@ pub const TIANQUAN_SOUL_FLAVORS: &[TianquanSoulFlavor] = &[
         tier: TianquanTier::LoopPlot,
         allow_nesting: false,
         summary: "剧情开槽+弧卡+伏笔(L5 loop:plot)",
-        tool_allowlist: &["builtin.read_file", "builtin.list_dir", "builtin.grep", "builtin.write_file"],
+        tool_allowlist: &[],
     },
     // LOOP event (L4)
     TianquanSoulFlavor {
@@ -144,7 +144,7 @@ pub const TIANQUAN_SOUL_FLAVORS: &[TianquanSoulFlavor] = &[
         tier: TianquanTier::LoopEvent,
         allow_nesting: false,
         summary: "事件填槽+因果链(L4 loop:event)",
-        tool_allowlist: &["builtin.read_file", "builtin.list_dir", "builtin.grep", "builtin.write_file"],
+        tool_allowlist: &[],
     },
     // LOOP discourse (L6)
     TianquanSoulFlavor {
@@ -152,7 +152,7 @@ pub const TIANQUAN_SOUL_FLAVORS: &[TianquanSoulFlavor] = &[
         tier: TianquanTier::LoopDiscourse,
         allow_nesting: false,
         summary: "话语规划+渲染调度(L6 loop:discourse)",
-        tool_allowlist: &["builtin.read_file", "builtin.list_dir", "builtin.grep", "builtin.write_file"],
+        tool_allowlist: &[],
     },
     // LOOP pack (L7)
     TianquanSoulFlavor {
@@ -160,14 +160,14 @@ pub const TIANQUAN_SOUL_FLAVORS: &[TianquanSoulFlavor] = &[
         tier: TianquanTier::LoopPack,
         allow_nesting: false,
         summary: "章节打包+Coverage(L7 loop:pack)",
-        tool_allowlist: &["builtin.read_file", "builtin.list_dir", "builtin.grep", "builtin.write_file"],
+        tool_allowlist: &[],
     },
     TianquanSoulFlavor {
         kind: "scene-reasoner",
         tier: TianquanTier::LoopPack,
         allow_nesting: false,
         summary: "场景推理+硬门(L7 loop:pack)",
-        tool_allowlist: &["builtin.read_file", "builtin.list_dir", "builtin.grep"],
+        tool_allowlist: &[],
     },
     // LOOP prose (L8)
     TianquanSoulFlavor {
@@ -175,35 +175,35 @@ pub const TIANQUAN_SOUL_FLAVORS: &[TianquanSoulFlavor] = &[
         tier: TianquanTier::LoopProse,
         allow_nesting: false,
         summary: "正文创作(P1-P12 大白话+铁律+VERIFY 15 项,L8 loop:prose)",
-        tool_allowlist: &["builtin.read_file", "builtin.list_dir", "builtin.grep", "builtin.write_file"],
+        tool_allowlist: &[],
     },
     TianquanSoulFlavor {
         kind: "auditor",
         tier: TianquanTier::LoopProse,
         allow_nesting: false,
         summary: "审计(13 硬检查+review-gate,L8 loop:prose)",
-        tool_allowlist: &["builtin.read_file", "builtin.list_dir", "builtin.grep"],
+        tool_allowlist: &[],
     },
     TianquanSoulFlavor {
         kind: "committer",
         tier: TianquanTier::LoopProse,
         allow_nesting: false,
         summary: "提交(9 commit-gate+CommitRecord,L8 loop:prose)",
-        tool_allowlist: &["builtin.read_file", "builtin.list_dir", "builtin.grep", "builtin.write_file"],
+        tool_allowlist: &[],
     },
     TianquanSoulFlavor {
         kind: "chapter-reviewer",
         tier: TianquanTier::LoopProse,
         allow_nesting: false,
         summary: "章节复核(L8 loop:prose)",
-        tool_allowlist: &["builtin.read_file", "builtin.list_dir", "builtin.grep"],
+        tool_allowlist: &[],
     },
     TianquanSoulFlavor {
         kind: "polisher",
         tier: TianquanTier::LoopProse,
         allow_nesting: false,
         summary: "润色(L8 loop:prose)",
-        tool_allowlist: &["builtin.read_file", "builtin.list_dir", "builtin.grep", "builtin.write_file"],
+        tool_allowlist: &[],
     },
 ];
 
@@ -287,9 +287,24 @@ mod tests {
 
     #[test]
     fn allowed_capabilities_for_novelist() {
+        // 天权铁律:创作 agent 无任何 coding 能力(读文件/写文件/列目录/检索/patch/shell
+        // 全部移除,2026-09-17 用户钦定"所有能力都围绕创作小说/创作虚拟世界")。
+        // 创作资产只能经 MCP 工具/ArtifactStore 坐标读写,不暴露任意文件路径。
         let caps = allowed_capabilities_for("novelist").unwrap();
-        assert!(caps.contains(&CapabilityId::new("builtin.write_file").unwrap()));
-        assert!(caps.contains(&CapabilityId::new("builtin.read_file").unwrap()));
+        for capability in [
+            "builtin.write_file",
+            "builtin.read_file",
+            "builtin.list_dir",
+            "builtin.glob",
+            "builtin.grep",
+            "builtin.apply_patch",
+            "builtin.shell",
+        ] {
+            assert!(
+                !caps.contains(&CapabilityId::new(capability).unwrap()),
+                "novelist 不应拥有 {capability}"
+            );
+        }
     }
 
     #[test]

@@ -87,8 +87,6 @@ pub const APPLY_PATCH_CAPABILITY_ID: &str = "builtin.apply_patch";
 const PROCESS_PORT_BACKED_BUILTIN_CAPABILITY_IDS: &[&str] = &[SHELL_CAPABILITY_ID];
 
 const MAX_FIRST_PARTY_INPUT_BYTES: usize = 1_048_576;
-const MAX_WRITE_FILE_INPUT_BYTES: usize = 6 * 1024 * 1024;
-const MAX_APPLY_PATCH_INPUT_BYTES: usize = 21 * 1024 * 1024;
 const FIRST_PARTY_DEFAULT_OUTPUT_BYTES: u64 = 16 * 1024;
 pub(super) const FIRST_PARTY_MAX_OUTPUT_BYTES: u64 = 1_048_576;
 const FIRST_PARTY_DEFAULT_WALL_CLOCK_MS: u64 = 100;
@@ -112,13 +110,6 @@ const CODING_CAPABILITIES: &[CodingCapabilityMetadata] = &[
         max_input_bytes: MAX_FIRST_PARTY_INPUT_BYTES,
     },
     CodingCapabilityMetadata {
-        id: WRITE_FILE_CAPABILITY_ID,
-        kind: CodingCapabilityKind::WriteFile,
-        description: "Write content through scoped mounts with v1 write_file output shape",
-        effects: &[EffectKind::WriteFilesystem],
-        max_input_bytes: MAX_WRITE_FILE_INPUT_BYTES,
-    },
-    CodingCapabilityMetadata {
         id: LIST_DIR_CAPABILITY_ID,
         kind: CodingCapabilityKind::ListDir,
         description: "List directory contents through scoped mounts with v1 list_dir output shape",
@@ -138,13 +129,6 @@ const CODING_CAPABILITIES: &[CodingCapabilityMetadata] = &[
         description: "Search scoped file contents with v1 grep output modes",
         effects: &[EffectKind::ReadFilesystem],
         max_input_bytes: MAX_FIRST_PARTY_INPUT_BYTES,
-    },
-    CodingCapabilityMetadata {
-        id: APPLY_PATCH_CAPABILITY_ID,
-        kind: CodingCapabilityKind::ApplyPatch,
-        description: "Apply exact/fuzzy search-replace edits through scoped mounts",
-        effects: &[EffectKind::ReadFilesystem, EffectKind::WriteFilesystem],
-        max_input_bytes: MAX_APPLY_PATCH_INPUT_BYTES,
     },
 ];
 

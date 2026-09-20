@@ -11,8 +11,7 @@ use ironclaw_host_api::{
     CapabilityId, EffectKind, ExecutionContext, ExtensionId, InvocationId, MountView,
     ResourceScope, RuntimeKind, TrustClass, UserId,
 };
-use ironclaw_host_runtime::{
-    CapabilitySurfacePolicy, HostRuntime, SurfaceKind,
+use ironclaw_host_runtime::{HostRuntime, SurfaceKind,
     VisibleCapabilityRequest as HostVisibleCapabilityRequest,
 };
 use ironclaw_loop_host::{
@@ -41,6 +40,7 @@ use ironclaw_turns::{
 };
 
 use crate::builtin_capability_policy::BuiltinCapabilityPolicy;
+use crate::tianquan_capability_policy::{filter_tianquan_grants, tianquan_surface_policy};
 use crate::local_dev_authorization::{
     StoreApprovalSettingsProvider, local_dev_effects_require_approval,
 };
@@ -1125,6 +1125,7 @@ fn visible_capability_request(
         inputs.memory_mounts,
         inputs.system_extensions_lifecycle_mounts,
     );
+    filter_tianquan_grants(&run_context.scope.tenant_id, &mut grants);
     grants
         .grants
         .extend(inputs.extension_surface.grants(&extension_id, &user_id));
@@ -1168,7 +1169,7 @@ fn visible_capability_request(
         context,
         SurfaceKind::new("agent_loop").map_err(host_api_agent_loop_error)?,
     )
-    .with_policy(CapabilitySurfacePolicy::allow_all())
+    .with_policy(tianquan_surface_policy())
     .with_provider_trust(provider_trust))
 }
 

@@ -982,6 +982,7 @@ async fn visible_surface_policy_filters_runtime_and_effects_before_authorization
         allowed_runtimes: vec![RuntimeKind::Wasm],
         allowed_effects: vec![EffectKind::DispatchCapability],
         include_requires_approval: true,
+        denied_capabilities: Vec::new(),
         max_capabilities: None,
     };
 
@@ -1227,12 +1228,14 @@ async fn visible_surface_version_is_order_insensitive_for_equivalent_policy() {
         allowed_runtimes: vec![RuntimeKind::Wasm, RuntimeKind::Script],
         allowed_effects: vec![EffectKind::DispatchCapability, EffectKind::Network],
         include_requires_approval: true,
+        denied_capabilities: Vec::new(),
         max_capabilities: None,
     };
     let policy_b = CapabilitySurfacePolicy {
         allowed_runtimes: vec![RuntimeKind::Script, RuntimeKind::Wasm],
         allowed_effects: vec![EffectKind::Network, EffectKind::DispatchCapability],
         include_requires_approval: true,
+        denied_capabilities: Vec::new(),
         max_capabilities: None,
     };
 

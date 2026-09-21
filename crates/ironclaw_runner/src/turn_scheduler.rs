@@ -650,7 +650,11 @@ async fn run_scheduler_loop(
                 }
             }
             _ = recovery_tick.tick() => {
-                recover_expired_leases(Arc::clone(&context.transitions)).await;
+                // ISSUE-IRONCLAW-009: 活动 executor 持有中的 run 不参与 lease 回收——
+                // executor 活着即 run 活着,心跳饿死不该让收割割掉整段工作。
+                let active_run_ids: Vec<ironclaw_turns::TurnRunId> =
+                    active_runs.keys().copied().collect();
+                recover_expired_leases(Arc::clone(&context.transitions), active_run_ids).await;
             }
             _ = await_edge_recovery_tick.tick(), if await_edge_recovery.is_some() => {
                 start_await_edge_recovery_if_idle(
@@ -1113,13 +1117,17 @@ fn scheduler_failure(category: &'static str) -> Option<SanitizedFailure> {
     }
 }
 
-async fn recover_expired_leases(transitions: Arc<dyn TurnRunTransitionPort>) {
+async fn recover_expired_leases(
+    transitions: Arc<dyn TurnRunTransitionPort>,
+    exclude_run_ids: Vec<ironclaw_turns::TurnRunId>,
+) {
     let result: Result<_, TurnError> = transitions
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: Utc::now(),
             // Scheduler currently owns one global worker pool; if composition
             // introduces per-tenant schedulers, thread that scope filter here.
             scope_filter: None,
+            exclude_run_ids,
         })
         .await;
     match result {

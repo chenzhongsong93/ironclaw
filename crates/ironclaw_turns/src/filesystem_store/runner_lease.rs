@@ -438,7 +438,10 @@ impl RunnerLeaseStore {
             return Ok(None);
         };
         if let Some((runner_id, lease_token)) = expected_runner {
-            ensure_active_runner_lease(&existing, runner_id, lease_token, chrono::Utc::now())?;
+            // ISSUE-IRONCLAW-009: 终态退休路径认身份不认过期——到达此处的调用方全是
+            // terminal retirement(complete/fail/cancel/relinquish),正统 owner 交卷
+            // 不该被过期租约拦。过期租约的 reclaim 安全由 reaper 清 token 保证。
+            ensure_rightful_runner_lease(&existing, runner_id, lease_token)?;
         }
         if existing.status == status {
             return Ok(None);
@@ -522,6 +525,17 @@ fn apply_runner_lease_overlay(record: &mut TurnRunRecord, lease: &RunnerLeaseRec
     }
     record.last_heartbeat_at = Some(lease.last_heartbeat_at);
     record.lease_expires_at = Some(lease.lease_expires_at);
+}
+
+fn ensure_rightful_runner_lease(
+    record: &RunnerLeaseRecord,
+    runner_id: crate::TurnRunnerId,
+    lease_token: crate::TurnLeaseToken,
+) -> Result<(), TurnError> {
+    if record.runner_id != runner_id || record.lease_token != lease_token {
+        return Err(TurnError::LeaseMismatch);
+    }
+    Ok(())
 }
 
 fn ensure_active_runner_lease(

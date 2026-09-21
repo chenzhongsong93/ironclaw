@@ -943,8 +943,10 @@ where
     let checkpoint = put_loop_checkpoint(store, &claimed, LoopCheckpointKind::BeforeModel).await;
     let recovered = store
         .recover_expired_leases(RecoverExpiredLeasesRequest {
-            now: Utc::now() + chrono::Duration::seconds(120),
+            // 既红修复(2026-09-21):TTL 90→600 后 +120s 永不过期;改 +700s。
+            now: Utc::now() + chrono::Duration::seconds(700),
             scope_filter: Some(scope(&retryable_thread)),
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();
@@ -976,8 +978,10 @@ where
     put_loop_checkpoint(store, &claimed, LoopCheckpointKind::Final).await;
     let recovered = store
         .recover_expired_leases(RecoverExpiredLeasesRequest {
-            now: Utc::now() + chrono::Duration::seconds(120),
+            // 既红修复(2026-09-21):TTL 90→600 后 +120s 永不过期;改 +700s。
+            now: Utc::now() + chrono::Duration::seconds(700),
             scope_filter: Some(scope(&nonretryable_thread)),
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();

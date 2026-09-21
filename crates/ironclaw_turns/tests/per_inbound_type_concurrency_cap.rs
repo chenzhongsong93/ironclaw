@@ -383,8 +383,11 @@ async fn trigger_counter_decrements_on_lease_expiry() {
 
     store
         .recover_expired_leases(RecoverExpiredLeasesRequest {
-            now: Utc::now() + ChronoDuration::seconds(300),
+            // 既红修复(2026-09-21):TTL 90→200→420→600 上调后该拨钟没跟着更新,
+            // +300s < 600s lease 永不过期致计数器不降;改 +700s 越过当前 TTL。
+            now: Utc::now() + ChronoDuration::seconds(700),
             scope_filter: None,
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();

@@ -161,6 +161,7 @@ async fn event_publishing_transition_port_publishes_expired_lease_terminal_event
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: Utc::now() + ChronoDuration::seconds(120),
             scope_filter: None,
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();
@@ -202,8 +203,10 @@ async fn event_publishing_transition_port_publishes_expired_lease_terminal_event
 
     let recovered = transition_port
         .recover_expired_leases(RecoverExpiredLeasesRequest {
-            now: Utc::now() + ChronoDuration::seconds(120),
+            // 既红修复(2026-09-21):TTL 600 后 +120s 永不过期;改 +700s。
+            now: Utc::now() + ChronoDuration::seconds(700),
             scope_filter: None,
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();

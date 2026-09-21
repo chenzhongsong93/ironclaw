@@ -1231,6 +1231,7 @@ async fn filesystem_turn_state_store_does_not_write_unchanged_idle_runner_snapsh
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: Utc.with_ymd_and_hms(2026, 5, 27, 0, 12, 0).unwrap(),
             scope_filter: None,
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();
@@ -2775,6 +2776,7 @@ async fn filesystem_turn_state_store_no_op_under_active_lease_overlay_does_not_r
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: Utc.with_ymd_and_hms(2026, 5, 17, 12, 0, 0).unwrap(),
             scope_filter: None,
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();
@@ -2914,6 +2916,7 @@ async fn filesystem_turn_state_store_recover_expired_leases_uses_memory_runner_l
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: first_expiry + chrono::Duration::milliseconds(1),
             scope_filter: None,
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();
@@ -2926,6 +2929,7 @@ async fn filesystem_turn_state_store_recover_expired_leases_uses_memory_runner_l
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: refreshed_expiry + chrono::Duration::milliseconds(1),
             scope_filter: None,
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();

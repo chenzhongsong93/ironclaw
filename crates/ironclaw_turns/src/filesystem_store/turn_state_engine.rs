@@ -1977,7 +1977,7 @@ impl TurnRunTransitionPort for TurnStateEngine {
         let mut record = inner.take_record(request.run_id)?;
         let result = (|| {
             let now = Utc::now();
-            ensure_active_lease(&record, request.runner_id, request.lease_token, now)?;
+            ensure_rightful_owner(&record, request.runner_id, request.lease_token)?;
             if record.status.get() != TurnStatus::Running {
                 return Err(TurnError::InvalidTransition {
                     from: record.status.get(),
@@ -2010,7 +2010,7 @@ impl TurnRunTransitionPort for TurnStateEngine {
             let mut record = inner.take_record(request.run_id)?;
             let inner_result = (|| {
                 let now = Utc::now();
-                ensure_active_lease(&record, request.runner_id, request.lease_token, now)?;
+                ensure_rightful_owner(&record, request.runner_id, request.lease_token)?;
                 if !matches!(record.status.get(), TurnStatus::Running) {
                     return Err(TurnError::InvalidTransition {
                         from: record.status.get(),
@@ -2604,6 +2604,12 @@ impl Inner {
                 {
                     return None;
                 }
+                // ISSUE-IRONCLAW-009: 活动 executor 持有中的 run 不回收——executor
+                // 活着即 run 活着;心跳饿死(长请求期 store 锁争用)不该让收割把整段
+                // 工作割掉。executor surfaced 终态后 active_runs 移除,下轮巡检才会收。
+                if request.exclude_run_ids.iter().any(|id| id == run_id) {
+                    return None;
+                }
                 if record
                     .lease_expires_at
                     .is_some_and(|expires_at| expires_at <= request.now)
@@ -3160,7 +3166,7 @@ impl Inner {
     ) -> Result<TurnRunState, TurnError> {
         let mut record = self.take_record(run_id)?;
         let result = (|| {
-            ensure_active_lease(&record, runner_id, lease_token, Utc::now())?;
+            ensure_rightful_owner(&record, runner_id, lease_token)?;
             if record.status.get() != TurnStatus::CancelRequested {
                 return Err(TurnError::InvalidTransition {
                     from: record.status.get(),
@@ -3199,7 +3205,7 @@ impl Inner {
     ) -> Result<TurnRunState, TurnError> {
         let mut record = self.take_record(run_id)?;
         let result = (|| {
-            ensure_active_lease(&record, runner_id, lease_token, Utc::now())?;
+            ensure_rightful_owner(&record, runner_id, lease_token)?;
             if record.status.get() == TurnStatus::CancelRequested
                 || record.status.get().is_terminal()
             {
@@ -3259,7 +3265,7 @@ impl Inner {
     ) -> Result<TurnRunState, TurnError> {
         let mut record = self.take_record(run_id)?;
         let result = (|| {
-            if let Err(error) = ensure_active_lease(&record, runner_id, lease_token, Utc::now()) {
+            if let Err(error) = ensure_rightful_owner(&record, runner_id, lease_token) {
                 return AppliedLoopTransition::Rejected {
                     record: Box::new(record),
                     error,
@@ -3515,7 +3521,7 @@ impl Inner {
     ) -> Result<TurnRunState, TurnError> {
         let record = self.take_record(run_id)?;
         let transition = (|| {
-            if let Err(error) = ensure_active_lease(&record, runner_id, lease_token, Utc::now()) {
+            if let Err(error) = ensure_rightful_owner(&record, runner_id, lease_token) {
                 return AppliedLoopTransition::Rejected {
                     record: Box::new(record),
                     error,
@@ -3536,7 +3542,7 @@ impl Inner {
         let mut record = self.take_record(run_id)?;
         let mut requeue = false;
         let result = (|| {
-            ensure_active_lease(&record, runner_id, lease_token, now)?;
+            ensure_rightful_owner(&record, runner_id, lease_token)?;
             if !matches!(
                 record.status.get(),
                 TurnStatus::Running | TurnStatus::CancelRequested
@@ -4140,6 +4146,25 @@ fn ensure_active_lease(
         return Err(TurnError::Conflict {
             reason: "turn run lease expired".to_string(),
         });
+    }
+    Ok(())
+}
+
+/// 终态/进度路径的租约校验(ISSUE-IRONCLAW-009):只认身份,不认过期。
+///
+/// lease 过期是"回收信号"而不是"授权撤销"——授权=runner_id+lease_token 身份匹配。
+/// 回收方(reaper)通过清空 record 上的 token 让旧 executor 的身份失效( reclaim 后
+/// 再 claim 会换发新 token),身份校验天然防双完成/幽灵完成。长生成场景心跳可能在
+/// 长请求期饿死,若终态转移也卡过期,executor 干完活却无法交卷,整段工作照样丢失。
+/// 心跳路径仍走 [`ensure_active_lease`](ensure_active_lease) 严格版(过期拒绝续期),
+/// hung-executor 的回收语义不变。
+fn ensure_rightful_owner(
+    record: &RunRecord,
+    runner_id: crate::TurnRunnerId,
+    lease_token: crate::TurnLeaseToken,
+) -> Result<(), TurnError> {
+    if record.runner_id != Some(runner_id) || record.lease_token != Some(lease_token) {
+        return Err(TurnError::LeaseMismatch);
     }
     Ok(())
 }

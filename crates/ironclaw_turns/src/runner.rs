@@ -42,6 +42,11 @@ pub struct HeartbeatRequest {
 pub struct RecoverExpiredLeasesRequest {
     pub now: TurnTimestamp,
     pub scope_filter: Option<TurnScope>,
+    /// 调度器当前持有活动 executor 任务的 run——这些 run 的 lease 即使过期也不许
+    /// 回收(ISSUE-IRONCLAW-009):executor 活着就是 run 活着,心跳续期可能在长请求期
+    /// 饿死,但回收必须等 executor 自己 surfaced 终态,否则整段工作被割掉。
+    #[serde(default)]
+    pub exclude_run_ids: Vec<TurnRunId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

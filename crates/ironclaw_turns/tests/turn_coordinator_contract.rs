@@ -1749,6 +1749,7 @@ async fn event_publishing_transition_port_publishes_expired_lease_terminal_event
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: Utc::now() + ChronoDuration::seconds(120),
             scope_filter: None,
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();
@@ -1792,6 +1793,7 @@ async fn event_publishing_transition_port_publishes_expired_lease_terminal_event
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: Utc::now() + ChronoDuration::seconds(120),
             scope_filter: None,
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();
@@ -1965,6 +1967,7 @@ async fn event_publishing_transition_port_preserves_terminal_recovery_reason() {
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: lease_expires_at + ChronoDuration::milliseconds(1),
             scope_filter: Some(scope("thread-recovery-sink")),
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();
@@ -2032,6 +2035,7 @@ async fn event_publishing_transition_port_attempts_all_expired_lease_events_afte
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: lease_expires_at + ChronoDuration::milliseconds(1),
             scope_filter: None,
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();
@@ -2112,6 +2116,7 @@ async fn event_publishing_transition_port_attempts_all_expired_lease_events_afte
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: lease_expires_at + ChronoDuration::milliseconds(1),
             scope_filter: None,
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();
@@ -3894,6 +3899,7 @@ async fn model_route_snapshot_persists_across_snapshot_restore_and_recovery() {
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: Utc::now() + ChronoDuration::hours(1),
             scope_filter: Some(scope("thread-route")),
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();
@@ -5624,6 +5630,7 @@ async fn cancel_requested_runner_heartbeat_does_not_extend_lease() {
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: Utc::now(),
             scope_filter: None,
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();
@@ -5632,7 +5639,7 @@ async fn cancel_requested_runner_heartbeat_does_not_extend_lease() {
 }
 
 #[tokio::test]
-async fn expired_runner_lease_rejects_heartbeat_and_terminal_completion_before_recovery_sweep() {
+async fn expired_runner_lease_rejects_heartbeat_but_honors_rightful_owner_terminal_completion() {
     let limits =
         TurnStateStoreLimits::default().set_runner_lease_ttl(ChronoDuration::milliseconds(-1));
     let store = Arc::new(in_memory_turn_state_store().with_limits(limits));
@@ -5670,6 +5677,10 @@ async fn expired_runner_lease_rejects_heartbeat_and_terminal_completion_before_r
         }
     );
 
+    // ISSUE-IRONCLAW-009: 终态交卷认身份不认过期——lease 过期是回收信号不是授权
+    // 撤销。正统 executor(runner_id+token 匹配)干完活必须能交卷,否则长生成被
+    // 心跳饿死+过期双杀,整段工作丢失。回收安全由 reclaim 清 token 保证(旧 token
+    // 再交卷= LeaseMismatch)。
     let completed = store
         .complete_run(CompleteRunRequest {
             run_id,
@@ -5677,13 +5688,8 @@ async fn expired_runner_lease_rejects_heartbeat_and_terminal_completion_before_r
             lease_token,
         })
         .await
-        .unwrap_err();
-    assert_eq!(
-        completed,
-        TurnError::Conflict {
-            reason: "turn run lease expired".to_string(),
-        }
-    );
+        .expect("rightful owner 终态交卷不应被过期租约拒绝");
+    assert_eq!(completed.status, TurnStatus::Completed);
 
     let state = coordinator
         .get_run_state(GetRunStateRequest {
@@ -5692,11 +5698,77 @@ async fn expired_runner_lease_rejects_heartbeat_and_terminal_completion_before_r
         })
         .await
         .unwrap();
-    assert_eq!(state.status, TurnStatus::Running);
+    assert_eq!(state.status, TurnStatus::Completed);
 }
 
 #[tokio::test]
-async fn expired_runner_lease_rejects_fail_and_runner_side_cancel_before_recovery_sweep() {
+async fn expired_lease_recovery_skips_runs_with_live_executors() {
+    // ISSUE-IRONCLAW-009 回归:lease 过期但 executor 还活着的 run 不许被回收巡检收割
+    // (executor 活着即 run 活着);executor 消失后(排除集为空)才允许回收。
+    let limits =
+        TurnStateStoreLimits::default().set_runner_lease_ttl(ChronoDuration::milliseconds(-1));
+    let store = Arc::new(in_memory_turn_state_store().with_limits(limits));
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+    let run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-a"))
+            .await
+            .unwrap(),
+    );
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    // executor 持有中:排除集含本 run → 巡检不回收
+    let skipped = store
+        .recover_expired_leases(RecoverExpiredLeasesRequest {
+            now: Utc::now(),
+            scope_filter: None,
+            exclude_run_ids: vec![run_id],
+        })
+        .await
+        .unwrap();
+    assert!(
+        skipped.recovered.is_empty(),
+        "活动 executor 持有中的 run 不被回收,实得 {:?}",
+        skipped
+            .recovered
+            .iter()
+            .map(|s| s.status)
+            .collect::<Vec<_>>()
+    );
+    let state = coordinator
+        .get_run_state(GetRunStateRequest {
+            scope: scope("thread-a"),
+            run_id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(state.status, TurnStatus::Running, "run 保持 Running");
+
+    // executor 消失:排除集为空 → 照常回收
+    let recovered = store
+        .recover_expired_leases(RecoverExpiredLeasesRequest {
+            now: Utc::now(),
+            scope_filter: None,
+            exclude_run_ids: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(recovered.recovered.len(), 1, "无活动 executor 后允许回收");
+    assert_eq!(recovered.recovered[0].run_id, run_id);
+}
+
+#[tokio::test]
+async fn expired_runner_lease_honors_rightful_owner_fail_and_runner_side_cancel() {
     let limits =
         TurnStateStoreLimits::default().set_runner_lease_ttl(ChronoDuration::milliseconds(-1));
     let store = Arc::new(in_memory_turn_state_store().with_limits(limits));
@@ -5720,6 +5792,7 @@ async fn expired_runner_lease_rejects_fail_and_runner_side_cancel_before_recover
         .unwrap()
         .unwrap();
 
+    // ISSUE-IRONCLAW-009: 同上——正统 owner 的失败终态交卷放行(认身份不认过期)。
     let failed = store
         .fail_run(FailRunRequest {
             run_id: failed_run_id,
@@ -5728,13 +5801,8 @@ async fn expired_runner_lease_rejects_fail_and_runner_side_cancel_before_recover
             failure: SanitizedFailure::new("late_failure").unwrap(),
         })
         .await
-        .unwrap_err();
-    assert_eq!(
-        failed,
-        TurnError::Conflict {
-            reason: "turn run lease expired".to_string(),
-        }
-    );
+        .expect("rightful owner 失败终态交卷不应被过期租约拒绝");
+    assert_eq!(failed.status, TurnStatus::Failed);
 
     let cancelled_run_id = accepted_run_id(
         &coordinator
@@ -5769,13 +5837,8 @@ async fn expired_runner_lease_rejects_fail_and_runner_side_cancel_before_recover
             lease_token: cancel_lease_token,
         })
         .await
-        .unwrap_err();
-    assert_eq!(
-        cancelled,
-        TurnError::Conflict {
-            reason: "turn run lease expired".to_string(),
-        }
-    );
+        .expect("rightful owner 取消终态交卷不应被过期租约拒绝");
+    assert_eq!(cancelled.status, TurnStatus::Cancelled);
 }
 
 #[tokio::test]
@@ -5872,6 +5935,7 @@ async fn expired_running_lease_fails_and_releases_thread_lock() {
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: lease_expires_at - ChronoDuration::milliseconds(1),
             scope_filter: None,
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();
@@ -5881,6 +5945,7 @@ async fn expired_running_lease_fails_and_releases_thread_lock() {
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: lease_expires_at + ChronoDuration::milliseconds(1),
             scope_filter: None,
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();
@@ -5956,6 +6021,7 @@ async fn expired_cancel_requested_lease_cancels_and_releases_thread_lock() {
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: lease_expires_at + ChronoDuration::milliseconds(1),
             scope_filter: None,
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();
@@ -6016,6 +6082,7 @@ async fn cancel_after_expired_failed_run_reports_already_terminal_and_allows_new
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: lease_expires_at + ChronoDuration::milliseconds(1),
             scope_filter: None,
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();

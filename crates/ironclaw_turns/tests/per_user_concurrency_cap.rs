@@ -395,8 +395,10 @@ async fn running_counter_decrements_on_lease_expiry() {
     // Expire the lease by advancing time far into the future.
     store
         .recover_expired_leases(RecoverExpiredLeasesRequest {
-            now: Utc::now() + ChronoDuration::seconds(300),
+            // 既红修复(2026-09-21):同 per_inbound 族,TTL 600 后 +300s 永不过期。
+            now: Utc::now() + ChronoDuration::seconds(700),
             scope_filter: None,
+            exclude_run_ids: Vec::new(),
         })
         .await
         .unwrap();

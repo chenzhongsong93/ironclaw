@@ -704,6 +704,7 @@ where
                 .recover_expired_leases(RecoverExpiredLeasesRequest {
                     now,
                     scope_filter: None,
+                    exclude_run_ids: Vec::new(),
                 })
                 .await
                 .map(|_| Effect::Recovered)
@@ -1857,6 +1858,7 @@ async fn crash_preserves_single_claim_and_lease_expiry_requeues_abandoned_run() 
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap(),
             scope_filter: None,
+            exclude_run_ids: Vec::new(),
         })
         .await
         .expect("recover expired leases");
@@ -2106,6 +2108,7 @@ async fn lease_expiry_requeues_checkpointless_run_as_redrivable() {
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap(),
             scope_filter: None,
+            exclude_run_ids: Vec::new(),
         })
         .await
         .expect("lease recovery");
@@ -2188,6 +2191,7 @@ async fn lease_expiry_crash_retry_bound_fails_with_crash_retry_exhausted() {
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap(),
             scope_filter: None,
+            exclude_run_ids: Vec::new(),
         })
         .await
         .expect("lease recovery");

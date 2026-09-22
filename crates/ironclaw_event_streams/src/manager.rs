@@ -475,19 +475,28 @@ async fn forward_subscription_items(
                         return;
                     }
                 }
-                match sender.try_send(ProjectionStreamItem::Update(envelope)) {
-                    Ok(()) => {
+                // Backpressure policy (ISSUE-IRONCLAW-010 follow-up): a slow
+                // subscriber must apply *backpressure* to the live source, not
+                // terminate the subscription. Terminating on `Full` converted
+                // one slow SSE hop (api proxy, browser tab) into a close →
+                // cursor-reconnect loop; at ~1 reconnect/s that burned the
+                // webui SSE per-caller open budget (30/60s) and produced the
+                // observed 429 storm. Blocking send (with `closed()` escape)
+                // propagates the stall upstream instead — every layer between
+                // here and the HTTP body already uses blocking sends.
+                //
+                // Terminal `Lagged` reasons below are unchanged: they signal
+                // real data loss (broadcast overflow) or policy blocks
+                // (access/redaction), where resync-by-snapshot is the only
+                // correct recovery.
+                tokio::select! {
+                    _ = sender.closed() => return,
+                    sent = sender.send(ProjectionStreamItem::Update(envelope)) => {
+                        if sent.is_err() {
+                            return;
+                        }
                         last_delivered_cursor = envelope_cursor;
                     }
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        send_terminal_lag(
-                            &terminal_sender,
-                            LagReason::SubscriberBackpressure,
-                            &last_delivered_cursor,
-                        );
-                        return;
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => return,
                 }
             }
             Err(broadcast::error::RecvError::Lagged(_)) => {

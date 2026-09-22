@@ -534,7 +534,13 @@ async fn unrelated_scope_live_burst_does_not_lag_subscription() {
 }
 
 #[tokio::test]
-async fn slow_subscriber_gets_backpressure_lag_marker() {
+async fn slow_subscriber_applies_backpressure_without_terminating() {
+    // ISSUE-IRONCLAW-010 follow-up: a slow subscriber must NOT get a terminal
+    // lag marker — the forward task blocks on the bounded channel instead, so
+    // the subscription survives and every envelope is delivered in order.
+    // Terminating on channel-full was what turned one slow SSE hop into a
+    // close→reconnect loop (and, at ~1 reconnect/s, a 429 storm against the
+    // webui per-caller open budget).
     let scope = projection_scope("thread-a");
     let source = Arc::new(InMemoryProjectionUpdateSource::new(8));
     let manager = manager_with_source(scope.clone(), Arc::clone(&source));
@@ -548,13 +554,13 @@ async fn slow_subscriber_gets_backpressure_lag_marker() {
 
     tokio::time::sleep(Duration::from_millis(10)).await;
 
+    // Publish while the consumer is idle: with capacity 1 the forward task
+    // parks on the blocking send instead of killing the subscription.
     source
         .publish(ProductProjectionEnvelope::ThreadUpdates(replay(
             &scope, 11, 11,
         )))
         .expect("publish update");
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     match timeout(Duration::from_secs(1), subscription.next())
         .await
@@ -564,27 +570,38 @@ async fn slow_subscriber_gets_backpressure_lag_marker() {
         ProjectionStreamItem::Snapshot(envelope) => {
             assert_eq!(envelope.cursor().runtime, EventCursor::new(10));
         }
-        other => panic!("expected queued snapshot before terminal lag, got {other:?}"),
+        other => panic!("expected queued snapshot first, got {other:?}"),
     }
 
+    // The parked update is delivered once the consumer drains the snapshot —
+    // no terminal lag marker, stream stays open.
     match timeout(Duration::from_secs(1), subscription.next())
         .await
-        .expect("terminal backpressure marker after snapshot")
-        .expect("terminal backpressure marker after snapshot")
+        .expect("backpressured update must still arrive")
+        .expect("backpressured update must still arrive")
     {
-        ProjectionStreamItem::Lagged {
-            reason,
-            snapshot_cursor,
-        } => {
-            assert_eq!(reason, LagReason::SubscriberBackpressure);
-            assert_eq!(snapshot_cursor.runtime, EventCursor::new(10));
+        ProjectionStreamItem::Update(envelope) => {
+            assert_eq!(envelope.cursor().runtime, EventCursor::new(11));
         }
-        other => panic!("expected backpressure marker, got {other:?}"),
+        other => panic!("expected update 11 after draining snapshot, got {other:?}"),
     }
-    assert!(
-        subscription.next().await.is_none(),
-        "terminal lag should close the observable stream"
-    );
+
+    // One more update to prove the subscription is still live afterwards.
+    source
+        .publish(ProductProjectionEnvelope::ThreadUpdates(replay(
+            &scope, 12, 12,
+        )))
+        .expect("publish second update");
+    match timeout(Duration::from_secs(1), subscription.next())
+        .await
+        .expect("subscription must survive backpressure")
+        .expect("subscription must survive backpressure")
+    {
+        ProjectionStreamItem::Update(envelope) => {
+            assert_eq!(envelope.cursor().runtime, EventCursor::new(12));
+        }
+        other => panic!("expected update 12, got {other:?}"),
+    }
 }
 
 #[tokio::test]

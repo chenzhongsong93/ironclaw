@@ -124,6 +124,10 @@ pub enum ProjectionStreamItem {
 pub enum LagReason {
     SourceLagged,
     SourceFailed,
+    /// Retained for wire/diagnostic compatibility. No longer emitted: the
+    /// manager now applies blocking backpressure to slow subscribers instead
+    /// of terminating their subscriptions (ISSUE-IRONCLAW-010 follow-up —
+    /// terminate-on-full turned one slow SSE hop into a reconnect storm).
     SubscriberBackpressure,
     RedactionBlocked,
     AccessBlocked,

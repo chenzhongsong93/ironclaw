@@ -27,41 +27,43 @@ use ironclaw_product_workflow::{
     CodexLoginStart, FsMount, LifecyclePackageKind, LifecyclePackageRef, LlmConfigSnapshot,
     LlmModelsResult, LlmProbeRequest, LlmProbeResult, LlmSubjectKeyPutRequest, LlmSubjectKeyStatus,
     NearAiLoginRequest, NearAiLoginStart, NearAiWalletLoginRequest, NearAiWalletLoginResult,
-    ProductOutboundEnvelope, ProductWorkflowError, ProjectFsFile, ProjectionCursor,
-    RebornAccountLoginLinkResponse, RebornAccountTracesResponse, RebornAddMemberRequest,
-    RebornAdminCreateUserRequest, RebornAdminPutSecretRequest, RebornAdminSecretDeletedResponse,
-    RebornAdminSecretResponse, RebornAdminSetRoleRequest, RebornAdminSetStatusRequest,
-    RebornAdminUpdateUserRequest, RebornAdminUserCreatedResponse, RebornAdminUserDeletedResponse,
-    RebornAdminUserListQuery, RebornAdminUserListResponse, RebornAdminUserResponse,
-    RebornAdminUserSecretsListResponse, RebornAttachmentRequest, RebornAutomationMutationResponse,
-    RebornCancelRunResponse, RebornConnectableChannelListResponse, RebornCreateProjectRequest,
-    RebornCreateThreadResponse, RebornDeleteProjectRequest, RebornDeleteThreadRequest,
-    RebornDeleteThreadResponse, RebornExtensionActionResponse, RebornExtensionListResponse,
-    RebornExtensionRegistryResponse, RebornFsListRequest, RebornFsListResponse,
-    RebornFsMountsResponse, RebornFsReadRequest, RebornFsStatRequest, RebornFsStatResponse,
-    RebornGetProjectRequest, RebornListAutomationsResponse, RebornListMembersRequest,
-    RebornListMembersResponse, RebornListProjectsRequest, RebornListProjectsResponse,
-    RebornListThreadsResponse, RebornLogQueryRequest, RebornLogQueryResponse,
-    RebornOperatorCommandPlaneResponse, RebornOperatorConfigGetResponse,
-    RebornOperatorConfigListResponse, RebornOperatorConfigSetRequest,
-    RebornOperatorConfigValidateRequest, RebornOperatorConfigValidateResponse,
-    RebornOperatorLogsQuery, RebornOperatorServiceLifecycleRequest, RebornOperatorSetupRequest,
-    RebornOperatorSetupResponse, RebornOutboundDeliveryTargetListResponse,
-    RebornOutboundPreferencesResponse, RebornProjectFsListRequest, RebornProjectFsListResponse,
-    RebornProjectFsReadRequest, RebornProjectFsStatRequest, RebornProjectFsStatResponse,
-    RebornProjectMemberInfo, RebornProjectResponse, RebornRemoveMemberRequest,
-    RebornResolveGateResponse, RebornRetryRunResponse, RebornServicesApi, RebornServicesError,
-    RebornServicesErrorCode, RebornServicesErrorKind, RebornSetOutboundPreferencesRequest,
-    RebornSetupExtensionResponse, RebornSkillActionResponse, RebornSkillContentResponse,
-    RebornSkillListResponse, RebornSkillSearchResponse, RebornStreamEventsRequest,
-    RebornSubmitTurnResponse, RebornTimelineRequest, RebornTimelineResponse,
-    RebornTraceCreditsResponse, RebornTraceHoldAuthorizeResponse, RebornUpdateMemberRoleRequest,
-    RebornUpdateProjectRequest, SetActiveLlmRequest, SettingsToolPermissionState,
-    UpsertLlmProviderRequest, WebUiAttachmentCapabilities, WebUiAuthenticatedCaller,
-    WebUiCancelRunRequest, WebUiCreateThreadRequest, WebUiInboundValidationCode,
-    WebUiInboundValidationError, WebUiListAutomationsRequest, WebUiListThreadsRequest,
-    WebUiRenameAutomationRequest, WebUiResolveGateRequest, WebUiRetryRunRequest,
-    WebUiSendMessageRequest, WebUiSetupExtensionRequest, webui_attachment_capabilities,
+    ProductCommandDescriptor, ProductOutboundEnvelope, ProductWorkflowError, ProjectFsFile,
+    ProjectionCursor, RebornAccountLoginLinkResponse, RebornAccountTracesResponse,
+    RebornAddMemberRequest, RebornAdminCreateUserRequest, RebornAdminPutSecretRequest,
+    RebornAdminSecretDeletedResponse, RebornAdminSecretResponse, RebornAdminSetRoleRequest,
+    RebornAdminSetStatusRequest, RebornAdminUpdateUserRequest, RebornAdminUserCreatedResponse,
+    RebornAdminUserDeletedResponse, RebornAdminUserListQuery, RebornAdminUserListResponse,
+    RebornAdminUserResponse, RebornAdminUserSecretsListResponse, RebornAttachmentRequest,
+    RebornAutomationMutationResponse, RebornCancelRunResponse,
+    RebornConnectableChannelListResponse, RebornCreateProjectRequest, RebornCreateThreadResponse,
+    RebornDeleteProjectRequest, RebornDeleteThreadRequest, RebornDeleteThreadResponse,
+    RebornExtensionActionResponse, RebornExtensionListResponse, RebornExtensionRegistryResponse,
+    RebornFsListRequest, RebornFsListResponse, RebornFsMountsResponse, RebornFsReadRequest,
+    RebornFsStatRequest, RebornFsStatResponse, RebornGetProjectRequest,
+    RebornListAutomationsResponse, RebornListMembersRequest, RebornListMembersResponse,
+    RebornListProjectsRequest, RebornListProjectsResponse, RebornListThreadsResponse,
+    RebornLogQueryRequest, RebornLogQueryResponse, RebornOperatorCommandPlaneResponse,
+    RebornOperatorConfigGetResponse, RebornOperatorConfigListResponse,
+    RebornOperatorConfigSetRequest, RebornOperatorConfigValidateRequest,
+    RebornOperatorConfigValidateResponse, RebornOperatorLogsQuery,
+    RebornOperatorServiceLifecycleRequest, RebornOperatorSetupRequest, RebornOperatorSetupResponse,
+    RebornOutboundDeliveryTargetListResponse, RebornOutboundPreferencesResponse,
+    RebornProjectFsListRequest, RebornProjectFsListResponse, RebornProjectFsReadRequest,
+    RebornProjectFsStatRequest, RebornProjectFsStatResponse, RebornProjectMemberInfo,
+    RebornProjectResponse, RebornRemoveMemberRequest, RebornResolveGateResponse,
+    RebornRetryRunResponse, RebornServicesApi, RebornServicesError, RebornServicesErrorCode,
+    RebornServicesErrorKind, RebornSetOutboundPreferencesRequest, RebornSetupExtensionResponse,
+    RebornSkillActionResponse, RebornSkillContentResponse, RebornSkillListResponse,
+    RebornSkillSearchResponse, RebornStreamEventsRequest, RebornSubmitTurnResponse,
+    RebornTimelineRequest, RebornTimelineResponse, RebornTraceCreditsResponse,
+    RebornTraceHoldAuthorizeResponse, RebornUpdateMemberRoleRequest, RebornUpdateProjectRequest,
+    SetActiveLlmRequest, SettingsToolPermissionState, UpsertLlmProviderRequest,
+    WebUiAttachmentCapabilities, WebUiAuthenticatedCaller, WebUiCancelRunRequest,
+    WebUiCreateThreadRequest, WebUiInboundValidationCode, WebUiInboundValidationError,
+    WebUiListAutomationsRequest, WebUiListThreadsRequest, WebUiRenameAutomationRequest,
+    WebUiResolveGateRequest, WebUiRetryRunRequest, WebUiSendMessageRequest,
+    WebUiSetupExtensionRequest, execute_webui_command, product_command_descriptors,
+    webui_attachment_capabilities,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1500,6 +1502,55 @@ pub async fn list_skills(
 ) -> Result<Json<RebornSkillListResponse>, WebUiV2HttpError> {
     let response = state.services().list_skills(caller).await?;
     Ok(Json(response))
+}
+
+#[derive(Debug, Serialize)]
+pub struct WebUiCommandCatalogResponse {
+    pub commands: Vec<ProductCommandDescriptor>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WebUiExecuteCommandRequest {
+    pub command: String,
+    #[serde(default)]
+    pub arguments: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WebUiExecuteCommandResponse {
+    pub command: String,
+    pub supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+}
+
+/// `GET /api/webchat/v2/commands`
+///
+/// Command metadata comes from IronClaw's product command registry. The WebUI
+/// and downstream consumers must not maintain a second static command list.
+pub async fn list_commands(
+    Extension(_caller): Extension<WebUiAuthenticatedCaller>,
+) -> Result<Json<WebUiCommandCatalogResponse>, WebUiV2HttpError> {
+    Ok(Json(WebUiCommandCatalogResponse {
+        commands: product_command_descriptors().collect(),
+    }))
+}
+
+/// `POST /api/webchat/v2/commands`
+///
+/// Execute only the read-only command subset exposed by the runtime registry;
+/// unsupported commands return `supported:false` and never create a model run.
+pub async fn execute_command(
+    Extension(_caller): Extension<WebUiAuthenticatedCaller>,
+    Json(body): Json<WebUiExecuteCommandRequest>,
+) -> Result<Json<WebUiExecuteCommandResponse>, WebUiV2HttpError> {
+    let command = body.command.trim().to_ascii_lowercase();
+    let output = execute_webui_command(&command, &body.arguments);
+    Ok(Json(WebUiExecuteCommandResponse {
+        command,
+        supported: output.is_some(),
+        output,
+    }))
 }
 
 /// `POST /api/webchat/v2/skills/search`

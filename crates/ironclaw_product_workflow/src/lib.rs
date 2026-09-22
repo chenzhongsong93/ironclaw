@@ -102,7 +102,7 @@ pub use command_dispatch::{
 };
 pub use commands::{
     LifecycleProductCommandService, ProductCommand, ProductCommandDescriptor, ProductModelCommand,
-    product_command_descriptors,
+    execute_webui_command, product_command_descriptors,
 };
 pub use conversation_binding::{
     ProductActorBindingPolicy, ProductActorUserResolutionRequest, ProductActorUserResolver,

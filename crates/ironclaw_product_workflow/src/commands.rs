@@ -56,14 +56,56 @@ const COMMAND_SPECS: &[ProductCommandSpec] = &[
 type ProductCommandParseResult = Result<ProductCommand, ProductRejection>;
 
 pub fn product_command_descriptors() -> impl Iterator<Item = ProductCommandDescriptor> {
-    LifecycleCommandKind::ALL
-        .iter()
-        .copied()
-        .map(|kind| ProductCommandDescriptor {
-            name: kind.command_name(),
+    [
+        ProductCommandDescriptor {
+            name: "help",
             aliases: &[],
-        })
-        .chain(COMMAND_SPECS.iter().map(|spec| spec.descriptor.clone()))
+        },
+        ProductCommandDescriptor {
+            name: "version",
+            aliases: &[],
+        },
+        ProductCommandDescriptor {
+            name: "ping",
+            aliases: &[],
+        },
+    ]
+    .into_iter()
+    .chain(
+        LifecycleCommandKind::ALL
+            .iter()
+            .copied()
+            .map(|kind| ProductCommandDescriptor {
+                name: kind.command_name(),
+                aliases: &[],
+            }),
+    )
+    .chain(COMMAND_SPECS.iter().map(|spec| spec.descriptor.clone()))
+}
+
+/// Execute the small read-only command surface exposed by Reborn WebChat.
+///
+/// This is intentionally owned by IronClaw's product command registry so WebUI
+/// and TianQuan consumers never maintain a second command implementation.
+pub fn execute_webui_command(name: &str, arguments: &str) -> Option<String> {
+    match name {
+        "help" if arguments.trim().is_empty() => Some(
+            product_command_descriptors()
+                .map(|descriptor| format!("/{}", descriptor.name))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        "version" if arguments.trim().is_empty() => Some(format!(
+            "ironclaw-product-workflow v{}",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "ping" if arguments.trim().is_empty() => Some("pong".to_string()),
+        "status" | "progress" if arguments.trim().is_empty() => Some(
+            "IronClaw command plane online. 当前运行状态请通过对应会话的事件流与状态面板查看。"
+                .to_string(),
+        ),
+        _ => None,
+    }
 }
 
 /// Typed command family produced from a normalized command payload.

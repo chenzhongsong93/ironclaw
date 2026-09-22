@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add an authenticated Reborn WebChat runtime command catalog and read-only command execution endpoint. The catalog is sourced from the product command registry so clients can discover `/version`, `/ping`, `/help`, and supported product commands without maintaining a second static list.
+
 ## [1.0.0-rc.1] - 2026-07-20
 
 First release candidate of a rearchitected IronClaw. This is not an increment

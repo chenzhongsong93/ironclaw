@@ -55,6 +55,8 @@ pub const WEBUI_V2_ROUTE_REMOVE_EXTENSION: &str = "webui.v2.remove_extension";
 pub const WEBUI_V2_ROUTE_GET_EXTENSION_SETUP: &str = "webui.v2.get_extension_setup";
 pub const WEBUI_V2_ROUTE_SETUP_EXTENSION: &str = "webui.v2.setup_extension";
 pub const WEBUI_V2_ROUTE_LIST_SKILLS: &str = "webui.v2.list_skills";
+pub const WEBUI_V2_ROUTE_LIST_COMMANDS: &str = "webui.v2.list_commands";
+pub const WEBUI_V2_ROUTE_EXECUTE_COMMAND: &str = "webui.v2.execute_command";
 pub const WEBUI_V2_ROUTE_SEARCH_SKILLS: &str = "webui.v2.search_skills";
 pub const WEBUI_V2_ROUTE_INSTALL_SKILL: &str = "webui.v2.install_skill";
 pub const WEBUI_V2_ROUTE_GET_SKILL: &str = "webui.v2.get_skill";
@@ -161,6 +163,8 @@ pub const WEBUI_V2_PATTERN_REMOVE_EXTENSION: &str =
     "/api/webchat/v2/extensions/{package_id}/remove";
 pub const WEBUI_V2_PATTERN_SETUP_EXTENSION: &str = "/api/webchat/v2/extensions/{package_id}/setup";
 pub const WEBUI_V2_PATTERN_LIST_SKILLS: &str = "/api/webchat/v2/skills";
+pub const WEBUI_V2_PATTERN_LIST_COMMANDS: &str = "/api/webchat/v2/commands";
+pub const WEBUI_V2_PATTERN_EXECUTE_COMMAND: &str = "/api/webchat/v2/commands";
 pub const WEBUI_V2_PATTERN_SEARCH_SKILLS: &str = "/api/webchat/v2/skills/search";
 pub const WEBUI_V2_PATTERN_INSTALL_SKILL: &str = "/api/webchat/v2/skills/install";
 pub const WEBUI_V2_PATTERN_SKILL_DETAIL: &str = "/api/webchat/v2/skills/{name}";
@@ -251,6 +255,8 @@ pub fn webui_v2_routes() -> Vec<IngressRouteDescriptor> {
         get_extension_setup_descriptor(),
         setup_extension_descriptor(),
         list_skills_descriptor(),
+        list_commands_descriptor(),
+        execute_command_descriptor(),
         search_skills_descriptor(),
         install_skill_descriptor(),
         get_skill_descriptor(),
@@ -1162,6 +1168,34 @@ fn list_skills_descriptor() -> IngressRouteDescriptor {
             AuditTraceClass::UserAction,
             AllowedEffectPath::ProjectionOnly,
             StreamingMode::None,
+        ),
+    )
+}
+
+fn list_commands_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_LIST_COMMANDS,
+        NetworkMethod::Get,
+        WEBUI_V2_PATTERN_LIST_COMMANDS,
+        read_policy(
+            read_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProjectionOnly,
+            StreamingMode::None,
+        ),
+    )
+}
+
+fn execute_command_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_EXECUTE_COMMAND,
+        NetworkMethod::Post,
+        WEBUI_V2_PATTERN_EXECUTE_COMMAND,
+        mutation_policy(
+            body_limit_kib(4),
+            mutation_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProjectionOnly,
         ),
     )
 }

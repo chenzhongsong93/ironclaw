@@ -367,7 +367,7 @@ impl ProjectionStream for WebuiRuntimeProjectionStream {
             .await?;
         }
 
-        self.append_turn_events(&mut batch, Some(&mut subscription), &request)
+        self.append_turn_events_resilient(&mut batch, &mut subscription, &request)
             .await?;
         self.batch_into_outbound(batch, &request)
     }
@@ -458,7 +458,7 @@ impl WebuiRuntimeProjectionStream {
             return;
         }
         if let Err(error) = self
-            .append_turn_events(&mut batch, Some(&mut subscription), &request)
+            .append_turn_events_resilient(&mut batch, &mut subscription, &request)
             .await
         {
             send_projection_subscription_error(&sender, error).await;
@@ -499,7 +499,7 @@ impl WebuiRuntimeProjectionStream {
                         }
                     };
                     if let Err(error) = self
-                        .append_turn_events(&mut batch, Some(&mut subscription), &request)
+                        .append_turn_events_resilient(&mut batch, &mut subscription, &request)
                         .await
                     {
                         send_projection_subscription_error(&sender, error).await;
@@ -539,7 +539,7 @@ impl WebuiRuntimeProjectionStream {
                         return;
                     }
                     if let Err(error) = self
-                        .append_turn_events(&mut batch, Some(&mut subscription), &request)
+                        .append_turn_events_resilient(&mut batch, &mut subscription, &request)
                         .await
                     {
                         send_projection_subscription_error(&sender, error).await;
@@ -598,6 +598,45 @@ impl WebuiRuntimeProjectionStream {
         Ok(())
     }
 
+    /// ISSUE-IRONCLAW-010 跟随修复(第二处终止点):turn-event 投影的**瞬时**不可用
+    /// (store 受压时 `service.updates` 返 Unavailable/Transient)曾直接终止整条订阅,
+    /// 客户端 2s 空闲重连锁链放大成 ~30 次/分钟的风暴(2026-09-22 09:50-10:02
+    /// 实证 365 次 ReplayUnavailable——manager 层背压修复已部署后仍复现,终止点不同)。
+    /// 政策:瞬时错误**有界重试**(3 次,500ms/1s/2s 退避)保订阅续命,运行时帧不中断;
+    /// 确定性拒绝(越权/参数错等)仍即终止(快照重同步是唯一正确恢复)。
+    async fn append_turn_events_resilient(
+        &self,
+        batch: &mut WebuiProjectionBatch,
+        subscription: &mut EventProjectionSubscription,
+        request: &ProjectionSubscriptionRequest,
+    ) -> Result<(), ProductAdapterError> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut attempt = 0u32;
+        loop {
+            match self
+                .append_turn_events(batch, Some(subscription), request)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if attempt + 1 < MAX_ATTEMPTS && is_transient_projection_error(&error) =>
+                {
+                    attempt += 1;
+                    let delay = std::time::Duration::from_millis(250 * (1 << attempt));
+                    tracing::debug!(
+                        target: "ironclaw_reborn_composition::projection",
+                        attempt,
+                        ?delay,
+                        error = %error,
+                        "turn-event projection transient failure; retrying to keep the SSE subscription alive"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     fn batch_into_outbound(
         &self,
         batch: WebuiProjectionBatch,
@@ -652,6 +691,20 @@ impl WebuiRuntimeProjectionStream {
         }
         true
     }
+}
+
+/// 瞬时投影错误判定(与 `map_projection_error` 的 ReplayUnavailable 映射同族):
+/// 这些错误重试有可能恢复;其余(越权/参数/确定性拒绝)重试无意义,应即终止。
+fn is_transient_projection_error(error: &ProductAdapterError) -> bool {
+    matches!(
+        error,
+        ProductAdapterError::WorkflowTransient { .. }
+            | ProductAdapterError::EgressTransient { .. }
+            | ProductAdapterError::WorkflowRejected {
+                kind: ProductWorkflowRejectionKind::Unavailable,
+                ..
+            }
+    )
 }
 
 async fn send_projection_subscription_error(

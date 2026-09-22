@@ -416,3 +416,51 @@ fn turn_run_state(
         llm_subject: None,
     }
 }
+
+// 覆盖:ISSUE-IRONCLAW-010 跟随修复(composition 层)——瞬时投影错误有界重试、
+// 确定性拒绝即终止的分类判定。
+#[test]
+fn transient_projection_errors_are_retryable_but_deterministic_rejections_are_not() {
+    // 瞬时:store 受压族(Unavailable/Transient)→ 重试保订阅
+    assert!(is_transient_projection_error(
+        &ProductAdapterError::WorkflowTransient {
+            reason: RedactedString::new("projection store busy"),
+        }
+    ));
+    assert!(is_transient_projection_error(
+        &ProductAdapterError::EgressTransient {
+            reason: RedactedString::new("egress hiccup"),
+        }
+    ));
+    assert!(is_transient_projection_error(
+        &ProductAdapterError::WorkflowRejected {
+            kind: ProductWorkflowRejectionKind::Unavailable,
+            status_code: 503,
+            retryable: true,
+            reason: RedactedString::new("turn-event projection unavailable"),
+        }
+    ));
+    // 确定性:重试无意义 → 即终止(调用方负责快照重同步)
+    for error in [
+        ProductAdapterError::WorkflowRejected {
+            kind: ProductWorkflowRejectionKind::Unauthorized,
+            status_code: 403,
+            retryable: false,
+            reason: RedactedString::new("access denied"),
+        },
+        ProductAdapterError::WorkflowRejected {
+            kind: ProductWorkflowRejectionKind::InvalidRequest,
+            status_code: 400,
+            retryable: false,
+            reason: RedactedString::new("bad request"),
+        },
+        ProductAdapterError::Internal {
+            detail: RedactedString::new("validation failed"),
+        },
+    ] {
+        assert!(
+            !is_transient_projection_error(&error),
+            "确定性拒绝不得重试: {error:?}"
+        );
+    }
+}

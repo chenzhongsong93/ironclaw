@@ -2,7 +2,7 @@
 
 本轮按用户要求检查本地分支并回合到 `main`；没有删除任何分支或 worktree。当前 IronClaw `main` 为 `a787b2490`。Todo/runtime 与子运行隔离已在 `61bbca3fd` 合入；`codex/novel-studio-runtime`、`feat/tianquan-timeout-lease-spawn-fixes`、`tianquan-soul-v1` 均可从 main 到达。旧 `tianquan-soul` 通过 `a787b2490` 的合并父链收口，但保留 main 文件树：该线的 20 项 flavor 与当前实际支持的 16 项 resolver 不一致，且其 composition 冲突会关闭 local-dev 所有网络目标的私网 IP 防护；这些效果不应覆盖当前目录与网络边界。原分支仍在，完整提交历史仍可追溯。
 
-远端状态：个人 fork 的 `fork/main` 为 `342bb8560`，与本地 main 分叉（本地 69 个独有提交、远端 61 个独有提交）；上游 `origin/main` 获取本轮遇到 Schannel early EOF，且 origin 指向 nearai 上游。为避免强推或丢弃 fork 上的提交，本地主线改以新远端评审分支 `codex/tianquan-mainline-integration-20260923` 推送到个人 fork；远端 `main` 保持不变。推送结果以本节后续追加为准。
+远端状态：个人 fork 的 `fork/main` 为 `342bb8560`，与本地 main 分叉（本地 69 个独有提交、远端 61 个独有提交）；上游 `origin/main` 获取本轮遇到 Schannel early EOF，且 origin 指向 nearai 上游。为避免强推或丢弃 fork 上的提交，本地主线已推送到个人 fork 的新评审分支 `codex/tianquan-mainline-integration-20260923`；远端 `main` 保持不变。没有强推，也没有删除远端分支。
 
 验证边界：本地 main 最近代码门控已在前序交接记录；本次额外核对所有本地分支均为 main 祖先、main 工作树干净。此次旧 SOUL 合并树与原 main 完全一致，没有新增代码。任何上线仍须独立发布镜像并复验，不因本地分支回合而宣称生产运行时已更新。
 

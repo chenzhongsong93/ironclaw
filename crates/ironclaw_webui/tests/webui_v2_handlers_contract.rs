@@ -1,3 +1,4 @@
+// arch-exempt: large_file, plan and command caller cases reuse the existing axum fixture until WebUI v2 tests are split, plan #3031
 //! Caller-level contract tests for the WebChat v2 axum handlers.
 //!
 //! Per `.claude/rules/testing.md` "Test Through the Caller", these tests
@@ -245,6 +246,17 @@ struct StubServices {
     delete_thread_calls: Mutex<Vec<RebornDeleteThreadRequest>>,
     submit_turn_calls: Mutex<Vec<WebUiSendMessageRequest>>,
     get_timeline_calls: Mutex<Vec<RebornTimelineRequest>>,
+    get_thread_plan_calls: Mutex<
+        Vec<(
+            WebUiAuthenticatedCaller,
+            ironclaw_product_workflow::RebornGetThreadPlanRequest,
+        )>,
+    >,
+    next_thread_plan_response: Mutex<
+        Option<Result<ironclaw_product_workflow::RebornGetThreadPlanResponse, RebornServicesError>>,
+    >,
+    get_run_state_calls: Mutex<Vec<(WebUiAuthenticatedCaller, RebornGetRunStateRequest)>>,
+    next_run_state_response: Mutex<Option<Result<RebornGetRunStateResponse, RebornServicesError>>>,
     browse_fs_calls: Mutex<Vec<RebornFsListRequest>>,
     global_auto_approve_enabled: Mutex<bool>,
     global_auto_approve_calls: Mutex<usize>,
@@ -747,23 +759,36 @@ impl RebornServicesApi for StubServices {
             .ok_or_else(|| service_unavailable_error(true))
     }
 
+    async fn get_thread_plan(
+        &self,
+        caller: WebUiAuthenticatedCaller,
+        request: ironclaw_product_workflow::RebornGetThreadPlanRequest,
+    ) -> Result<ironclaw_product_workflow::RebornGetThreadPlanResponse, RebornServicesError> {
+        self.get_thread_plan_calls
+            .lock()
+            .unwrap()
+            .push((caller, request));
+        self.next_thread_plan_response
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| Err(service_unavailable_error(true)))
+    }
+
     async fn get_run_state(
         &self,
-        _caller: WebUiAuthenticatedCaller,
-        _request: RebornGetRunStateRequest,
+        caller: WebUiAuthenticatedCaller,
+        request: RebornGetRunStateRequest,
     ) -> Result<RebornGetRunStateResponse, RebornServicesError> {
-        // Not exercised by any current handler test — `get_run_state` is on
-        // the facade trait but not wired to a WebChat v2 HTTP route. Fail
-        // loud rather than fabricate a response so a future caller-level
-        // test that forgets to program this path can't quietly pass.
-        Err(RebornServicesError {
-            code: RebornServicesErrorCode::Internal,
-            kind: RebornServicesErrorKind::Internal,
-            status_code: 500,
-            retryable: false,
-            field: None,
-            validation_code: None,
-        })
+        self.get_run_state_calls
+            .lock()
+            .unwrap()
+            .push((caller, request));
+        self.next_run_state_response
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| Err(service_unavailable_error(true)))
     }
 
     async fn cancel_run(
@@ -6657,4 +6682,174 @@ async fn list_projects_unwired_returns_503() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn runtime_commands_catalog_matches_execution_without_model_dispatch() {
+    let services = Arc::new(StubServices::default());
+    let router = router_with(services.clone());
+    let catalog = read_json(
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/webchat/v2/commands")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let commands = catalog["commands"].as_array().unwrap();
+    assert!(
+        !commands
+            .iter()
+            .any(|entry| entry["name"] == "extension_install")
+    );
+    for entry in commands {
+        if entry["name"] == "skills" {
+            continue;
+        } // 此替身未装配技能 facade。
+        let body = serde_json::json!({"command":entry["name"],"arguments":"  "});
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/webchat/v2/commands")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let result = read_json(response).await;
+        assert_eq!(result["supported"], true);
+        assert!(!result["output"].as_str().unwrap().is_empty());
+        if entry["name"] == "help" {
+            assert!(result["output"].as_str().unwrap().starts_with("- `"));
+        }
+    }
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/webchat/v2/commands")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"command":"status","thread_id":"thread-alpha"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let result = read_json(response).await;
+    assert!(result["output"].as_str().unwrap().contains("尚无运行记录"));
+    assert_eq!(services.get_timeline_calls.lock().unwrap().len(), 1);
+    assert!(services.submit_turn_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn get_thread_plan_route_forwards_caller_and_preserves_null_snapshot_and_read_failure() {
+    use ironclaw_product_workflow::RebornGetThreadPlanResponse;
+    let services = Arc::new(StubServices::default());
+    *services.next_thread_plan_response.lock().unwrap() =
+        Some(Ok(RebornGetThreadPlanResponse { plan: None }));
+    let app = router_with_caller(
+        services.clone(),
+        WebUiV2Capabilities::default(),
+        caller_for_user("plan-owner"),
+    );
+    let request = || {
+        Request::builder()
+            .method(Method::GET)
+            .uri("/api/webchat/v2/threads/plan-thread/plan")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(read_json(response).await, serde_json::json!({"plan":null}));
+    {
+        let calls = services.get_thread_plan_calls.lock().unwrap();
+        assert_eq!(calls[0].0.user_id.as_str(), "plan-owner");
+        assert_eq!(calls[0].0.tenant_id, caller().tenant_id);
+        assert_eq!(calls[0].1.thread_id, "plan-thread");
+    }
+    // The next unprogrammed read is a real facade error, not another null.
+    let response = app.oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(read_json(response).await.get("plan").is_none());
+}
+
+#[tokio::test]
+async fn get_run_state_route_forwards_caller_path_and_canonical_status() {
+    let services = Arc::new(StubServices::default());
+    let run_id = TurnRunId::new();
+    let snapshot = RebornGetRunStateResponse {
+        turn_id: "actual-turn".to_string(),
+        run_id,
+        status: TurnStatus::BlockedApproval,
+        event_cursor: EventCursor(17),
+        accepted_message_ref: ironclaw_turns::AcceptedMessageRef::new("actual-message").unwrap(),
+        resolved_run_profile_id: "default".to_string(),
+        resolved_run_profile_version: 1,
+        received_at: chrono::Utc::now(),
+        checkpoint_id: None,
+        gate_ref: None,
+        failure: None,
+        usage: None,
+        cost: None,
+    };
+    *services.next_run_state_response.lock().unwrap() = Some(Ok(snapshot));
+    let app = router_with_caller(
+        services.clone(),
+        WebUiV2Capabilities::default(),
+        caller_for_user("run-owner"),
+    );
+    let uri = format!("/api/webchat/v2/threads/child-thread/runs/{run_id}");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(&uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["status"], "BlockedApproval");
+    assert_eq!(body["run_id"], run_id.to_string());
+    {
+        let calls = services.get_run_state_calls.lock().unwrap();
+        assert_eq!(calls[0].0.user_id.as_str(), "run-owner");
+        assert_eq!(calls[0].1.thread_id, "child-thread");
+        assert_eq!(calls[0].1.run_id, run_id.to_string());
+    }
+    *services.next_run_state_response.lock().unwrap() = Some(Err(RebornServicesError {
+        code: RebornServicesErrorCode::NotFound,
+        kind: RebornServicesErrorKind::NotFound,
+        status_code: 404,
+        retryable: false,
+        field: None,
+        validation_code: None,
+    }));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(read_json(response).await.get("status").is_none());
 }

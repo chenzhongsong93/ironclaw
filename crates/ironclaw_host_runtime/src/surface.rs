@@ -1,10 +1,12 @@
+use std::collections::BTreeMap;
+
 use futures_util::{StreamExt, stream};
 use ironclaw_authorization::TrustAwareCapabilityDispatchAuthorizer;
 use ironclaw_extensions::{CapabilityVisibility, ExtensionPackage, ExtensionRegistry};
 use ironclaw_filesystem::RootFilesystem;
 use ironclaw_host_api::{
-    CapabilityDescriptor, CapabilityGrant, Decision, EffectKind, ResourceEstimate, RuntimeKind,
-    canonical_json_v1, runtime_policy::EffectiveRuntimePolicy, sha256_digest_token,
+    CapabilityDescriptor, CapabilityGrant, CapabilityId, Decision, EffectKind, ResourceEstimate,
+    RuntimeKind, canonical_json_v1, runtime_policy::EffectiveRuntimePolicy, sha256_digest_token,
 };
 use ironclaw_trust::TrustDecision;
 use serde_json::{Value, json};
@@ -61,6 +63,10 @@ pub struct CapabilitySurfacePolicy {
     /// none. Order and duplicates do not affect filtering or surface-version
     /// fingerprinting.
     pub allowed_effects: Vec<EffectKind>,
+    /// Exact capability-specific visibility ceiling. This never grants authority:
+    /// dispatch still checks the caller's grant, provider trust, and obligations.
+    /// Unlisted capabilities retain `allowed_effects` unchanged.
+    pub allowed_effect_overrides: BTreeMap<CapabilityId, Vec<EffectKind>>,
     /// Whether capabilities that require approval may be rendered as askable.
     ///
     /// This is informational only. It does not issue approval leases or widen
@@ -81,6 +87,7 @@ impl CapabilitySurfacePolicy {
         Self {
             allowed_runtimes: ALL_RUNTIME_KINDS.to_vec(),
             allowed_effects: ALL_EFFECT_KINDS.to_vec(),
+            allowed_effect_overrides: BTreeMap::new(),
             include_requires_approval: true,
             denied_capabilities: Vec::new(),
             max_capabilities: None,
@@ -91,10 +98,12 @@ impl CapabilitySurfacePolicy {
         self.allowed_runtimes.contains(&runtime)
     }
 
-    fn allows_effects(&self, effects: &[EffectKind]) -> bool {
-        effects
-            .iter()
-            .all(|effect| self.allowed_effects.contains(effect))
+    fn allows_effects(&self, capability_id: &CapabilityId, effects: &[EffectKind]) -> bool {
+        let ceiling = self
+            .allowed_effect_overrides
+            .get(capability_id)
+            .unwrap_or(&self.allowed_effects);
+        effects.iter().all(|effect| ceiling.contains(effect))
     }
 }
 
@@ -173,7 +182,9 @@ impl<'a> CapabilityCatalog<'a> {
             }
             if !self.is_model_visible(descriptor)
                 || !request.policy.allows_runtime(descriptor.runtime)
-                || !request.policy.allows_effects(&descriptor.effects)
+                || !request
+                    .policy
+                    .allows_effects(&descriptor.id, &descriptor.effects)
             {
                 continue;
             }
@@ -214,7 +225,9 @@ impl<'a> CapabilityCatalog<'a> {
                 !request.policy.denied_capabilities.contains(&descriptor.id)
                     && self.is_model_visible(descriptor)
                     && request.policy.allows_runtime(descriptor.runtime)
-                    && request.policy.allows_effects(&descriptor.effects)
+                    && request
+                        .policy
+                        .allows_effects(&descriptor.id, &descriptor.effects)
                     && plan_capability(descriptor, self.runtime_policy).is_ok()
                     && request.provider_trust.contains_key(&descriptor.provider)
             })
@@ -408,6 +421,13 @@ fn surface_version(
         "policy": {
             "allowed_runtimes": canonical_runtime_kinds(&request.policy.allowed_runtimes),
             "allowed_effects": canonical_effect_kinds(&request.policy.allowed_effects),
+            "allowed_effect_overrides": request.policy.allowed_effect_overrides
+                .iter()
+                .map(|(id, effects)| json!({
+                    "capability_id": id.as_str(),
+                    "allowed_effects": canonical_effect_kinds(effects),
+                }))
+                .collect::<Vec<_>>(),
             "include_requires_approval": request.policy.include_requires_approval,
             "denied_capabilities": canonical_capability_ids(&request.policy.denied_capabilities),
             "max_capabilities": request.policy.max_capabilities,
@@ -488,9 +508,7 @@ fn capability_version_key(
     )
 }
 
-fn canonical_capability_ids(
-    capabilities: &[ironclaw_host_api::CapabilityId],
-) -> Vec<String> {
+fn canonical_capability_ids(capabilities: &[ironclaw_host_api::CapabilityId]) -> Vec<String> {
     let mut values = capabilities
         .iter()
         .map(|capability| capability.as_str().to_string())

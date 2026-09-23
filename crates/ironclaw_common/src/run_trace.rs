@@ -45,15 +45,16 @@ fn trace_root() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_TRACE_ROOT))
 }
 
-/// ===== 内容寻址库(2026-08-27 二轮精简:索引/内容分离)=====
-/// 实测残余冗余:同一 35KB 工具结果在对话历史重放 10 次(350KB)、system
-/// 29KB×3——对话历史里 tool/system 消息天然跨请求重复,前缀增量治不了。
-/// 方案(用户钦定"只保留 index,提示词额外存放"):
-/// - traces/content/{sha256 前 16 位}.json:每条消息全文只存一份(全局去重)
-/// - 索引事件只存 content_hash 列表 + 元数据 → 单 run 索引 ~50KB 级
-/// - dossier 重建:索引+内容库拼装,展示层仍无损
+// ===== 内容寻址库(2026-08-27 二轮精简:索引/内容分离)=====
+// 实测残余冗余:同一 35KB 工具结果在对话历史重放 10 次(350KB)、system
+// 29KB×3——对话历史里 tool/system 消息天然跨请求重复,前缀增量治不了。
+// 方案(用户钦定"只保留 index,提示词额外存放"):
+// - traces/content/{sha256 前 16 位}.json:每条消息全文只存一份(全局去重)
+// - 索引事件只存 content_hash 列表 + 元数据 → 单 run 索引 ~50KB 级
+// - dossier 重建:索引+内容库拼装,展示层仍无损
 
 /// 存一条消息到内容库,返回 16 位 hash 引用。
+///
 /// 文件名 = sha256(规范化 JSON) 前 16 hex(碰撞概率对 10^5 条消息 < 10^-7,
 /// 且同 hash 不同内容只影响展示正确性不影响崩溃——可接受)。
 pub fn store_message_content(msg: &serde_json::Value) -> Option<String> {

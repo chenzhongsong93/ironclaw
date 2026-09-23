@@ -18,6 +18,7 @@ mod skill_management;
 mod skill_url_install;
 mod spawn_subagent;
 mod time;
+mod todo;
 mod trace_commons;
 mod trigger_management;
 
@@ -60,6 +61,7 @@ pub use skill_management::{
 };
 pub use spawn_subagent::SPAWN_SUBAGENT_CAPABILITY_ID;
 pub use time::TIME_CAPABILITY_ID;
+pub use todo::{TODO_READ_CAPABILITY_ID, TODO_WRITE_CAPABILITY_ID, ThreadPlanTools};
 pub use trace_commons::{
     TRACE_COMMONS_ACCOUNT_LOGIN_LINK_CAPABILITY_ID, TRACE_COMMONS_CREDITS_CAPABILITY_ID,
     TRACE_COMMONS_ONBOARD_CAPABILITY_ID, TRACE_COMMONS_PROFILE_SET_CAPABILITY_ID,
@@ -169,6 +171,7 @@ pub fn builtin_first_party_package() -> Result<ExtensionPackage, ExtensionError>
                     profile_set::manifest()?,
                 ];
                 capabilities.extend(memory::manifests()?);
+                capabilities.extend(todo::manifests()?);
                 capabilities.extend(coding_manifests()?);
                 capabilities.extend(skill_management::manifests()?);
                 capabilities.extend(trigger_management::manifests()?);
@@ -367,6 +370,11 @@ fn builtin_first_party_base_registry() -> Result<FirstPartyCapabilityRegistry, H
         .with_handler(CapabilityId::new(ECHO_CAPABILITY_ID)?, handler.clone())
         .with_handler(CapabilityId::new(TIME_CAPABILITY_ID)?, handler.clone())
         .with_handler(CapabilityId::new(JSON_CAPABILITY_ID)?, handler.clone())
+        .with_handler(CapabilityId::new(TODO_READ_CAPABILITY_ID)?, handler.clone())
+        .with_handler(
+            CapabilityId::new(TODO_WRITE_CAPABILITY_ID)?,
+            handler.clone(),
+        )
         .with_handler(CapabilityId::new(HTTP_CAPABILITY_ID)?, handler.clone())
         .with_handler(CapabilityId::new(HTTP_SAVE_CAPABILITY_ID)?, handler.clone())
         .with_handler(
@@ -525,6 +533,12 @@ impl FirstPartyCapabilityHandler for BuiltinFirstPartyTools {
             ECHO_CAPABILITY_ID => (echo::dispatch(&request.input)?, None),
             TIME_CAPABILITY_ID => (time::dispatch(&request.input)?, None),
             JSON_CAPABILITY_ID => (json::dispatch(&request.input)?, None),
+            TODO_READ_CAPABILITY_ID | TODO_WRITE_CAPABILITY_ID => {
+                return Err(FirstPartyCapabilityError::with_safe_summary(
+                    RuntimeDispatchErrorKind::Backend,
+                    "Task plan storage is not configured for this runtime.",
+                ));
+            }
             HTTP_CAPABILITY_ID | HTTP_SAVE_CAPABILITY_ID => {
                 let result = http::dispatch(&request).await?;
                 network_egress_bytes = result.network_egress_bytes;

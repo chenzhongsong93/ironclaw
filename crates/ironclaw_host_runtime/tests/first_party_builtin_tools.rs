@@ -68,6 +68,9 @@ use ironclaw_trust::{
 use ironclaw_turns::TurnRunId;
 use serde_json::{Value, json};
 
+#[path = "first_party_builtin_tools/todo_contract.rs"]
+mod todo_contract;
+
 #[tokio::test]
 async fn builtin_first_party_package_declares_expected_capabilities() {
     let package = builtin_first_party_package().unwrap();
@@ -9170,6 +9173,8 @@ fn all_builtin_capability_ids() -> Vec<&'static str> {
         MEMORY_WRITE_CAPABILITY_ID,
         MEMORY_READ_CAPABILITY_ID,
         MEMORY_TREE_CAPABILITY_ID,
+        ironclaw_host_runtime::TODO_READ_CAPABILITY_ID,
+        ironclaw_host_runtime::TODO_WRITE_CAPABILITY_ID,
         READ_FILE_CAPABILITY_ID,
         WRITE_FILE_CAPABILITY_ID,
         LIST_DIR_CAPABILITY_ID,

@@ -81,9 +81,19 @@ pub(crate) fn local_dev_host_runtime_with_registry_and_runtime_http_egress(
     egress: Arc<RecordingRuntimeHttpEgress>,
     process_port: Option<Arc<dyn RuntimeProcessPort>>,
 ) -> HarnessResult<Arc<dyn HostRuntime>> {
+    let filesystem = local_dev_root_filesystem(storage_root, LocalDevRootMounts::core_builtins())?;
+    let mut handlers = builtin_first_party_handlers(Arc::new(
+        ironclaw_triggers::InMemoryTriggerRepository::default(),
+    ))?;
+    ironclaw_host_runtime::ThreadPlanTools::new(Arc::new(
+        ironclaw_threads::plan::FilesystemThreadPlanStore::new(
+            ironclaw_reborn_composition::wrap_scoped(filesystem.clone()),
+        ),
+    ))
+    .insert_into(&mut handlers)?;
     let mut services = HostRuntimeServices::new(
         Arc::new(registry),
-        local_dev_root_filesystem(storage_root, LocalDevRootMounts::core_builtins())?,
+        filesystem,
         Arc::new(InMemoryResourceGovernor::new()),
         Arc::new(GrantAuthorizer::new()),
         ironclaw_processes::ProcessServices::in_memory(),
@@ -96,9 +106,7 @@ pub(crate) fn local_dev_host_runtime_with_registry_and_runtime_http_egress(
     .with_runtime_credential_account_resolver(Arc::new(FixedRuntimeCredentialAccountResolver {
         result: Ok(SecretHandle::new("github_manual_access")?),
     }))
-    .with_first_party_capabilities(Arc::new(builtin_first_party_handlers(Arc::new(
-        ironclaw_triggers::InMemoryTriggerRepository::default(),
-    ))?))
+    .with_first_party_capabilities(Arc::new(handlers))
     .with_first_party_http_egress(egress)
     .with_trust_policy(Arc::new(first_party_trust_policy()?));
     // Inject the recording process port when provided; `None` defaults to
@@ -345,6 +353,19 @@ pub(crate) fn local_dev_root_filesystem(
         )?;
     }
     if mounts.memory {
+        let threads = Arc::new(InMemoryBackend::new());
+        root.mount(
+            local_dev_mount_descriptor(
+                "/tenants",
+                "local-dev-thread-plans",
+                BackendKind::DatabaseFilesystem,
+                StorageClass::StructuredRecords,
+                ContentKind::SystemState,
+                IndexPolicy::NotIndexed,
+                threads.capabilities(),
+            )?,
+            threads,
+        )?;
         let memory = Arc::new(InMemoryBackend::new());
         root.mount(
             local_dev_mount_descriptor(

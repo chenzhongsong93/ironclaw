@@ -5,7 +5,7 @@ use ironclaw_product_adapters::{
 };
 use ironclaw_product_workflow::{
     LifecyclePackageId, LifecyclePackageKind, LifecyclePackageRef, LifecycleProductAction,
-    ProductCommand, ProductModelCommand, execute_webui_command, product_command_descriptors,
+    ProductCommand, ProductModelCommand, product_command_descriptors,
 };
 
 #[test]
@@ -373,16 +373,4 @@ fn command_registry_declares_canonical_lifecycle_commands() {
     ] {
         assert!(names.contains(&name), "missing lifecycle command {name}");
     }
-}
-
-#[test]
-fn webui_read_only_commands_are_runtime_registry_owned() {
-    let names = product_command_descriptors()
-        .map(|descriptor| descriptor.name)
-        .collect::<Vec<_>>();
-    assert!(names.contains(&"help"));
-    assert!(names.contains(&"version"));
-    assert!(names.contains(&"ping"));
-    assert_eq!(execute_webui_command("ping", ""), Some("pong".to_string()));
-    assert!(execute_webui_command("version", "unexpected").is_none());
 }

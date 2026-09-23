@@ -8,7 +8,7 @@
 //! `RebornServicesApi` method set so any *new* method fails CI and the migration
 //! stops the bleeding before it starts.
 //!
-//! This test **freezes the current 88-method `RebornServicesApi` trait block**
+//! This test **freezes the current 92-method `RebornServicesApi` trait block**
 //! (`crates/ironclaw_product_workflow/src/reborn_services.rs`) as a set-membership
 //! allowlist (§10: compare set membership, never a count) and fails on any change:
 //!
@@ -49,7 +49,10 @@ use ratchet_support::{strip_comments_and_strings, workspace_root};
 const FACADE_SOURCE: &str = "crates/ironclaw_product_workflow/src/reborn_services.rs";
 const FACADE_TRAIT: &str = "RebornServicesApi";
 
-/// The frozen inventory of `RebornServicesApi` methods, as of the §5.2.5 freeze.
+/// The frozen inventory of `RebornServicesApi` methods. The local-main integration
+/// of the existing Reborn feature branch re-baselines four already-shipped reads /
+/// credential operations; plan #3031 must migrate them to descriptors. Future
+/// methods remain forbidden and removals still shrink this set.
 /// Grouped by the product domain each method serves, so a reviewer can see which
 /// cluster is migrating as entries disappear. Remove an entry in the same PR that
 /// deletes its method (because the method became a capability/view descriptor);
@@ -60,6 +63,7 @@ const FROZEN_REBORN_SERVICES_METHODS: &[&str] = &[
     "submit_turn",
     "delete_thread",
     "get_timeline",
+    "get_thread_plan",
     "global_auto_approve_enabled",
     "read_attachment",
     "stream_events",
@@ -122,6 +126,9 @@ const FROZEN_REBORN_SERVICES_METHODS: &[&str] = &[
     "setup_extension",
     // --- LLM admin config ---
     "get_llm_config",
+    "get_llm_subject_key_status",
+    "put_llm_subject_key",
+    "delete_llm_subject_key",
     "upsert_llm_provider",
     "delete_llm_provider",
     "set_active_llm",

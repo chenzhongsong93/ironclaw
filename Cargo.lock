@@ -4416,6 +4416,7 @@ dependencies = [
  "ironclaw_scripts",
  "ironclaw_secrets",
  "ironclaw_skills",
+ "ironclaw_threads",
  "ironclaw_triggers",
  "ironclaw_trust",
  "ironclaw_turns",
@@ -4527,6 +4528,7 @@ dependencies = [
  "ironclaw_skills",
  "ironclaw_slack_v2_adapter",
  "ironclaw_threads",
+ "ironclaw_tianquan_subagents",
  "ironclaw_triggers",
  "ironclaw_trust",
  "ironclaw_tui",
@@ -4571,7 +4573,6 @@ dependencies = [
  "termimad",
  "testcontainers-modules",
  "thiserror 2.0.18",
- "tianquan_subagents",
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
@@ -4978,6 +4979,7 @@ dependencies = [
  "ironclaw_slack_v2_adapter",
  "ironclaw_telegram_extension",
  "ironclaw_threads",
+ "ironclaw_tianquan_subagents",
  "ironclaw_triggers",
  "ironclaw_trust",
  "ironclaw_turns",
@@ -4997,7 +4999,6 @@ dependencies = [
  "tempfile",
  "testcontainers-modules",
  "thiserror 2.0.18",
- "tianquan_subagents",
  "tokio",
  "tokio-tungstenite 0.29.0",
  "tokio-util",
@@ -5471,6 +5472,22 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "ironclaw_tianquan_subagents"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ironclaw_host_api",
+ "ironclaw_loop_host",
+ "ironclaw_runner",
+ "ironclaw_threads",
+ "ironclaw_turns",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -9135,22 +9152,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "tianquan_subagents"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "ironclaw_host_api",
- "ironclaw_loop_host",
- "ironclaw_runner",
- "ironclaw_threads",
- "ironclaw_turns",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
 ]
 
 [[package]]

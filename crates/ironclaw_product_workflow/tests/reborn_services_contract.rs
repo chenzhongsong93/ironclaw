@@ -12281,3 +12281,202 @@ async fn admin_last_admin_protection_survives_concurrent_demotion() {
         "the tenant must never be stranded without an admin"
     );
 }
+
+fn plan_filesystem()
+-> Arc<ironclaw_filesystem::ScopedFilesystem<ironclaw_filesystem::InMemoryBackend>> {
+    use ironclaw_host_api::{MountAlias, MountGrant, MountPermissions, MountView, VirtualPath};
+    Arc::new(ironclaw_filesystem::ScopedFilesystem::new(
+        Arc::new(ironclaw_filesystem::InMemoryBackend::new()),
+        |_scope: &ResourceScope| {
+            MountView::new(vec![MountGrant::new(
+                MountAlias::new("/threads")?,
+                VirtualPath::new("/threads")?,
+                MountPermissions::read_write_list_delete(),
+            )])
+        },
+    ))
+}
+
+#[tokio::test]
+async fn thread_plan_facade_reads_actual_store_and_recovers_update_clear_and_sibling_isolation() {
+    use ironclaw_product_workflow::RebornGetThreadPlanRequest;
+    use ironclaw_threads::plan::{
+        FilesystemThreadPlanStore, ThreadPlanStatus, ThreadPlanStep, ThreadPlanWrite,
+    };
+    let filesystem = plan_filesystem();
+    let store = Arc::new(FilesystemThreadPlanStore::new(filesystem.clone()));
+    let threads = Arc::new(InMemorySessionThreadService::default());
+    let coordinator = Arc::new(FakeTurnCoordinator::default());
+    let services = RebornServices::new(threads.clone(), coordinator.clone())
+        .with_thread_plan_reader(store.clone());
+    setup_owned_thread(&services, caller(), "plan-main").await;
+    setup_owned_thread(&services, caller(), "plan-sibling").await;
+    let request = || RebornGetThreadPlanRequest {
+        thread_id: "plan-main".to_string(),
+    };
+    assert!(
+        services
+            .get_thread_plan(caller(), request())
+            .await
+            .unwrap()
+            .plan
+            .is_none()
+    );
+    let scope = caller()
+        .turn_scope(ThreadId::new("plan-main").unwrap())
+        .to_resource_scope();
+    let input = |status| ThreadPlanWrite {
+        title: "检阅任务".to_string(),
+        steps: vec![ThreadPlanStep {
+            index: 0,
+            title: "读取实际消息".to_string(),
+            status,
+        }],
+        expected_revision: None,
+    };
+    let created = store
+        .update(&scope, input(ThreadPlanStatus::Pending), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        services
+            .get_thread_plan(caller(), request())
+            .await
+            .unwrap()
+            .plan,
+        Some(created)
+    );
+    let completed = store
+        .update(&scope, input(ThreadPlanStatus::Completed), None)
+        .await
+        .unwrap();
+    let reopened = RebornServices::new(threads, coordinator)
+        .with_thread_plan_reader(Arc::new(FilesystemThreadPlanStore::new(filesystem)));
+    assert_eq!(
+        reopened
+            .get_thread_plan(caller(), request())
+            .await
+            .unwrap()
+            .plan,
+        Some(completed)
+    );
+    assert!(
+        reopened
+            .get_thread_plan(
+                caller(),
+                RebornGetThreadPlanRequest {
+                    thread_id: "plan-sibling".to_string()
+                }
+            )
+            .await
+            .unwrap()
+            .plan
+            .is_none()
+    );
+    let cleared = store
+        .update(
+            &scope,
+            ThreadPlanWrite {
+                title: String::new(),
+                steps: vec![],
+                expected_revision: Some(2),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .get_thread_plan(caller(), request())
+            .await
+            .unwrap()
+            .plan,
+        Some(cleared)
+    );
+}
+
+#[derive(Default)]
+struct FailingThreadPlanReader {
+    calls: Mutex<Vec<ResourceScope>>,
+}
+
+#[async_trait]
+impl ironclaw_threads::plan::ThreadPlanReader for FailingThreadPlanReader {
+    async fn read(
+        &self,
+        scope: &ResourceScope,
+    ) -> Result<
+        Option<ironclaw_threads::plan::ThreadPlanUpdate>,
+        ironclaw_threads::plan::ThreadPlanError,
+    > {
+        self.calls.lock().unwrap().push(scope.clone());
+        Err(ironclaw_threads::plan::ThreadPlanError::StorageUnavailable)
+    }
+}
+
+#[tokio::test]
+async fn thread_plan_facade_authorizes_before_storage_and_distinguishes_unavailable_from_empty() {
+    use ironclaw_product_workflow::RebornGetThreadPlanRequest;
+    let reader = Arc::new(FailingThreadPlanReader::default());
+    let services = RebornServices::new(
+        Arc::new(InMemorySessionThreadService::default()),
+        Arc::new(FakeTurnCoordinator::default()),
+    );
+    setup_owned_thread(&services, caller(), "plan-owned").await;
+    let request = || RebornGetThreadPlanRequest {
+        thread_id: "plan-owned".to_string(),
+    };
+    assert_eq!(
+        services
+            .get_thread_plan(caller(), request())
+            .await
+            .unwrap_err()
+            .status_code,
+        503
+    );
+    let services = services.with_thread_plan_reader(reader.clone());
+    let mut other_tenant = caller();
+    other_tenant.tenant_id = TenantId::new("other-tenant").unwrap();
+    let mut other_agent = caller();
+    other_agent.agent_id = Some(AgentId::new("other-agent").unwrap());
+    for denied in [
+        caller_for_user("other-user"),
+        other_tenant,
+        other_agent,
+        caller_with_project(Some("other-project")),
+    ] {
+        assert_eq!(
+            services
+                .get_thread_plan(denied, request())
+                .await
+                .unwrap_err()
+                .status_code,
+            404
+        );
+    }
+    assert_eq!(
+        services
+            .get_thread_plan(
+                caller(),
+                RebornGetThreadPlanRequest {
+                    thread_id: "missing".to_string()
+                }
+            )
+            .await
+            .unwrap_err()
+            .status_code,
+        404
+    );
+    assert!(
+        reader.calls.lock().unwrap().is_empty(),
+        "unauthorized requests cannot touch plan storage"
+    );
+    let error = services
+        .get_thread_plan(caller(), request())
+        .await
+        .unwrap_err();
+    assert_eq!(error.status_code, 503);
+    assert!(error.retryable);
+    assert_eq!(error.kind, RebornServicesErrorKind::ServiceUnavailable);
+    assert_eq!(reader.calls.lock().unwrap().len(), 1);
+}

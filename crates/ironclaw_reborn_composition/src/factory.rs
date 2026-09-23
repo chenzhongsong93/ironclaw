@@ -1175,6 +1175,23 @@ where
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 impl RebornProductionRuntimeServices {
+    pub(crate) fn thread_plan_reader(&self) -> Arc<dyn ironclaw_threads::plan::ThreadPlanReader> {
+        match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(graph) => {
+                Arc::new(ironclaw_threads::plan::FilesystemThreadPlanStore::new(
+                    Arc::clone(&graph.scoped_filesystem),
+                ))
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(graph) => {
+                Arc::new(ironclaw_threads::plan::FilesystemThreadPlanStore::new(
+                    Arc::clone(&graph.scoped_filesystem),
+                ))
+            }
+        }
+    }
+
     /// Returns the trigger repository from whichever production store graph is
     /// active. Backs the WebUI automations facade for production profiles
     /// (libSQL / Postgres) where `local_runtime` is None.
@@ -2121,6 +2138,10 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
         Arc::clone(&store_graph.trigger_repository),
         trigger_create_hook,
         trigger_active_run_lookup,
+    )?;
+    register_thread_plan_tools(
+        &mut first_party_registry,
+        Arc::clone(&store_graph.local_runtime.identity_filesystem),
     )?;
     register_bundled_gsuite_first_party_handlers(
         &mut first_party_registry,
@@ -4270,6 +4291,19 @@ fn production_builtin_extension_registry(
     Ok(registry)
 }
 
+fn register_thread_plan_tools<F: RootFilesystem + 'static>(
+    registry: &mut FirstPartyCapabilityRegistry,
+    filesystem: Arc<ScopedFilesystem<F>>,
+) -> Result<(), RebornBuildError> {
+    ironclaw_host_runtime::ThreadPlanTools::new(Arc::new(
+        ironclaw_threads::plan::FilesystemThreadPlanStore::new(filesystem),
+    ))
+    .insert_into(registry)
+    .map_err(|error| RebornBuildError::InvalidConfig {
+        reason: format!("thread plan handlers are invalid: {error}"),
+    })
+}
+
 fn builtin_first_party_registry_with_trigger_create_hook(
     trigger_repository: Arc<dyn TriggerRepository>,
     trigger_create_hook: Arc<dyn TriggerCreateHook>,
@@ -5341,6 +5375,10 @@ where
         trigger_create_hook,
         trigger_active_run_lookup,
         process_backend,
+    )?;
+    register_thread_plan_tools(
+        &mut first_party_registry,
+        Arc::clone(&stores.scoped_filesystem),
     )?;
     let product_auth_filesystem = Arc::clone(&stores.scoped_filesystem);
     let services = HostRuntimeServices::new(

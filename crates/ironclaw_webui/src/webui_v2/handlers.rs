@@ -1,3 +1,4 @@
+// arch-exempt: large_file, bounded plan and command handlers preserve the current caller API until WebUI v2 is split, plan #3031
 //! WebChat v2 HTTP handlers.
 //!
 //! Every handler:
@@ -27,43 +28,46 @@ use ironclaw_product_workflow::{
     CodexLoginStart, FsMount, LifecyclePackageKind, LifecyclePackageRef, LlmConfigSnapshot,
     LlmModelsResult, LlmProbeRequest, LlmProbeResult, LlmSubjectKeyPutRequest, LlmSubjectKeyStatus,
     NearAiLoginRequest, NearAiLoginStart, NearAiWalletLoginRequest, NearAiWalletLoginResult,
-    ProductCommandDescriptor, ProductOutboundEnvelope, ProductWorkflowError, ProjectFsFile,
-    ProjectionCursor, RebornAccountLoginLinkResponse, RebornAccountTracesResponse,
-    RebornAddMemberRequest, RebornAdminCreateUserRequest, RebornAdminPutSecretRequest,
-    RebornAdminSecretDeletedResponse, RebornAdminSecretResponse, RebornAdminSetRoleRequest,
-    RebornAdminSetStatusRequest, RebornAdminUpdateUserRequest, RebornAdminUserCreatedResponse,
-    RebornAdminUserDeletedResponse, RebornAdminUserListQuery, RebornAdminUserListResponse,
-    RebornAdminUserResponse, RebornAdminUserSecretsListResponse, RebornAttachmentRequest,
-    RebornAutomationMutationResponse, RebornCancelRunResponse,
-    RebornConnectableChannelListResponse, RebornCreateProjectRequest, RebornCreateThreadResponse,
-    RebornDeleteProjectRequest, RebornDeleteThreadRequest, RebornDeleteThreadResponse,
-    RebornExtensionActionResponse, RebornExtensionListResponse, RebornExtensionRegistryResponse,
-    RebornFsListRequest, RebornFsListResponse, RebornFsMountsResponse, RebornFsReadRequest,
-    RebornFsStatRequest, RebornFsStatResponse, RebornGetProjectRequest,
-    RebornListAutomationsResponse, RebornListMembersRequest, RebornListMembersResponse,
-    RebornListProjectsRequest, RebornListProjectsResponse, RebornListThreadsResponse,
-    RebornLogQueryRequest, RebornLogQueryResponse, RebornOperatorCommandPlaneResponse,
-    RebornOperatorConfigGetResponse, RebornOperatorConfigListResponse,
-    RebornOperatorConfigSetRequest, RebornOperatorConfigValidateRequest,
-    RebornOperatorConfigValidateResponse, RebornOperatorLogsQuery,
-    RebornOperatorServiceLifecycleRequest, RebornOperatorSetupRequest, RebornOperatorSetupResponse,
-    RebornOutboundDeliveryTargetListResponse, RebornOutboundPreferencesResponse,
-    RebornProjectFsListRequest, RebornProjectFsListResponse, RebornProjectFsReadRequest,
-    RebornProjectFsStatRequest, RebornProjectFsStatResponse, RebornProjectMemberInfo,
-    RebornProjectResponse, RebornRemoveMemberRequest, RebornResolveGateResponse,
-    RebornRetryRunResponse, RebornServicesApi, RebornServicesError, RebornServicesErrorCode,
-    RebornServicesErrorKind, RebornSetOutboundPreferencesRequest, RebornSetupExtensionResponse,
-    RebornSkillActionResponse, RebornSkillContentResponse, RebornSkillListResponse,
-    RebornSkillSearchResponse, RebornStreamEventsRequest, RebornSubmitTurnResponse,
-    RebornTimelineRequest, RebornTimelineResponse, RebornTraceCreditsResponse,
-    RebornTraceHoldAuthorizeResponse, RebornUpdateMemberRoleRequest, RebornUpdateProjectRequest,
-    SetActiveLlmRequest, SettingsToolPermissionState, UpsertLlmProviderRequest,
-    WebUiAttachmentCapabilities, WebUiAuthenticatedCaller, WebUiCancelRunRequest,
-    WebUiCreateThreadRequest, WebUiInboundValidationCode, WebUiInboundValidationError,
-    WebUiListAutomationsRequest, WebUiListThreadsRequest, WebUiRenameAutomationRequest,
-    WebUiResolveGateRequest, WebUiRetryRunRequest, WebUiSendMessageRequest,
-    WebUiSetupExtensionRequest, execute_webui_command, product_command_descriptors,
-    webui_attachment_capabilities,
+    ProductOutboundEnvelope, ProductWorkflowError, ProjectFsFile, ProjectionCursor,
+    RebornAccountLoginLinkResponse, RebornAccountTracesResponse, RebornAddMemberRequest,
+    RebornAdminCreateUserRequest, RebornAdminPutSecretRequest, RebornAdminSecretDeletedResponse,
+    RebornAdminSecretResponse, RebornAdminSetRoleRequest, RebornAdminSetStatusRequest,
+    RebornAdminUpdateUserRequest, RebornAdminUserCreatedResponse, RebornAdminUserDeletedResponse,
+    RebornAdminUserListQuery, RebornAdminUserListResponse, RebornAdminUserResponse,
+    RebornAdminUserSecretsListResponse, RebornAttachmentRequest, RebornAutomationMutationResponse,
+    RebornCancelRunResponse, RebornConnectableChannelListResponse, RebornCreateProjectRequest,
+    RebornCreateThreadResponse, RebornDeleteProjectRequest, RebornDeleteThreadRequest,
+    RebornDeleteThreadResponse, RebornExtensionActionResponse, RebornExtensionListResponse,
+    RebornExtensionRegistryResponse, RebornFsListRequest, RebornFsListResponse,
+    RebornFsMountsResponse, RebornFsReadRequest, RebornFsStatRequest, RebornFsStatResponse,
+    RebornGetProjectRequest, RebornListAutomationsResponse, RebornListMembersRequest,
+    RebornListMembersResponse, RebornListProjectsRequest, RebornListProjectsResponse,
+    RebornListThreadsResponse, RebornLogQueryRequest, RebornLogQueryResponse,
+    RebornOperatorCommandPlaneResponse, RebornOperatorConfigGetResponse,
+    RebornOperatorConfigListResponse, RebornOperatorConfigSetRequest,
+    RebornOperatorConfigValidateRequest, RebornOperatorConfigValidateResponse,
+    RebornOperatorLogsQuery, RebornOperatorServiceLifecycleRequest, RebornOperatorSetupRequest,
+    RebornOperatorSetupResponse, RebornOutboundDeliveryTargetListResponse,
+    RebornOutboundPreferencesResponse, RebornProjectFsListRequest, RebornProjectFsListResponse,
+    RebornProjectFsReadRequest, RebornProjectFsStatRequest, RebornProjectFsStatResponse,
+    RebornProjectMemberInfo, RebornProjectResponse, RebornRemoveMemberRequest,
+    RebornResolveGateResponse, RebornRetryRunResponse, RebornServicesApi, RebornServicesError,
+    RebornServicesErrorCode, RebornServicesErrorKind, RebornSetOutboundPreferencesRequest,
+    RebornSetupExtensionResponse, RebornSkillActionResponse, RebornSkillContentResponse,
+    RebornSkillListResponse, RebornSkillSearchResponse, RebornStreamEventsRequest,
+    RebornSubmitTurnResponse, RebornTimelineRequest, RebornTimelineResponse,
+    RebornTraceCreditsResponse, RebornTraceHoldAuthorizeResponse, RebornUpdateMemberRoleRequest,
+    RebornUpdateProjectRequest, SetActiveLlmRequest, SettingsToolPermissionState,
+    UpsertLlmProviderRequest, WebUiAttachmentCapabilities, WebUiAuthenticatedCaller,
+    WebUiCancelRunRequest, WebUiCommandDescriptor, WebUiCreateThreadRequest,
+    WebUiInboundValidationCode, WebUiInboundValidationError, WebUiListAutomationsRequest,
+    WebUiListThreadsRequest, WebUiRenameAutomationRequest, WebUiResolveGateRequest,
+    WebUiRetryRunRequest, WebUiSendMessageRequest, WebUiSetupExtensionRequest,
+    execute_runtime_read_command, webui_attachment_capabilities, webui_command_descriptors,
+};
+use ironclaw_product_workflow::{
+    RebornGetRunStateRequest, RebornGetRunStateResponse, RebornGetThreadPlanRequest,
+    RebornGetThreadPlanResponse,
 };
 use serde::{Deserialize, Serialize};
 
@@ -73,6 +77,32 @@ use crate::webui_v2::error::WebUiV2HttpError;
 use crate::webui_v2::router::{WebUiV2Capabilities, WebUiV2State};
 use crate::webui_v2::schema::WebChatV2EventFrame;
 use crate::webui_v2::sse_capacity::{SSE_MAX_LIFETIME, SseSlot};
+
+/// Read the runtime-owned task snapshot for an authorized thread.
+pub async fn get_thread_plan(
+    State(state): State<WebUiV2State>,
+    Extension(caller): Extension<WebUiAuthenticatedCaller>,
+    Path(thread_id): Path<String>,
+) -> Result<Json<RebornGetThreadPlanResponse>, WebUiV2HttpError> {
+    let response = state
+        .services()
+        .get_thread_plan(caller, RebornGetThreadPlanRequest { thread_id })
+        .await?;
+    Ok(Json(response))
+}
+
+/// Read canonical run state; tool-call completion is not run completion.
+pub async fn get_run_state(
+    State(state): State<WebUiV2State>,
+    Extension(caller): Extension<WebUiAuthenticatedCaller>,
+    Path((thread_id, run_id)): Path<(String, String)>,
+) -> Result<Json<RebornGetRunStateResponse>, WebUiV2HttpError> {
+    let response = state
+        .services()
+        .get_run_state(caller, RebornGetRunStateRequest { thread_id, run_id })
+        .await?;
+    Ok(Json(response))
+}
 
 // Session bootstrap must stay cheap and non-blocking: this flag only tunes
 // initial approval UI state. It is mutable through `/settings/tools`, so do
@@ -1506,7 +1536,7 @@ pub async fn list_skills(
 
 #[derive(Debug, Serialize)]
 pub struct WebUiCommandCatalogResponse {
-    pub commands: Vec<ProductCommandDescriptor>,
+    pub commands: Vec<WebUiCommandDescriptor>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1514,6 +1544,8 @@ pub struct WebUiExecuteCommandRequest {
     pub command: String,
     #[serde(default)]
     pub arguments: String,
+    #[serde(default)]
+    pub thread_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1532,7 +1564,7 @@ pub async fn list_commands(
     Extension(_caller): Extension<WebUiAuthenticatedCaller>,
 ) -> Result<Json<WebUiCommandCatalogResponse>, WebUiV2HttpError> {
     Ok(Json(WebUiCommandCatalogResponse {
-        commands: product_command_descriptors().collect(),
+        commands: webui_command_descriptors(),
     }))
 }
 
@@ -1541,11 +1573,19 @@ pub async fn list_commands(
 /// Execute only the read-only command subset exposed by the runtime registry;
 /// unsupported commands return `supported:false` and never create a model run.
 pub async fn execute_command(
-    Extension(_caller): Extension<WebUiAuthenticatedCaller>,
+    State(state): State<WebUiV2State>,
+    Extension(caller): Extension<WebUiAuthenticatedCaller>,
     Json(body): Json<WebUiExecuteCommandRequest>,
 ) -> Result<Json<WebUiExecuteCommandResponse>, WebUiV2HttpError> {
     let command = body.command.trim().to_ascii_lowercase();
-    let output = execute_webui_command(&command, &body.arguments);
+    let output = execute_runtime_read_command(
+        state.services().as_ref(),
+        caller,
+        &command,
+        &body.arguments,
+        body.thread_id,
+    )
+    .await?;
     Ok(Json(WebUiExecuteCommandResponse {
         command,
         supported: output.is_some(),

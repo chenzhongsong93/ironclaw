@@ -52,7 +52,11 @@ mod lifecycle;
 mod outbound_delivery;
 mod policy;
 mod reborn_services;
+mod webui_commands;
 mod webui_inbound;
+pub use webui_commands::{
+    WebUiCommandDescriptor, execute_runtime_read_command, webui_command_descriptors,
+};
 mod workflow;
 
 pub use action::{
@@ -102,7 +106,7 @@ pub use command_dispatch::{
 };
 pub use commands::{
     LifecycleProductCommandService, ProductCommand, ProductCommandDescriptor, ProductModelCommand,
-    execute_webui_command, product_command_descriptors,
+    product_command_descriptors,
 };
 pub use conversation_binding::{
     ProductActorBindingPolicy, ProductActorUserResolutionRequest, ProductActorUserResolver,
@@ -198,10 +202,11 @@ pub use reborn_services::{
     RebornExtensionSetupSecret, RebornFsListRequest, RebornFsListResponse, RebornFsMountInfo,
     RebornFsMountsResponse, RebornFsReadRequest, RebornFsStatRequest, RebornFsStatResponse,
     RebornGetProjectRequest, RebornGetRunStateRequest, RebornGetRunStateResponse,
-    RebornListAutomationsResponse, RebornListMembersRequest, RebornListMembersResponse,
-    RebornListProjectsRequest, RebornListProjectsResponse, RebornListThreadsResponse,
-    RebornLogEntry, RebornLogLevel, RebornLogQueryRequest, RebornLogQueryResponse,
-    RebornOperatorArea, RebornOperatorCommandPlaneResponse, RebornOperatorConfigDiagnostic,
+    RebornGetThreadPlanRequest, RebornGetThreadPlanResponse, RebornListAutomationsResponse,
+    RebornListMembersRequest, RebornListMembersResponse, RebornListProjectsRequest,
+    RebornListProjectsResponse, RebornListThreadsResponse, RebornLogEntry, RebornLogLevel,
+    RebornLogQueryRequest, RebornLogQueryResponse, RebornOperatorArea,
+    RebornOperatorCommandPlaneResponse, RebornOperatorConfigDiagnostic,
     RebornOperatorConfigDiagnosticSeverity, RebornOperatorConfigEntry,
     RebornOperatorConfigGetResponse, RebornOperatorConfigListResponse,
     RebornOperatorConfigSetRequest, RebornOperatorConfigValidateRequest,

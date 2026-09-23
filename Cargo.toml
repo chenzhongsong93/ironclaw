@@ -362,7 +362,7 @@ ironclaw_events = { path = "crates/ironclaw_events", version = "0.1.0" }
 # harness seam) — cfg(test) does not propagate from an integration-test binary into its deps.
 ironclaw_triggers = { path = "crates/ironclaw_triggers", version = "0.1.0", features = ["test-support"] }
 # 天权 16 SOUL flavors + directions。tests/tianquan_subagent_spawn_e2e.rs 用。
-tianquan_subagents = { path = "crates/tianquan_subagents" }
+tianquan_subagents = { package = "ironclaw_tianquan_subagents", path = "crates/tianquan_subagents" }
 # Trigger-conversation binding/session services for the E-TRIGGERED-SUBMIT harness seam —
 # mirrors the conversation-services type production's own local-dev build wires for the
 # trusted-trigger submit path (ironclaw_reborn_composition::runtime.rs).

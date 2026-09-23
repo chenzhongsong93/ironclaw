@@ -4,6 +4,24 @@ use crate::first_party_tools::time::UNIX_MILLIS_THRESHOLD;
 
 pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value> {
     Some(match reference {
+        "schemas/builtin/todo_read.input.v1.json" => json!({
+            "type": "object", "properties": {}, "additionalProperties": false
+        }),
+        "schemas/builtin/todo_write.input.v1.json" => json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {
+                "title": { "type": "string", "maxLength": 160 },
+                "steps": { "type": "array", "maxItems": 100, "items": {
+                    "type": "object", "additionalProperties": false,
+                    "properties": {
+                        "index": { "type": "integer", "minimum": 0 },
+                        "title": { "type": "string", "minLength": 1, "maxLength": 500 },
+                        "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "failed"] }
+                    }, "required": ["index", "title", "status"]
+                } },
+                "expected_revision": { "type": "integer", "minimum": 0 }
+            }, "required": ["title", "steps"]
+        }),
         "schemas/builtin/echo.input.v1.json" => json!({
             "type": "object",
             "properties": {

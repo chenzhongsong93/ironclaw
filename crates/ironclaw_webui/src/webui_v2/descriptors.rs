@@ -1,3 +1,4 @@
+// arch-exempt: large_file, bounded plan and command routes stay in the existing descriptor table until WebUI v2 is split, plan #3031
 //! Host-owned route descriptors for the Reborn WebChat v2 surface.
 //!
 //! Host composition consumes [`webui_v2_routes`] and mounts the matching
@@ -29,6 +30,8 @@ pub const WEBUI_V2_ROUTE_GET_SESSION: &str = "webui.v2.get_session";
 pub const WEBUI_V2_ROUTE_SEND_MESSAGE: &str = "webui.v2.send_message";
 pub const WEBUI_V2_ROUTE_LIST_THREADS: &str = "webui.v2.list_threads";
 pub const WEBUI_V2_ROUTE_GET_TIMELINE: &str = "webui.v2.get_timeline";
+pub const WEBUI_V2_ROUTE_GET_THREAD_PLAN: &str = "webui.v2.get_thread_plan";
+pub const WEBUI_V2_ROUTE_GET_RUN_STATE: &str = "webui.v2.get_run_state";
 pub const WEBUI_V2_ROUTE_GET_ATTACHMENT: &str = "webui.v2.get_attachment";
 pub const WEBUI_V2_ROUTE_STREAM_EVENTS: &str = "webui.v2.stream_events";
 pub const WEBUI_V2_ROUTE_STREAM_EVENTS_WS: &str = "webui.v2.stream_events_ws";
@@ -123,6 +126,9 @@ pub const WEBUI_V2_PATTERN_DELETE_THREAD: &str = "/api/webchat/v2/threads/{threa
 pub const WEBUI_V2_PATTERN_GET_SESSION: &str = "/api/webchat/v2/session";
 pub const WEBUI_V2_PATTERN_SEND_MESSAGE: &str = "/api/webchat/v2/threads/{thread_id}/messages";
 pub const WEBUI_V2_PATTERN_GET_TIMELINE: &str = "/api/webchat/v2/threads/{thread_id}/timeline";
+pub const WEBUI_V2_PATTERN_GET_THREAD_PLAN: &str = "/api/webchat/v2/threads/{thread_id}/plan";
+pub const WEBUI_V2_PATTERN_GET_RUN_STATE: &str =
+    "/api/webchat/v2/threads/{thread_id}/runs/{run_id}";
 pub const WEBUI_V2_PATTERN_LOGS: &str = "/api/webchat/v2/logs";
 pub const WEBUI_V2_PATTERN_GET_ATTACHMENT: &str =
     "/api/webchat/v2/threads/{thread_id}/messages/{message_id}/attachments/{attachment_id}";
@@ -226,6 +232,8 @@ pub fn webui_v2_routes() -> Vec<IngressRouteDescriptor> {
         send_message_descriptor(),
         list_threads_descriptor(),
         get_timeline_descriptor(),
+        get_thread_plan_descriptor(),
+        get_run_state_descriptor(),
         logs_descriptor(),
         get_attachment_descriptor(),
         stream_events_descriptor(),
@@ -791,6 +799,34 @@ fn get_timeline_descriptor() -> IngressRouteDescriptor {
         WEBUI_V2_ROUTE_GET_TIMELINE,
         NetworkMethod::Get,
         WEBUI_V2_PATTERN_GET_TIMELINE,
+        read_policy(
+            read_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProjectionOnly,
+            StreamingMode::None,
+        ),
+    )
+}
+
+fn get_thread_plan_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_GET_THREAD_PLAN,
+        NetworkMethod::Get,
+        WEBUI_V2_PATTERN_GET_THREAD_PLAN,
+        read_policy(
+            read_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProjectionOnly,
+            StreamingMode::None,
+        ),
+    )
+}
+
+fn get_run_state_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_GET_RUN_STATE,
+        NetworkMethod::Get,
+        WEBUI_V2_PATTERN_GET_RUN_STATE,
         read_policy(
             read_rate_limit(),
             AuditTraceClass::UserAction,

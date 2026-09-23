@@ -3868,9 +3868,9 @@ pub async fn build_reborn_runtime(
                 tianquan_prompt_thread_service,
             ),
         )),
-        // 天权定制:注入 4+16=20 flavor catalog(4 内置 + 16 SOUL),让 LLM schema enum 含 novelist/auditor 等。
-        // None 时 fallback 4 内置(runtime.rs 默认),天权注入 20 个。
-        subagent_flavor_catalog: Some(tianquan_subagents::flavors::merged_flavor_catalog()),
+        // 目录与 TianquanSubagentDefinitionResolver 同源:当前仅能解析 16 SOUL。
+        // 4 个内置类型在天权没有执行解析器,不得误报到模型可用目录。
+        subagent_flavor_catalog: Some(tianquan_subagents::flavors::tianquan_flavor_catalog()),
         subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(
             capability_input_resolver,
         )),
@@ -4730,6 +4730,7 @@ async fn build_placeholder_llm_gateway(
 /// Single-provider wrapper (no mission slot): used by the placeholder boot
 /// path and tests that drive a lone swappable. See
 /// [`wrap_swappable_gateway_with_mission`] for the dual-model variant.
+#[allow(dead_code)] // Retain the single-provider test seam; production uses the dual-model wrapper.
 fn wrap_swappable_gateway(
     raw: Arc<dyn ironclaw_llm::LlmProvider>,
     session: Arc<ironclaw_llm::SessionManager>,

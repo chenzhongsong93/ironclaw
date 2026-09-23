@@ -443,7 +443,7 @@ where
         let run_id = request.run_id;
         let turn_id = request.turn_id;
         let replay_identity =
-            ProviderReplayIdentity::new(&self.replay_provider_id(), &model_override)?;
+            ProviderReplayIdentity::new(self.replay_provider_id(), &model_override)?;
         let mut completion =
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(model_override);
@@ -488,7 +488,7 @@ where
         let run_id = request.run_id;
         let turn_id = request.turn_id;
         let replay_identity =
-            ProviderReplayIdentity::new(&self.replay_provider_id(), &model_override)?;
+            ProviderReplayIdentity::new(self.replay_provider_id(), &model_override)?;
         let mut completion =
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(model_override);
@@ -533,7 +533,7 @@ where
         let run_id = request.run_id;
         let turn_id = request.turn_id;
         let replay_identity =
-            ProviderReplayIdentity::new(&self.replay_provider_id(), &model_override)?;
+            ProviderReplayIdentity::new(self.replay_provider_id(), &model_override)?;
         let mut completion =
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(model_override);
@@ -583,7 +583,7 @@ where
         let run_id = request.run_id;
         let turn_id = request.turn_id;
         let replay_identity =
-            ProviderReplayIdentity::new(&self.replay_provider_id(), &model_override)?;
+            ProviderReplayIdentity::new(self.replay_provider_id(), &model_override)?;
         let mut completion =
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(model_override);
@@ -1237,7 +1237,7 @@ fn trace_model_request_event(
     thread_local! {
         /// (run_id → 上次请求的完整 messages JSON)——同 run 增量对比用
         static LAST_MESSAGES: RefCell<Vec<(String, serde_json::Value, u32)>> =
-            RefCell::new(Vec::new());
+            const { RefCell::new(Vec::new()) };
     }
     let (run, turn) = parse_provider_turn_scope(provider_turn_scope);
     let all = serde_json::to_value(&completion.messages).unwrap_or(serde_json::json!([]));
@@ -2830,7 +2830,6 @@ mod tests {
     /// runs alike all traced as "unconfigured").
     #[test]
     fn dynamic_provider_identity_follows_hot_swap() {
-        use ironclaw_llm::LlmProvider as _;
         use ironclaw_llm::SwappableLlmProvider;
 
         let swappable = Arc::new(SwappableLlmProvider::new(Arc::new(NamedStubProvider {
@@ -2857,7 +2856,6 @@ mod tests {
     /// live provider identity — tests and routed pools rely on the explicit id.
     #[test]
     fn pinned_provider_identity_is_stable_across_hot_swap() {
-        use ironclaw_llm::LlmProvider as _;
         use ironclaw_llm::SwappableLlmProvider;
 
         let swappable = Arc::new(SwappableLlmProvider::new(Arc::new(NamedStubProvider {

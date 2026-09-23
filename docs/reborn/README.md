@@ -10,6 +10,7 @@ This repo exposes Reborn structure primarily through implementation crates, crat
 
 | Need | Start with |
 | --- | --- |
+| Current TianQuan runtime handoff and verification | `docs/reborn/handover.md` |
 | Standalone Reborn binary | `docs/reborn-binary.md` |
 | Standalone Reborn onboarding | `docs/reborn/onboarding.md` |
 | Production cutover readiness closeout | `docs/reborn/production-cutover-readiness-closeout.md` |

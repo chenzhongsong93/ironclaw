@@ -28,10 +28,10 @@ use sha2::Digest as _;
 
 use super::await_edge::EdgeTerminalKind;
 
-/// 铁律(2026-08-07):通用平台能力不做领域判断——本扩展只做**忠实文件持久化**
-/// (子 agent final_text 原文落盘 + raw sha256),零小说领域假设(剥围栏/判正文/拒汇报
-/// 等全属天权业务逻辑,在天权 api 读取侧 `read_prose_from_ssot_file` 实现)。
-/// 落盘 raw = 完整过程记录(可 debug),天权读取时提取纯正文用于呈现/校验。
+// 铁律(2026-08-07):通用平台能力不做领域判断——本扩展只做**忠实文件持久化**
+// (子 agent final_text 原文落盘 + raw sha256),零小说领域假设(剥围栏/判正文/拒汇报
+// 等全属天权业务逻辑,在天权 api 读取侧 `read_prose_from_ssot_file` 实现)。
+// 落盘 raw = 完整过程记录(可 debug),天权读取时提取纯正文用于呈现/校验。
 
 /// One `spawn_records` row (mirror of TianQuan api migration 0005).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,7 +173,7 @@ fn persist_final_text_to_workspace(final_text: Option<&str>, record: &SpawnProve
         return;
     }
     let path = dir.join("ch24.txt");
-    if let Err(error) = std::fs::write(&path, &prose) {
+    if let Err(error) = std::fs::write(&path, prose) {
         tracing::warn!(
             target: "tianquan_spawn_provenance",
             child_run_id = %record.child_run_id,

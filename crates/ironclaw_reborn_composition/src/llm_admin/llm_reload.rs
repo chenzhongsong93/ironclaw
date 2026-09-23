@@ -149,65 +149,62 @@ impl LlmReloadTrigger for RebornLlmReloadAdapter {
         // Failure to reload the mission route is non-fatal (default chain is
         // already swapped); it is logged and the previous mission provider
         // stays active until the next reload.
-        if let Some(mission_swappable) = self.mission_swappable.as_ref() {
-            if let Some(mission_resolved) =
+        if let Some(mission_swappable) = self.mission_swappable.as_ref()
+            && let Some(mission_resolved) =
                 resolve_reborn_mission_llm(&self.boot, config_file.as_ref())
                     .map_err(|error| error.to_string())?
+        {
+            let mission_provider_id = mission_resolved.provider_id().to_string();
+            // The gateway's DualModelRouter dispatch key and the
+            // `mission_model` profile override were pinned at boot from
+            // the then-current `[llm.mission] model`. A changed mission
+            // model cannot be hot-applied to them — surface the drift so
+            // operators know a restart is required instead of silently
+            // routing mission-profile runs to a chain under a stale key.
+            let reloaded_mission_model = mission_resolved.config.active_model_name();
+            if self.boot_mission_model.as_deref() != Some(reloaded_mission_model.as_str()) {
+                tracing::warn!(
+                    mission_provider_id = %mission_provider_id,
+                    boot_mission_model = self.boot_mission_model.as_deref().unwrap_or(""),
+                    reloaded_mission_model = %reloaded_mission_model,
+                    "[llm.mission] model changed since boot; the running gateway still routes \
+                     the mission model profile by the boot-time model name — restart to apply",
+                );
+            }
+            let mut mission_config = mission_resolved.config;
+            if let Some(stored) = self
+                .keys
+                .read(&mission_provider_id)
+                .await
+                .map_err(|error| error.to_string())?
             {
-                let mission_provider_id = mission_resolved.provider_id().to_string();
-                // The gateway's DualModelRouter dispatch key and the
-                // `mission_model` profile override were pinned at boot from
-                // the then-current `[llm.mission] model`. A changed mission
-                // model cannot be hot-applied to them — surface the drift so
-                // operators know a restart is required instead of silently
-                // routing mission-profile runs to a chain under a stale key.
-                let reloaded_mission_model = mission_resolved.config.active_model_name();
-                if self.boot_mission_model.as_deref()
-                    != Some(reloaded_mission_model.as_str())
-                {
-                    tracing::warn!(
+                apply_stored_api_key(&mut mission_config, stored);
+            }
+            // Swap the *bare* chain: `build_bare_provider_chain` returns
+            // the decorated primary without its own swappable/recording
+            // wrappers, so repeated reloads do not stack wrapper layers
+            // under this handle (the old path swapped the wrapped output
+            // of `build_provider_chain`, adding one nested swappable —
+            // plus a recording wrapper when enabled — per reload).
+            match ironclaw_llm::build_bare_provider_chain(
+                &mission_config,
+                Arc::clone(&self.session),
+            )
+            .await
+            {
+                Ok(mission_chain) => {
+                    mission_swappable.swap(mission_chain);
+                    tracing::debug!(
                         mission_provider_id = %mission_provider_id,
-                        boot_mission_model = self.boot_mission_model.as_deref().unwrap_or(""),
-                        reloaded_mission_model = %reloaded_mission_model,
-                        "[llm.mission] model changed since boot; the running gateway still routes \
-                         the mission model profile by the boot-time model name — restart to apply",
+                        "mission LLM provider reloaded"
                     );
                 }
-                let mut mission_config = mission_resolved.config;
-                if let Some(stored) = self
-                    .keys
-                    .read(&mission_provider_id)
-                    .await
-                    .map_err(|error| error.to_string())?
-                {
-                    apply_stored_api_key(&mut mission_config, stored);
-                }
-                // Swap the *bare* chain: `build_bare_provider_chain` returns
-                // the decorated primary without its own swappable/recording
-                // wrappers, so repeated reloads do not stack wrapper layers
-                // under this handle (the old path swapped the wrapped output
-                // of `build_provider_chain`, adding one nested swappable —
-                // plus a recording wrapper when enabled — per reload).
-                match ironclaw_llm::build_bare_provider_chain(
-                    &mission_config,
-                    Arc::clone(&self.session),
-                )
-                .await
-                {
-                    Ok(mission_chain) => {
-                        mission_swappable.swap(mission_chain);
-                        tracing::debug!(
-                            mission_provider_id = %mission_provider_id,
-                            "mission LLM provider reloaded"
-                        );
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            mission_provider_id = %mission_provider_id,
-                            "mission LLM reload failed; previous mission provider stays active"
-                        );
-                    }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        mission_provider_id = %mission_provider_id,
+                        "mission LLM reload failed; previous mission provider stays active"
+                    );
                 }
             }
         }

@@ -71,6 +71,8 @@ exempt_capabilities = [
     #   to exempt here (unlike `memory_write`, an arbitrary-path write that is
     #   NOT exempt and still hits the gate).
     "builtin.profile_set",
+    # 仅替换当前可信会话的封闭字段任务计划，无任意路径或外部副作用。
+    "builtin.todo_write",
 ]
 
 [approval_defaults.spawn_capability]
@@ -93,6 +95,18 @@ network = "default"
 capability = "builtin.time"
 effects = ["dispatch_capability", "read_filesystem", "write_filesystem"]
 mounts = "workspace"
+network = "default"
+
+[[grants]]
+capability = "builtin.todo_read"
+effects = ["dispatch_capability", "read_filesystem"]
+mounts = "ambient"
+network = "default"
+
+[[grants]]
+capability = "builtin.todo_write"
+effects = ["dispatch_capability", "read_filesystem", "write_filesystem"]
+mounts = "ambient"
 network = "default"
 
 [[grants]]

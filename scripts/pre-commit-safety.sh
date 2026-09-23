@@ -412,7 +412,7 @@ fi
 #    src/cli/ for newly-added lines that touch direct manager fields on the
 #    gateway state. Suppress with "// dispatch-exempt: <reason>".
 DISPATCH_DIFF=$(git diff --cached -U0 -- 'src/channels/web/handlers/*.rs' 'src/cli/*.rs' 2>/dev/null || true)
-if [ -z "$DISPATCH_DIFF" ]; then
+if [ "$HAS_STAGED_CHANGES" -eq 0 ] && [ -z "$DISPATCH_DIFF" ]; then
     DISPATCH_DIFF=$(git diff "$(resolve_base_ref)" -U0 -- 'src/channels/web/handlers/*.rs' 'src/cli/*.rs' 2>/dev/null || true)
 fi
 if [ -n "$DISPATCH_DIFF" ]; then

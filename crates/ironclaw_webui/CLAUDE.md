@@ -84,6 +84,8 @@ closed (`500`) if that layer is missing (locked by
 | `webui.v2.delete_thread` | DELETE | `/api/webchat/v2/threads/{thread_id}` | — | `ProductWorkflow` |
 | `webui.v2.send_message` | POST | `/api/webchat/v2/threads/{thread_id}/messages` | — | `TurnCoordinator` |
 | `webui.v2.get_timeline` | GET | `/api/webchat/v2/threads/{thread_id}/timeline` (`?limit&cursor`) | — | `ProjectionOnly` |
+| `webui.v2.get_thread_plan` | GET | `/api/webchat/v2/threads/{thread_id}/plan` | — | `ProjectionOnly` |
+| `webui.v2.get_run_state` | GET | `/api/webchat/v2/threads/{thread_id}/runs/{run_id}` | — | `ProjectionOnly` |
 | `webui.v2.logs` | GET | `/api/webchat/v2/logs` | — | `ProjectionOnly` |
 | `webui.v2.stream_events` | GET | `/api/webchat/v2/threads/{thread_id}/events` | **SSE** | `ProjectionOnly` |
 | `webui.v2.stream_events_ws` | GET | `/api/webchat/v2/threads/{thread_id}/ws` | **WebSocket** | `ProjectionOnly` |

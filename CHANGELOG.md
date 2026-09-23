@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Add an authenticated Reborn WebChat runtime command catalog and read-only command execution endpoint. The catalog is sourced from the product command registry so clients can discover `/version`, `/ping`, `/help`, and supported product commands without maintaining a second static list.
+- 新增 Reborn 通用线程 Todo：原子持久化计划、真实读写工具、严格 caller scope 的计划读取 API；补齐既有 canonical run-state 的只读 HTTP 入口，支持真实子 Agent 检阅状态。读取失败独立报错，任务空态不再依赖工具计数。详见 [线程计划契约](docs/reborn/contracts/thread-plans.md)。
+
+- 修正 Reborn WebChat 命令控制面：目录与可执行处理器共用注册表，只展示已实现的只读命令；`status` 读取当前调用者会话的真实运行记录，`skills` 读取运行态目录。命令不创建模型 turn。新增 WebChat caller 路由测试验证目录、执行与零模型提交。
 
 ## [1.0.0-rc.1] - 2026-07-20
 

@@ -16,6 +16,7 @@ mod error;
 mod filesystem_service;
 mod identifiers;
 mod in_memory;
+pub mod plan;
 mod service;
 mod summary_artifacts;
 mod title;

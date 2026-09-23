@@ -224,6 +224,51 @@ assert_precommit_allows_unstaged_diff() {
     fi
 }
 
+assert_staged_scope_ignores_committed_dispatch() {
+    local tmp output status
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/precommit-safety.XXXXXX")
+    set +e
+    (
+        cd "$tmp"
+        git init -q
+        git config user.email test@example.com
+        git config user.name "Test User"
+        mkdir -p src/cli crates
+        printf 'fn existing() {}\n' > src/cli/commands.rs
+        git add src/cli/commands.rs
+        git commit -qm base
+        git branch -M main
+        git checkout -qb feature
+        printf 'fn existing() { let store = state.store.as_ref(); }\n' > src/cli/commands.rs
+        git add src/cli/commands.rs
+        git commit -qm older-feature-change
+        printf 'fn staged_change() {}\n' > crates/staged.rs
+        git add crates/staged.rs
+        output=$("$ROOT_DIR/scripts/pre-commit-safety.sh" 2>&1)
+        status=$?
+        if [ "$status" -eq 0 ]; then
+            echo "OK: staged scope ignores earlier branch dispatch edits"
+            exit 0
+        fi
+        echo "FAIL: staged scope inspected earlier branch diff"
+        printf '%s\n' "$output" | sed 's/^/    /'
+        exit 1
+    )
+    status=$?
+    set -e
+    case "$tmp" in
+        "${TMPDIR:-/tmp}"/precommit-safety.*) rm -rf -- "$tmp" ;;
+        *) echo "FAIL: unsafe test temp path $tmp"; exit 1 ;;
+    esac
+    if [ "$status" -eq 0 ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+assert_staged_scope_ignores_committed_dispatch
+
 # ── PROJECTION ────────────────────────────────────────────────
 # Positive: any `.broadcast_for_user(` (SseManager-unique method) or
 #           `sse.broadcast(` with a portable word boundary.

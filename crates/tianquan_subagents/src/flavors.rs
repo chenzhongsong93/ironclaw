@@ -275,6 +275,12 @@ mod tests {
     fn flavor_catalog_has_16_entries() {
         let catalog = tianquan_flavor_catalog();
         assert_eq!(catalog.len(), 16);
+        assert!(
+            catalog
+                .iter()
+                .any(|flavor| flavor.id.as_str() == "chapter-reviewer")
+        );
+        assert!(!catalog.iter().any(|flavor| flavor.id.as_str() == "general"));
     }
 
     #[test]

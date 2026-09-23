@@ -216,6 +216,8 @@ pub(crate) async fn core_builtin_tools_with_confirmed_host_mount()
 pub(crate) fn core_builtin_tools_capability_ids() -> HarnessResult<Vec<CapabilityId>> {
     Ok(vec![
         CapabilityId::new(TIME_CAPABILITY_ID)?,
+        CapabilityId::new(ironclaw_host_runtime::TODO_READ_CAPABILITY_ID)?,
+        CapabilityId::new(ironclaw_host_runtime::TODO_WRITE_CAPABILITY_ID)?,
         CapabilityId::new(JSON_CAPABILITY_ID)?,
         CapabilityId::new(HTTP_CAPABILITY_ID)?,
         CapabilityId::new(HTTP_SAVE_CAPABILITY_ID)?,

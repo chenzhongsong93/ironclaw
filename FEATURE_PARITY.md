@@ -36,6 +36,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 |---------|----------|----------|-------|
 | Gateway control plane | ✅ | ✅ | Web gateway with 40+ API endpoints |
 | HTTP endpoints for Control UI | ✅ | ✅ | Web dashboard with chat, memory, jobs, logs, extensions |
+| Reborn thread task plans and run inspection | — | Implemented | `builtin.todo_read/write` use scoped CAS snapshots; caller-authorized `/threads/{id}/plan` and `/threads/{id}/runs/{run_id}` read canonical state; see [contract](docs/reborn/contracts/thread-plans.md). Task SSE delivery remains outside this slice. |
 | Channel connection lifecycle | ✅ | ✅ | ChannelManager + WebSocket tracker |
 | Session management/routing | ✅ | ✅ | SessionManager exists |
 | Configuration hot-reload | ✅ | ❌ | |

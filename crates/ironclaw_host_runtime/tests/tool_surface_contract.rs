@@ -983,6 +983,7 @@ async fn visible_surface_policy_filters_runtime_and_effects_before_authorization
         allowed_effects: vec![EffectKind::DispatchCapability],
         include_requires_approval: true,
         denied_capabilities: Vec::new(),
+        allowed_effect_overrides: Default::default(),
         max_capabilities: None,
     };
 
@@ -1229,6 +1230,7 @@ async fn visible_surface_version_is_order_insensitive_for_equivalent_policy() {
         allowed_effects: vec![EffectKind::DispatchCapability, EffectKind::Network],
         include_requires_approval: true,
         denied_capabilities: Vec::new(),
+        allowed_effect_overrides: Default::default(),
         max_capabilities: None,
     };
     let policy_b = CapabilitySurfacePolicy {
@@ -1236,6 +1238,7 @@ async fn visible_surface_version_is_order_insensitive_for_equivalent_policy() {
         allowed_effects: vec![EffectKind::Network, EffectKind::DispatchCapability],
         include_requires_approval: true,
         denied_capabilities: Vec::new(),
+        allowed_effect_overrides: Default::default(),
         max_capabilities: None,
     };
 
@@ -1454,6 +1457,52 @@ async fn visible_surface_requires_every_descriptor_effect_to_be_policy_allowed()
     assert!(surface.capabilities.is_empty());
 }
 
+#[tokio::test]
+async fn visible_surface_allows_exact_capability_effect_override_without_widening_others() {
+    let runtime = runtime_with(
+        registry_from_manifests([(FILES_MANIFEST, "/system/extensions/files")]),
+        Arc::new(GrantAuthorizer),
+    )
+    .with_trust_policy(Arc::new(trust_policy_for([(
+        "files",
+        "/system/extensions/files/manifest.toml",
+        vec![EffectKind::ReadFilesystem],
+    )])));
+    let context = context_with_grants([(
+        capability_id("files.read"),
+        vec![EffectKind::ReadFilesystem],
+    )]);
+    let mut policy = CapabilitySurfacePolicy {
+        allowed_effects: vec![EffectKind::DispatchCapability],
+        ..CapabilitySurfacePolicy::allow_all()
+    };
+    let baseline = runtime
+        .visible_capabilities(visible_request(context.clone()).with_policy(policy.clone()))
+        .await
+        .unwrap();
+    assert!(baseline.capabilities.is_empty());
+
+    policy.allowed_effect_overrides.insert(
+        capability_id("other.tool"),
+        vec![EffectKind::ReadFilesystem],
+    );
+    let unrelated = runtime
+        .visible_capabilities(visible_request(context.clone()).with_policy(policy.clone()))
+        .await
+        .unwrap();
+    assert!(unrelated.capabilities.is_empty());
+
+    policy.allowed_effect_overrides.insert(
+        capability_id("files.read"),
+        vec![EffectKind::ReadFilesystem],
+    );
+    let allowed = runtime
+        .visible_capabilities(visible_request(context).with_policy(policy))
+        .await
+        .unwrap();
+    assert_eq!(visible_ids(&allowed), vec![capability_id("files.read")]);
+    assert_ne!(allowed.version, baseline.version);
+}
 #[tokio::test]
 async fn visible_surface_hides_mcp_http_when_policy_denies_network_even_if_effect_underdeclared() {
     let runtime = runtime_with(

@@ -1,3 +1,4 @@
+// arch-exempt: large_file, mechanical SSE parser lint fix in the existing provider pending transport decomposition, plan #3031
 //! Anthropic OAuth provider (direct HTTP, `Authorization: Bearer`).
 //!
 //! This provider exists because the `rig-core` Anthropic client hardcodes the
@@ -299,10 +300,10 @@ impl AnthropicOAuthProvider {
             while let Some(line_end) = buffer.find('\n') {
                 let line: String = buffer.drain(..=line_end).collect();
                 let line = line.trim_end();
-                if let Some(payload) = line.strip_prefix("data:") {
-                    if let Ok(event) = serde_json::from_str::<SseEvent>(payload.trim()) {
-                        aggregator.absorb(event);
-                    }
+                if let Some(payload) = line.strip_prefix("data:")
+                    && let Ok(event) = serde_json::from_str::<SseEvent>(payload.trim())
+                {
+                    aggregator.absorb(event);
                 }
             }
         }
@@ -1512,11 +1513,11 @@ mod streaming_tests {
         }
     }
 
-    static SUBJECT_RESOLVER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static SUBJECT_RESOLVER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     async fn optional_subject_policy_uses_shared_token_only_when_subject_absent() {
-        let _guard = SUBJECT_RESOLVER_TEST_LOCK.lock().unwrap();
+        let _guard = SUBJECT_RESOLVER_TEST_LOCK.lock().await;
         crate::subject_keys::clear_subject_key_resolver();
         crate::register_subject_key_resolver(
             std::sync::Arc::new(TestSubjectResolver),
@@ -1540,7 +1541,7 @@ mod streaming_tests {
 
     #[tokio::test]
     async fn required_subject_policy_rejects_missing_and_unknown_without_fallback() {
-        let _guard = SUBJECT_RESOLVER_TEST_LOCK.lock().unwrap();
+        let _guard = SUBJECT_RESOLVER_TEST_LOCK.lock().await;
         crate::subject_keys::clear_subject_key_resolver();
         crate::register_subject_key_resolver(
             std::sync::Arc::new(TestSubjectResolver),

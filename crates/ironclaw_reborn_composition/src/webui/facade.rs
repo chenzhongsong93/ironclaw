@@ -236,6 +236,17 @@ pub(crate) fn build_webui_services_with_connectable_channels(
     )
     .with_approval_interactions(runtime.webui_approval_interaction_service())
     .with_auth_interactions(runtime.webui_auth_interaction_service());
+    if let Some(local_runtime) = services.local_runtime.as_ref() {
+        api = api.with_thread_plan_reader(Arc::new(
+            ironclaw_threads::plan::FilesystemThreadPlanStore::new(Arc::clone(
+                &local_runtime.identity_filesystem,
+            )),
+        ));
+    }
+    #[cfg(any(feature = "libsql", feature = "postgres"))]
+    if let Some(production_runtime) = services.production_runtime.as_ref() {
+        api = api.with_thread_plan_reader(production_runtime.thread_plan_reader());
+    }
     // Admin user-management surface: wired only when the identity directory,
     // the admin secret provisioner, and a token minter are all available.
     // Otherwise the fail-closed RejectingAdminUserService default stands and

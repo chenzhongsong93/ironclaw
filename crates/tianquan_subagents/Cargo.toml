@@ -1,5 +1,5 @@
 [package]
-name = "tianquan_subagents"
+name = "ironclaw_tianquan_subagents"
 version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
@@ -9,6 +9,9 @@ license = "MIT OR Apache-2.0"
 homepage = "https://github.com/nearai/ironclaw"
 repository = "https://github.com/nearai/ironclaw"
 publish = false
+
+[lib]
+name = "tianquan_subagents"
 
 [package.metadata.ironclaw]
 layer = "loops"

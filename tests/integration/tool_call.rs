@@ -111,6 +111,63 @@ async fn runs_http_tool_call_through_recorded_egress() {
 
 const HTTP_TOOL_URL: &str = "https://api.example.test/v1/items";
 
+#[tokio::test]
+async fn todo_real_tool_plan_persists_across_turns_and_isolates_other_conversations() {
+    let group = RebornIntegrationGroup::builtin_tools()
+        .await
+        .expect("group");
+    let plan = json!({"title":"真实任务", "steps":[{"index":0,"title":"检查结果","status":"pending"}], "expected_revision":0});
+    let thread = group
+        .thread("todo-parent")
+        .script([
+            RebornScriptedReply::tool_call("builtin.todo_write", plan),
+            RebornScriptedReply::text("已创建"),
+            RebornScriptedReply::tool_call("builtin.todo_read", json!({})),
+            RebornScriptedReply::text("已恢复"),
+            RebornScriptedReply::tool_call(
+                "builtin.todo_write",
+                json!({"title":"", "steps":[], "expected_revision":1}),
+            ),
+            RebornScriptedReply::text("已清空"),
+        ])
+        .build()
+        .await
+        .expect("thread");
+    thread.submit_turn("创建任务").await.expect("create turn");
+    thread.submit_turn("读取真实任务").await.expect("read turn");
+    let read = thread
+        .tool_result_output("builtin.todo_read")
+        .await
+        .expect("persisted plan");
+    assert_eq!(read["revision"], 1);
+    assert_eq!(read["steps"][0]["status"], "pending");
+    let sibling = group
+        .thread("todo-other")
+        .script([
+            RebornScriptedReply::tool_call("builtin.todo_read", json!({})),
+            RebornScriptedReply::text("无任务"),
+        ])
+        .build()
+        .await
+        .expect("sibling");
+    sibling
+        .submit_turn("读取其他会话任务")
+        .await
+        .expect("isolated read");
+    assert!(
+        sibling
+            .tool_result_output("builtin.todo_read")
+            .await
+            .expect("empty plan")
+            .is_null()
+    );
+    thread.submit_turn("清空任务").await.expect("clear turn");
+    thread
+        .assert_tool_result_contains("builtin.todo_write", "\"revision\":2")
+        .await
+        .expect("clear persisted");
+}
+
 /// A prior assistant refusal is conversation history, not capability truth.
 /// Once Slack is installed and activated, the refreshed tool definitions must
 /// be authoritative and the same conversation must be able to dispatch a real

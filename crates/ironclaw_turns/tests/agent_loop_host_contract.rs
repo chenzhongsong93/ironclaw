@@ -1520,6 +1520,7 @@ async fn prompt_bundle_authority_consumes_grant_after_successful_model_authoriza
         bundle_ref: LoopPromptBundleRef::for_run(&context, "bundle-once").unwrap(),
         messages: messages.clone(),
         surface_version: None,
+        capability_view: None,
         compaction_message_index: Vec::new(),
         instruction_fingerprint: None,
         identity_message_count: 0,
@@ -3162,6 +3163,7 @@ impl LoopPromptPort for RecordingAgentLoopHost {
                 })
                 .collect(),
             surface_version: request.surface_version,
+            capability_view: request.capability_view,
             compaction_message_index: Vec::new(),
             instruction_fingerprint: None,
             identity_message_count: 0,

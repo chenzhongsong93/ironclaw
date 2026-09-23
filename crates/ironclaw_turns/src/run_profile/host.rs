@@ -1155,6 +1155,10 @@ pub struct LoopPromptBundle {
     pub bundle_ref: LoopPromptBundleRef,
     pub messages: Vec<LoopModelMessage>,
     pub surface_version: Option<CapabilitySurfaceVersion>,
+    /// Host-pinned upper bound for model-visible capabilities. A driver may narrow it,
+    /// but omitting its own view cannot widen the prompt's grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_view: Option<LoopModelCapabilityView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compaction_message_index: Vec<LoopContextCompactionMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1170,6 +1174,7 @@ pub struct LoopPromptBundleGrant {
     pub bundle_ref: LoopPromptBundleRef,
     pub messages: Vec<LoopModelMessage>,
     pub surface_version: Option<CapabilitySurfaceVersion>,
+    pub capability_view: Option<LoopModelCapabilityView>,
     pub instruction_fingerprint: Option<InstructionBundleFingerprint>,
 }
 
@@ -1207,6 +1212,7 @@ impl LoopPromptBundleAuthority {
                 bundle_ref: bundle.bundle_ref.clone(),
                 messages: bundle.messages.clone(),
                 surface_version: bundle.surface_version.clone(),
+                capability_view: bundle.capability_view.clone(),
                 instruction_fingerprint: bundle.instruction_fingerprint.clone(),
             },
         );

@@ -609,6 +609,7 @@ impl ironclaw_turns::run_profile::LoopPromptPort for MockHost {
                 content_ref: LoopMessageRef::new("msg:user").expect("valid"),
             }],
             surface_version: self.prompt_surface_version.clone(),
+            capability_view: None,
             compaction_message_index: self.compaction.next_prompt_index(),
             instruction_fingerprint: None,
             identity_message_count: 0,

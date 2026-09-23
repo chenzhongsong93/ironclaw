@@ -385,6 +385,7 @@ where
             bundle_ref: LoopPromptBundleRef::fresh_for_run(&self.context),
             messages: instruction_bundle.messages,
             surface_version: request.surface_version.clone(),
+            capability_view: request.capability_view.clone(),
             compaction_message_index,
             instruction_fingerprint: Some(instruction_bundle.fingerprint),
             identity_message_count,

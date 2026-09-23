@@ -1176,6 +1176,16 @@ where
             &request.messages,
             &request.surface_version,
         )?;
+        let effective_capability_view = match prompt_grant.capability_view.clone() {
+            Some(pinned) => Some(
+                model_capability_view::intersect_model_capability_view(
+                    pinned.visible_capability_ids.into_iter().collect(),
+                    request.capability_view.clone(),
+                )
+                .view,
+            ),
+            None => request.capability_view.clone(),
+        };
 
         // Resolve messages *before* the budget reservation in the outer
         // `HostManagedLoopModelPort` so a message-resolution failure here
@@ -1197,7 +1207,7 @@ where
         };
         let gateway_result = if let Some(capabilities) = self.capabilities.as_ref() {
             let capabilities: Arc<dyn LoopCapabilityPort> =
-                if let Some(ref capability_view) = request.capability_view {
+                if let Some(ref capability_view) = effective_capability_view {
                     Arc::new(CapabilitySurfaceVisibleFilter::new(
                         Arc::clone(capabilities),
                         capability_view.visible_capability_ids.clone(),

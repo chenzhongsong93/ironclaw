@@ -1,9 +1,9 @@
 // arch-exempt: large_file, mechanical LocalFilesystem->DiskFilesystem Bucket-2 rename (arch-simplification §4.4), no logic change, plan #6168
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -52,7 +52,8 @@ use ironclaw_loop_host::{
     HostSkillContextSource, HostUserProfileSource, IdentityApplicability, IdentityFileName,
     JsonSpawnSubagentInputCodec, LoopCapabilityInputResolver, LoopCapabilityPortFactory,
     LoopCapabilityResultWriter, ProductLiveCancellationProbe, RunCancellationFactory,
-    RunCancellationHandle, SubagentSpawnGoalStore, identity_message_ref,
+    RunCancellationHandle, SubagentPromptComposer, SubagentPromptGoal, SubagentPromptMaterial,
+    SubagentPromptMaterialSource, SubagentSpawnGoalStore, identity_message_ref,
     loop_driver_execution_extension_id,
 };
 use ironclaw_processes::ProcessServices;
@@ -3418,6 +3419,114 @@ async fn subagent_planned_host_factory_create_host_requires_prompt_composer() {
             error.reason
         );
     }
+}
+
+struct FixedNovelistMaterialSource {
+    allowed: BTreeSet<CapabilityId>,
+}
+
+#[async_trait]
+impl SubagentPromptMaterialSource for FixedNovelistMaterialSource {
+    async fn material_for_run(
+        &self,
+        _run_context: &LoopRunContext,
+    ) -> Result<SubagentPromptMaterial, AgentLoopHostError> {
+        Ok(SubagentPromptMaterial {
+            direction_markdown: "# Novelist Agent\nSYSTEM_SOUL_SENTINEL".to_owned(),
+            goal: SubagentPromptGoal {
+                task: "NOVELIST_GOAL_SENTINEL".to_owned(),
+                handoff: Some("PARENT_HANDOFF_SENTINEL".to_owned()),
+            },
+            allowed_capabilities: self.allowed.clone(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn novelist_host_final_model_request_contains_system_direction() {
+    let fixture = HostFixture::new("thread-novelist-provider-capture", "parent task").await;
+    fixture.gateway.enable_tool_capture();
+    let allowed_id = CapabilityId::new("demo.allowed").unwrap();
+    let denied_id = CapabilityId::new("demo.denied").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(allowed_id.as_str()),
+        capability_descriptor(denied_id.as_str()),
+    ])));
+    let capability_factory = Arc::new(TestHostRuntimeCapabilityFactory {
+        runtime,
+        visible_request: host_runtime_visible_request(&fixture, ["demo"]),
+        io: Arc::new(InMemoryCapabilityIo::default()),
+        milestone_sink: fixture.milestone_sink.clone(),
+    });
+    let surface_resolver = Arc::new(StaticCapabilitySurfaceProfileResolver::new(
+        CapabilityAllowSet::allowlist([allowed_id.clone(), denied_id]),
+    ));
+    let profile = default_planned_run_profile_resolver()
+        .expect("profile resolver")
+        .resolve_run_profile(
+            RunProfileResolutionRequest::interactive_default().with_requested_run_profile(
+                RunProfileRequest::new(SUBAGENT_NOVELIST_PROFILE_ID).unwrap(),
+            ),
+        )
+        .await
+        .expect("novelist profile");
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_run_profile_id = profile.profile_id.clone();
+    claimed.state.resolved_run_profile_version = profile.loop_driver.version;
+    claimed.resolved_run_profile = profile;
+    let composer = SubagentPromptComposer::new(Arc::new(FixedNovelistMaterialSource {
+        allowed: BTreeSet::from([allowed_id]),
+    }));
+    let host = fixture
+        .factory()
+        .with_driver_requirements(driver_requirements_for(
+            &claimed.resolved_run_profile.loop_driver,
+            DriverRequirements::all_required(),
+        ))
+        .with_profiled_capability_port_factory(capability_factory, surface_resolver)
+        .with_subagent_prompt_composer(composer)
+        .create_host(&claimed)
+        .await
+        .expect("novelist host");
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .expect("visible surface");
+    let bundle = host
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: Some(surface.version.clone()),
+            capability_view: None,
+            checkpoint_state_ref: None,
+            max_messages: Some(8),
+            inline_messages: Vec::new(),
+        })
+        .await
+        .expect("novelist prompt bundle");
+    host.stream_model(LoopModelRequest {
+        messages: bundle.messages,
+        inline_messages: Vec::new(),
+        surface_version: Some(surface.version),
+        model_preference: None,
+        capability_view: None,
+    })
+    .await
+    .expect("host model call");
+    let requests = fixture.gateway.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].messages.iter().any(|message| {
+        message.role == HostManagedModelMessageRole::System
+            && message.content.contains("SYSTEM_SOUL_SENTINEL")
+    }));
+    assert!(requests[0].messages.iter().any(|message| {
+        message.role == HostManagedModelMessageRole::User
+            && message.content.contains("NOVELIST_GOAL_SENTINEL")
+    }));
+    let captured_tools = fixture.gateway.captured_tool_definitions();
+    assert_eq!(captured_tools.len(), 1, "最终模型调用应携带一份工具视图");
+    assert!(captured_tools[0].contains(&CapabilityId::new("demo.allowed").unwrap()));
+    assert!(!captured_tools[0].contains(&CapabilityId::new("demo.denied").unwrap()));
 }
 
 #[tokio::test]
@@ -9347,6 +9456,8 @@ struct RecordingGateway {
     queued_responses: Mutex<VecDeque<Result<HostManagedModelResponse, HostManagedModelError>>>,
     response_delay: Mutex<Option<std::time::Duration>>,
     progress_updates: Mutex<Vec<String>>,
+    capture_tool_definitions: AtomicBool,
+    tool_definition_snapshots: Mutex<Vec<Vec<CapabilityId>>>,
 }
 
 impl RecordingGateway {
@@ -9357,7 +9468,30 @@ impl RecordingGateway {
             queued_responses: Mutex::new(VecDeque::new()),
             response_delay: Mutex::new(None),
             progress_updates: Mutex::new(Vec::new()),
+            capture_tool_definitions: AtomicBool::new(false),
+            tool_definition_snapshots: Mutex::new(Vec::new()),
         }
+    }
+
+    fn enable_tool_capture(&self) {
+        self.capture_tool_definitions.store(true, Ordering::SeqCst);
+    }
+
+    fn captured_tool_definitions(&self) -> Vec<Vec<CapabilityId>> {
+        self.tool_definition_snapshots.lock().unwrap().clone()
+    }
+
+    fn record_tool_definitions(&self, capabilities: &Arc<dyn LoopCapabilityPort>) {
+        if !self.capture_tool_definitions.load(Ordering::SeqCst) {
+            return;
+        }
+        let ids = capabilities
+            .tool_definitions()
+            .expect("test gateway should read final provider tool definitions")
+            .into_iter()
+            .map(|definition| definition.capability_id)
+            .collect();
+        self.tool_definition_snapshots.lock().unwrap().push(ids);
     }
 
     fn set_response(&self, response: Result<HostManagedModelResponse, HostManagedModelError>) {
@@ -9457,12 +9591,22 @@ impl HostManagedModelGateway for RecordingGateway {
         self.stream_model(request).await
     }
 
+    async fn stream_model_with_capabilities(
+        &self,
+        request: HostManagedModelRequest,
+        capabilities: Arc<dyn LoopCapabilityPort>,
+    ) -> Result<HostManagedModelResponse, HostManagedModelError> {
+        self.record_tool_definitions(&capabilities);
+        self.stream_model(request).await
+    }
+
     async fn stream_model_with_capabilities_and_progress(
         &self,
         request: HostManagedModelRequest,
-        _capabilities: Arc<dyn LoopCapabilityPort>,
+        capabilities: Arc<dyn LoopCapabilityPort>,
         sink: Arc<dyn HostManagedModelStreamSink>,
     ) -> Result<HostManagedModelResponse, HostManagedModelError> {
+        self.record_tool_definitions(&capabilities);
         self.stream_model_with_progress(request, sink).await
     }
 }

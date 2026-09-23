@@ -122,7 +122,16 @@ pub enum ProjectionStreamItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LagReason {
+    /// Live source (broadcast) overflowed — the subscriber genuinely missed
+    /// envelopes and must resync from a snapshot.
     SourceLagged,
+    /// The initial snapshot/replay page was truncated (more history than the
+    /// page limit). NOT data loss mid-stream: the visible window is delivered
+    /// and the subscriber resyncs from the returned snapshot cursor.
+    /// Distinct from `SourceLagged` because consumers must not treat it as a
+    /// stream-fatal error (ISSUE-IRONCLAW-010: terminating on truncation turned
+    /// every long-history thread into a subscribe-error reconnect storm).
+    SnapshotTruncated,
     SourceFailed,
     /// Retained for wire/diagnostic compatibility. No longer emitted: the
     /// manager now applies blocking backpressure to slow subscribers instead

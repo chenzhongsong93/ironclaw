@@ -14,7 +14,7 @@ use ironclaw_event_projections::{
 };
 use ironclaw_event_streams::{
     AllowAllProjectionAccessPolicy, EventStreamManager, InMemoryProjectionStreamAdmissionPolicy,
-    InMemoryProjectionUpdateSource, NoExposureProjectionRedactionValidator,
+    InMemoryProjectionUpdateSource, LagReason, NoExposureProjectionRedactionValidator,
     ProductProjectionEnvelope, ProjectionStreamError as EventProjectionStreamError,
     ProjectionStreamItem, ProjectionSubscribeRequest,
     ProjectionSubscription as EventProjectionSubscription, ProjectionTarget, ProjectionViewClass,
@@ -711,6 +711,14 @@ async fn send_projection_subscription_error(
     sender: &mpsc::Sender<Result<ProductOutboundEnvelope, ProductAdapterError>>,
     error: ProductAdapterError,
 ) {
+    // 临时诊断(ISSUE-IRONCLAW-010 毒线程态):精确记录投影泵终止订阅的错误来源,
+    // 定位后保留(升级为正式 warn,运维可见)。
+    tracing::warn!(
+        target: "ironclaw_reborn_composition::projection",
+        error = %error,
+        error_debug = ?error,
+        "projection subscription terminating with error (ISSUE-010 diagnosis)"
+    );
     let _ = sender.send(Err(error)).await;
 }
 
@@ -1254,6 +1262,23 @@ async fn item_to_payloads(
             )
             .await
         }
+        // ISSUE-IRONCLAW-010 (poisoned-thread root cause): a truncated initial
+        // page is NOT stream-fatal. Terminating the subscription on it made
+        // every thread whose projection exceeds the page limit fail every
+        // subscribe deterministically, and the consumer's reconnect loop
+        // amplified that into a storm (365 rejections in 13 minutes,
+        // 2026-09-22). Instead: skip the marker, let the already-buffered
+        // visible-window payloads flush, and close the stream cleanly — the
+        // client reconnects with the advanced cursor and takes the replay
+        // path, which is bounded and holds. History beyond the page limit
+        // needs cursor paging (tracked separately); it must never look like
+        // an outage.
+        ProjectionStreamItem::Lagged {
+            reason: LagReason::SnapshotTruncated,
+            ..
+        } => Ok(None),
+        // Genuine lag/policy blocks: the subscriber missed live envelopes or
+        // was blocked — keep terminating so the client resyncs from a snapshot.
         ProjectionStreamItem::Lagged { .. } => Err(ProductAdapterError::WorkflowRejected {
             kind: ProductWorkflowRejectionKind::Unavailable,
             status_code: 503,

@@ -2282,3 +2282,71 @@ async fn webui_event_stream_drains_completed_and_failed_capability_activity_meta
         )
     }));
 }
+
+// 覆盖:ISSUE-IRONCLAW-010 毒线程态根治——初始页截断(SnapshotTruncated)不得终止订阅
+// (交付可见窗口后干净关闭,客户端带游标重连续传);真 lag/策略阻断仍终止(需快照重同步)。
+#[tokio::test]
+async fn snapshot_truncated_lag_is_not_stream_fatal_but_real_lag_is() {
+    let tenant_id = TenantId::new("lag-policy-tenant").unwrap();
+    let agent_id = AgentId::new("lag-policy-agent").unwrap();
+    let thread_id = ThreadId::new("lag-policy-thread").unwrap();
+    let scope = TurnScope::new(tenant_id, Some(agent_id), None, thread_id);
+    let display_previews = NoopCapabilityDisplayPreviewSource;
+    let cursor = EventProjectionCursor::for_scope(
+        runtime_projection_scope(
+            &TurnActor::new(UserId::new("lag-policy-user").unwrap()),
+            &scope,
+        ),
+        ironclaw_events::EventCursor::new(7),
+    );
+
+    let truncated = item_to_payloads(
+        ProjectionStreamItem::Lagged {
+            reason: LagReason::SnapshotTruncated,
+            snapshot_cursor: cursor.clone(),
+        },
+        &scope,
+        &display_previews,
+        None,
+        None,
+        0,
+        8,
+    )
+    .await
+    .expect("snapshot truncation must not fail the subscription");
+    assert!(
+        truncated.is_none(),
+        "截断标记本身不产帧(可见窗口已在先前帧交付),但不能是 Err"
+    );
+
+    for real_lag in [
+        LagReason::SourceLagged,
+        LagReason::AccessBlocked,
+        LagReason::RedactionBlocked,
+        LagReason::SourceFailed,
+    ] {
+        let outcome = item_to_payloads(
+            ProjectionStreamItem::Lagged {
+                reason: real_lag,
+                snapshot_cursor: cursor.clone(),
+            },
+            &scope,
+            &display_previews,
+            None,
+            None,
+            0,
+            8,
+        )
+        .await;
+        assert!(
+            matches!(
+                &outcome,
+                Err(ProductAdapterError::WorkflowRejected {
+                    kind: ProductWorkflowRejectionKind::Unavailable,
+                    ..
+                })
+            ),
+            "真 lag/策略阻断({real_lag:?})必须仍终止订阅以触发快照重同步,实得 {outcome:?}"
+        );
+    }
+}

@@ -30,6 +30,7 @@ use ironclaw_product_adapters::{
     ProductAdapterError, ProductWorkflowRejectionKind, ProjectionStream,
     ProjectionSubscriptionRequest,
 };
+use ironclaw_threads::plan::ThreadPlanReader;
 use ironclaw_threads::{
     AcceptInboundMessageRequest, AcceptedInboundMessageReplay, AttachmentRef, EnsureThreadRequest,
     MessageContent, MessageStatus, ReplayAcceptedInboundMessageRequest, SessionThreadError,
@@ -77,6 +78,7 @@ mod lifecycle_setup;
 mod llm_config;
 mod project_fs;
 mod projects;
+mod thread_plan;
 mod trace_credits;
 mod types;
 
@@ -92,6 +94,7 @@ pub use admin_users::{
     RebornAdminUserListResponse, RebornAdminUserResponse, RebornAdminUserSecretsListResponse,
 };
 pub use error::{RebornServicesError, RebornServicesErrorCode, RebornServicesErrorKind};
+pub use thread_plan::{RebornGetThreadPlanRequest, RebornGetThreadPlanResponse};
 pub use trace_credits::{
     RebornAccountLoginLinkResponse, RebornAccountTrace, RebornAccountTracesResponse,
     RebornTraceCreditsResponse, RebornTraceHoldAuthorizeResponse,
@@ -1773,6 +1776,18 @@ pub trait RebornServicesApi: Send + Sync {
         request: RebornTimelineRequest,
     ) -> Result<RebornTimelineResponse, RebornServicesError>;
 
+    async fn get_thread_plan(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        _request: RebornGetThreadPlanRequest,
+    ) -> Result<RebornGetThreadPlanResponse, RebornServicesError> {
+        Err(RebornServicesError::from_status(
+            RebornServicesErrorCode::Unavailable,
+            503,
+            true,
+        ))
+    }
+
     /// Return the effective global auto-approve toggle for the authenticated
     /// caller. This is a narrow session-bootstrap read, not the operator
     /// config key/value surface; implementations must derive scope from the
@@ -2722,6 +2737,7 @@ pub trait InboundAttachmentReader: Send + Sync {
 #[derive(Clone)]
 pub struct RebornServices {
     thread_service: Arc<dyn SessionThreadService>,
+    thread_plan_reader: Option<Arc<dyn ThreadPlanReader>>,
     turn_coordinator: Arc<dyn TurnCoordinator>,
     inbound_attachments: Option<Arc<dyn InboundAttachmentLander>>,
     project_filesystem: Option<Arc<dyn ProjectFilesystemReader>>,
@@ -2758,6 +2774,7 @@ impl RebornServices {
     ) -> Self {
         Self {
             thread_service,
+            thread_plan_reader: None,
             turn_coordinator,
             inbound_attachments: None,
             project_filesystem: None,
@@ -2793,6 +2810,12 @@ impl RebornServices {
 
     pub fn with_event_stream(mut self, event_stream: Arc<dyn ProjectionStream>) -> Self {
         self.event_stream = Some(event_stream);
+        self
+    }
+
+    /// Attach the same authoritative plan store that backs the runtime tools.
+    pub fn with_thread_plan_reader(mut self, reader: Arc<dyn ThreadPlanReader>) -> Self {
+        self.thread_plan_reader = Some(reader);
         self
     }
 
@@ -3939,6 +3962,31 @@ impl RebornServicesApi for RebornServices {
         })
     }
 
+    async fn get_thread_plan(
+        &self,
+        caller: WebUiAuthenticatedCaller,
+        request: RebornGetThreadPlanRequest,
+    ) -> Result<RebornGetThreadPlanResponse, RebornServicesError> {
+        let thread_id = parse_thread_id_field("thread_id", request.thread_id)?;
+        let scope = caller.turn_scope(thread_id);
+        let actor = caller.actor();
+        let access = self
+            .resolve_thread_access_for_caller(caller, scope, &actor)
+            .await?;
+        let reader = self.thread_plan_reader.as_ref().ok_or_else(|| {
+            RebornServicesError::from_status(RebornServicesErrorCode::Unavailable, 503, true)
+        })?;
+        // dispatch-exempt: authorized read of the canonical thread plan, through
+        // the domain's read-only port. Mutation remains a mediated runtime tool.
+        let plan = reader
+            .read(&access.scope.to_resource_scope())
+            .await
+            .map_err(|_| {
+                RebornServicesError::from_status(RebornServicesErrorCode::Unavailable, 503, true)
+            })?;
+        Ok(RebornGetThreadPlanResponse { plan })
+    }
+
     async fn list_project_dir(
         &self,
         caller: WebUiAuthenticatedCaller,
@@ -4355,6 +4403,12 @@ impl RebornServicesApi for RebornServices {
                 let envelope = match next {
                     Ok(envelope) => envelope,
                     Err(error) => {
+                        tracing::warn!(
+                            target: "ironclaw_product_workflow::reborn_services",
+                            error = %error,
+                            error_debug = ?error,
+                            "SSE subscription pump got projection error (ISSUE-010 diagnosis)"
+                        );
                         let _ = sender.send(Err(map_projection_error(error))).await;
                         return;
                     }
@@ -4370,6 +4424,12 @@ impl RebornServicesApi for RebornServices {
                     )
                     .await;
                 if let Err(error) = revalidate {
+                    tracing::warn!(
+                        target: "ironclaw_product_workflow::reborn_services",
+                        error = %error,
+                        error_debug = ?error,
+                        "SSE subscription pump revalidation failed (ISSUE-010 diagnosis)"
+                    );
                     let _ = sender.send(Err(error)).await;
                     return;
                 }

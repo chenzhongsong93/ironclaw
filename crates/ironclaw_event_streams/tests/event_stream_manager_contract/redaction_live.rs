@@ -665,7 +665,7 @@ async fn truncated_snapshot_emits_terminal_lag_before_live_tail() {
             reason,
             snapshot_cursor,
         } => {
-            assert_eq!(reason, LagReason::SourceLagged);
+            assert_eq!(reason, LagReason::SnapshotTruncated);
             assert_eq!(snapshot_cursor.runtime, EventCursor::new(10));
         }
         other => panic!("expected truncated snapshot lag, got {other:?}"),
@@ -707,7 +707,7 @@ async fn truncated_resume_replay_emits_terminal_lag_before_live_tail() {
             reason,
             snapshot_cursor,
         } => {
-            assert_eq!(reason, LagReason::SourceLagged);
+            assert_eq!(reason, LagReason::SnapshotTruncated);
             assert_eq!(snapshot_cursor.runtime, EventCursor::new(3));
         }
         other => panic!("expected truncated replay lag, got {other:?}"),

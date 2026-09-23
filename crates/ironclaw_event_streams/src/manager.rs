@@ -514,7 +514,7 @@ async fn forward_subscription_items(
 
 fn truncated_lag_item(snapshot_cursor: &ProjectionCursor) -> ProjectionStreamItem {
     ProjectionStreamItem::Lagged {
-        reason: LagReason::SourceLagged,
+        reason: LagReason::SnapshotTruncated,
         snapshot_cursor: snapshot_cursor.clone(),
     }
 }

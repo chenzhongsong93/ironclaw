@@ -162,10 +162,12 @@ async fn todo_real_tool_plan_persists_across_turns_and_isolates_other_conversati
             .is_null()
     );
     thread.submit_turn("清空任务").await.expect("clear turn");
-    thread
-        .assert_tool_result_contains("builtin.todo_write", "\"revision\":2")
+    let cleared = thread
+        .tool_result_output("builtin.todo_write")
         .await
         .expect("clear persisted");
+    assert_eq!(cleared["revision"], 2);
+    assert_eq!(cleared["steps"], json!([]));
 }
 
 /// A prior assistant refusal is conversation history, not capability truth.

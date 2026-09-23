@@ -261,5 +261,16 @@ mod tests {
                 .direction_markdown
                 .contains("小说正文创作")
         );
+        let worldsmith = bundle.role("worldsmith").unwrap();
+        assert!(
+            worldsmith
+                .allowed_capabilities
+                .contains("tianquan-graph.run_world_patch")
+        );
+        assert!(
+            !worldsmith
+                .allowed_capabilities
+                .contains("builtin.write_file")
+        );
     }
 }

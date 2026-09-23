@@ -34,7 +34,7 @@ use ironclaw_turns::{
     run_profile::{AgentLoopHostError, AgentLoopHostErrorKind, LoopRunContext},
 };
 
-use flavors::{allowed_capabilities_for, is_tianquan_kind, lookup_soul_flavor};
+use flavors::{is_tianquan_kind, lookup_soul_flavor};
 
 // ---------------------------------------------------------------------------
 // TianquanSubagentDefinitionResolver
@@ -167,22 +167,8 @@ where
         })?;
         let direction_markdown = soul_role.direction_markdown.clone();
 
-        // 4. 目录声明与旧 flavor 上界取交集，最终再由 host 与授权工具面相交。
-        let legacy_limit: BTreeSet<CapabilityId> = allowed_capabilities_for(&kind_str)
-            .map_err(|e| AgentLoopHostError::new(AgentLoopHostErrorKind::Invalid, e))?;
-        let declared: BTreeSet<CapabilityId> = soul_role
-            .allowed_capabilities
-            .iter()
-            .map(|id| {
-                CapabilityId::new(id.as_str()).map_err(|error| {
-                    AgentLoopHostError::new(
-                        AgentLoopHostErrorKind::Invalid,
-                        format!("invalid SOUL capability {id}: {error}"),
-                    )
-                })
-            })
-            .collect::<Result<_, _>>()?;
-        let allowed_capabilities = legacy_limit.intersection(&declared).cloned().collect();
+        // 4. 角色上界随后由宿主与实际授权工具面取交集。
+        let allowed_capabilities = allowed_capabilities_for_role(soul_role)?;
 
         Ok(SubagentPromptMaterial {
             direction_markdown,
@@ -190,6 +176,23 @@ where
             allowed_capabilities,
         })
     }
+}
+
+fn allowed_capabilities_for_role(
+    soul_role: &directions::SoulRole,
+) -> Result<BTreeSet<CapabilityId>, AgentLoopHostError> {
+    soul_role
+        .allowed_capabilities
+        .iter()
+        .map(|id| {
+            CapabilityId::new(id.as_str()).map_err(|error| {
+                AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::Invalid,
+                    format!("invalid SOUL capability {id}: {error}"),
+                )
+            })
+        })
+        .collect::<Result<_, _>>()
 }
 
 // ---------------------------------------------------------------------------
@@ -312,4 +315,20 @@ fn map_goal_error(error: SubagentGoalStoreError) -> AgentLoopHostError {
         AgentLoopHostErrorKind::Unavailable,
         format!("subagent goal store error: {error}"),
     )
+}
+
+#[cfg(test)]
+mod role_capability_tests {
+    use super::*;
+
+    #[test]
+    fn worldsmith_receives_declared_mcp_tool_without_coding_capabilities() {
+        let role = directions::SoulRole {
+            direction_markdown: "worldsmith".into(),
+            allowed_capabilities: BTreeSet::from(["tianquan-graph.run_world_patch".to_string()]),
+        };
+        let allowed = allowed_capabilities_for_role(&role).unwrap();
+        assert!(allowed.contains(&CapabilityId::new("tianquan-graph.run_world_patch").unwrap()));
+        assert!(!allowed.contains(&CapabilityId::new("builtin.write_file").unwrap()));
+    }
 }

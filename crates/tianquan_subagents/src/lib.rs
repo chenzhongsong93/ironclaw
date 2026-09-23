@@ -1,7 +1,7 @@
 //! TianQuan 16 SOUL subagent 接入 IronClaw Reborn。
 //!
 //! 实现 SubagentDefinitionResolver + SubagentPromptMaterialSource 两个 trait,
-//! 把 16 SOUL(novelist/worldsmith 等)作为 Reborn subagent 的 direction persona 注入。
+//! 从天权只读 SOUL bundle 加载 16 个 direction persona，并注入 Reborn subagent。
 //!
 //! 对齐 architecture.md §14:IronClaw agent 编排(外壳)派子 agent 时按 tier:role
 //! 加载对应 SOUL persona,子 agent 经 MCP 调天权左脑引擎(底座)。
@@ -14,6 +14,7 @@ pub mod directions;
 pub mod flavors;
 
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -91,7 +92,7 @@ impl SubagentDefinitionResolver for TianquanSubagentDefinitionResolver {
 ///
 /// 替换 ironclaw 默认的 GateBackedSubagentPromptMaterialSource(用 direction_prompt
 /// 取 4 内置 flavor persona)。天权版从 thread metadata 取 subagent_kind → 查 16 SOUL
-/// direction_prompt + 天权工具白名单。
+/// direction prompt + 天权工具白名单。SOUL 资产不再编译进 IronClaw。
 ///
 /// goal 取数逻辑对齐 GateBackedSubagentPromptMaterialSource(优先 goal_store,
 /// fallback thread history),但 prompt material 用天权 SOUL(非 ironclaw 内置 direction)。
@@ -101,6 +102,7 @@ where
 {
     goal_store: Arc<G>,
     thread_service: Arc<dyn SessionThreadService>,
+    soul_bundle: Result<directions::SoulBundle, String>,
 }
 
 impl<G> TianquanSubagentPromptMaterialSource<G>
@@ -108,9 +110,13 @@ where
     G: SubagentGoalStore + ?Sized,
 {
     pub fn new(goal_store: Arc<G>, thread_service: Arc<dyn SessionThreadService>) -> Self {
+        let soul_bundle = std::env::var("TIANQUAN_SOUL_BUNDLE_DIR")
+            .map_err(|_| "TIANQUAN_SOUL_BUNDLE_DIR is not configured".to_string())
+            .and_then(|dir| directions::SoulBundle::load_from_dir(Path::new(&dir)));
         Self {
             goal_store,
             thread_service,
+            soul_bundle,
         }
     }
 }
@@ -149,19 +155,34 @@ where
         )
         .await?;
 
-        // 3. 取 SOUL direction prompt(persona 正文)
-        let direction_markdown = directions::direction_prompt_for_kind(&kind_str)
-            .ok_or_else(|| {
-                AgentLoopHostError::new(
-                    AgentLoopHostErrorKind::Invalid,
-                    format!("unknown tianquan soul direction for kind: {kind_str}"),
-                )
-            })?
-            .to_string();
+        // 3. 从构造时已校验并冻结的 SOUL bundle 取 persona 正文。
+        let soul_bundle = self.soul_bundle.as_ref().map_err(|error| {
+            AgentLoopHostError::new(AgentLoopHostErrorKind::Unavailable, error.clone())
+        })?;
+        let soul_role = soul_bundle.role(&kind_str).ok_or_else(|| {
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::Invalid,
+                format!("unknown tianquan soul direction for kind: {kind_str}"),
+            )
+        })?;
+        let direction_markdown = soul_role.direction_markdown.clone();
 
-        // 4. 取工具白名单
-        let allowed_capabilities: BTreeSet<CapabilityId> = allowed_capabilities_for(&kind_str)
+        // 4. 目录声明与旧 flavor 上界取交集，最终再由 host 与授权工具面相交。
+        let legacy_limit: BTreeSet<CapabilityId> = allowed_capabilities_for(&kind_str)
             .map_err(|e| AgentLoopHostError::new(AgentLoopHostErrorKind::Invalid, e))?;
+        let declared: BTreeSet<CapabilityId> = soul_role
+            .allowed_capabilities
+            .iter()
+            .map(|id| {
+                CapabilityId::new(id.as_str()).map_err(|error| {
+                    AgentLoopHostError::new(
+                        AgentLoopHostErrorKind::Invalid,
+                        format!("invalid SOUL capability {id}: {error}"),
+                    )
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let allowed_capabilities = legacy_limit.intersection(&declared).cloned().collect();
 
         Ok(SubagentPromptMaterial {
             direction_markdown,

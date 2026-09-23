@@ -5,13 +5,14 @@
 //!   - META/WORLD 层:读 + delegate(派下游)
 //!   - LOOP 层:读 + 写 + delegate + validate(经 MCP 调左脑引擎)
 //!
-//! 注:allowed_capabilities 是子 agent 可用的 IronClaw capability。
+//! 注:这里的 allowed_capabilities 是迁移期安全上界；运行许可由天权
+//! catalog 声明、此上界和 host 授权取交集。
 //! 天权左脑引擎经 MCP 暴露(ironclaw 调 mcp 工具 → 天权 api),不在此白名单
 //! (MCP 工具是 ironclaw 的 builtin.mcp__* capability,子 agent 默认可见经 profile 配置)。
 
 use ironclaw_host_api::CapabilityId;
 
-/// 16 个天权 SOUL subagent kind(对齐姊妹仓 profiles/ 的 16 个 SOUL.md)。
+/// 16 个天权 SOUL subagent kind(对齐天权 infra/agents/novel-studio/catalog.json)。
 ///
 /// kind 命名用连字符(对齐 SubagentKindId 校验:ascii alphanumeric/_/-)。
 pub const TIANQUAN_SOUL_KINDS: &[&str] = &[
@@ -217,8 +218,7 @@ pub fn tianquan_flavor_catalog() -> Vec<ironclaw_loop_host::SpawnSubagentFlavorD
     TIANQUAN_SOUL_FLAVORS
         .iter()
         .map(|f| ironclaw_loop_host::SpawnSubagentFlavorDescriptor {
-            id: ironclaw_loop_host::SubagentKindId::new(f.kind)
-                .expect("valid SubagentKindId"), // safety: TIANQUAN_SOUL_FLAVORS kinds are compile-time-constant valid
+            id: ironclaw_loop_host::SubagentKindId::new(f.kind).expect("valid SubagentKindId"), // safety: TIANQUAN_SOUL_FLAVORS kinds are compile-time-constant valid
             summary: f.summary.to_string(),
         })
         .collect()
@@ -245,8 +245,11 @@ pub fn is_tianquan_kind(kind: &str) -> bool {
 }
 
 /// 取 flavor 的工具白名单(BTreeSet<CapabilityId>)。
-pub fn allowed_capabilities_for(kind: &str) -> Result<std::collections::BTreeSet<CapabilityId>, String> {
-    let flavor = lookup_soul_flavor(kind).ok_or_else(|| format!("unknown tianquan soul kind: {kind}"))?;
+pub fn allowed_capabilities_for(
+    kind: &str,
+) -> Result<std::collections::BTreeSet<CapabilityId>, String> {
+    let flavor =
+        lookup_soul_flavor(kind).ok_or_else(|| format!("unknown tianquan soul kind: {kind}"))?;
     flavor
         .tool_allowlist
         .iter()
@@ -267,7 +270,10 @@ mod tests {
     #[test]
     fn kinds_match_flavors() {
         for kind in TIANQUAN_SOUL_KINDS {
-            assert!(lookup_soul_flavor(kind).is_some(), "flavor missing for kind {kind}");
+            assert!(
+                lookup_soul_flavor(kind).is_some(),
+                "flavor missing for kind {kind}"
+            );
         }
     }
 

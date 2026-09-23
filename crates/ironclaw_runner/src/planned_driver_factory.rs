@@ -112,9 +112,9 @@ pub fn subagent_novelist_planned_profile_id() -> Result<RunProfileId, String> {
 pub(crate) fn is_subagent_planned_profile(
     profile: &ironclaw_turns::run_profile::ResolvedRunProfile,
 ) -> bool {
-    profile.profile_id.as_str() == SUBAGENT_PLANNED_PROFILE_ID
-        && profile.loop_driver.id.as_str() == SUBAGENT_PLANNED_DRIVER_ID
+    profile.loop_driver.id.as_str() == SUBAGENT_PLANNED_DRIVER_ID
         && profile.loop_driver.version == planned_driver_default_version()
+        && profile.capability_surface_profile_id.as_str() == SUBAGENT_CAPABILITY_SURFACE_PROFILE_ID
 }
 
 pub(crate) fn is_subagent_planned_run_profile(
@@ -538,6 +538,8 @@ mod tests {
             snapshot.capability_surface_profile_id.as_str(),
             SUBAGENT_CAPABILITY_SURFACE_PROFILE_ID
         );
+        // ISSUE-IRONCLAW-011: model slot 不得改变子运行身份；该判定还守 SOUL 包装与工具交集。
+        assert!(is_subagent_planned_profile(&snapshot));
     }
 
     #[tokio::test]
@@ -583,6 +585,20 @@ mod tests {
             .expect("profile should resolve");
 
         assert!(is_subagent_planned_profile(&snapshot));
+
+        let mut alternate_model_profile = snapshot.clone();
+        alternate_model_profile.profile_id =
+            RunProfileId::new("reborn-planned-alternate-model").expect("valid profile id");
+        assert!(
+            is_subagent_planned_profile(&alternate_model_profile),
+            "model/profile selection must not remove subagent prompt or permissions"
+        );
+
+        let mut mismatched_surface = snapshot.clone();
+        mismatched_surface.capability_surface_profile_id =
+            CapabilitySurfaceProfileId::new(INTERACTIVE_CAPABILITY_SURFACE_PROFILE_ID)
+                .expect("valid capability surface profile id");
+        assert!(!is_subagent_planned_profile(&mismatched_surface));
 
         let mut mismatched_driver = snapshot.clone();
         mismatched_driver.loop_driver.id =

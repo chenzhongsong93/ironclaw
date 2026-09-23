@@ -803,6 +803,7 @@ where
             let provenance =
                 crate::subagent::spawn_provenance::SpawnProvenanceRecord::from_terminal(
                     &child_run_id,
+                    &parent_run_id,
                     child_scope,
                     &edge.subagent_kind,
                     terminal_kind,

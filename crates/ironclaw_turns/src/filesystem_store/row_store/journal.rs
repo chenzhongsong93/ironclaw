@@ -45,12 +45,21 @@ const MATERIALIZED_ROW_CAS_RETRIES: usize = 16;
 /// permanently wedge the whole turn engine (TianQuan ISSUE-IRONCLAW-002 — two
 /// production incidents where one busy append halted every subsequent
 /// mutation until a manual restart).
-const DELTA_JOURNAL_BUSY_RETRY_MAX_ATTEMPTS: u32 = 5;
-const DELTA_JOURNAL_BUSY_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
-const DELTA_JOURNAL_BUSY_RETRY_MAX_DELAY: Duration = Duration::from_millis(1600);
+// 2026-09-23 修订(ISSUE-IRONCLAW-002 复发根治):原预算 5 次×100ms-1.6s(总 ~3.1s)在
+// 35 分钟长 spawn 的高压竞争窗下被击穿,store 误降级→整轮生成报废。busy 的语义是
+// "本次 append 未提交"(all-or-nothing),重试同一批不可能造成持久缺口,因此对 busy 的
+// 容忍以分钟计:60 次×250ms-5s 退避(最坏 ~4.6 分钟)。只有非 busy 的真 I/O 错误
+// (可能半写)才继续走 degraded 闩锁+停机(正确性优先)。
+const DELTA_JOURNAL_BUSY_RETRY_MAX_ATTEMPTS: u32 = 60;
+const DELTA_JOURNAL_BUSY_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const DELTA_JOURNAL_BUSY_RETRY_MAX_DELAY: Duration = Duration::from_millis(5000);
+/// 第 1 次与每逢 10 的倍数记 warn(运维可见),其余 debug(避免长竞争窗刷屏)。
+fn busy_attempt_is_noisy(attempt: u32) -> bool {
+    attempt == 1 || attempt.is_multiple_of(10)
+}
 
 fn busy_backoff_delay(attempt: u32) -> Duration {
-    let shift = attempt.saturating_sub(1).min(4);
+    let shift = attempt.saturating_sub(1).min(5);
     DELTA_JOURNAL_BUSY_RETRY_BASE_DELAY
         .saturating_mul(1u32 << shift)
         .min(DELTA_JOURNAL_BUSY_RETRY_MAX_DELAY)
@@ -183,15 +192,23 @@ async fn run_delta_journal_flusher<F>(
                 {
                     busy_attempt += 1;
                     let delay = busy_backoff_delay(busy_attempt);
-                    tracing::warn!(
-                        attempt = busy_attempt,
-                        max_attempts = DELTA_JOURNAL_BUSY_RETRY_MAX_ATTEMPTS,
-                        delay_ms = delay.as_millis() as u64,
-                        batch_len = requests.len(),
-                        "delta journal append hit retryable backend contention; \
+                    if busy_attempt_is_noisy(busy_attempt) {
+                        tracing::warn!(
+                            attempt = busy_attempt,
+                            max_attempts = DELTA_JOURNAL_BUSY_RETRY_MAX_ATTEMPTS,
+                            delay_ms = delay.as_millis() as u64,
+                            batch_len = requests.len(),
+                            "delta journal append hit retryable backend contention; \
                          retrying the identical batch (busy appends never commit, \
                          so no durable gap is possible)",
-                    );
+                        );
+                    } else {
+                        tracing::debug!(
+                            attempt = busy_attempt,
+                            delay_ms = delay.as_millis() as u64,
+                            "delta journal busy retry (quiet attempt)",
+                        );
+                    }
                     tokio::time::sleep(delay).await;
                 }
                 Err(failure) => break Err(failure),
@@ -1061,5 +1078,50 @@ mod tests {
         let records = durable_delta_records(filesystem.as_ref()).await;
         assert!(records.is_empty(), "nothing durable for the failed batch");
         drop(journal);
+    }
+}
+
+#[cfg(test)]
+mod busy_budget_tests {
+    use super::*;
+
+    // 覆盖:ISSUE-IRONCLAW-002 复发根治(2026-09-23)——busy 预算以分钟计:
+    // 60 次尝试、250ms 起步、5s 封顶,最坏总等待约 4.6 分钟,覆盖长 spawn 高压竞争窗。
+    #[test]
+    fn busy_budget_covers_sustained_contention_windows() {
+        assert_eq!(DELTA_JOURNAL_BUSY_RETRY_MAX_ATTEMPTS, 60);
+        assert_eq!(
+            DELTA_JOURNAL_BUSY_RETRY_BASE_DELAY,
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            DELTA_JOURNAL_BUSY_RETRY_MAX_DELAY,
+            Duration::from_millis(5000)
+        );
+        // 退避曲线:250ms 起步,第 6 次起封顶 5s
+        assert_eq!(busy_backoff_delay(1), Duration::from_millis(250));
+        assert_eq!(busy_backoff_delay(2), Duration::from_millis(500));
+        assert_eq!(busy_backoff_delay(3), Duration::from_millis(1000));
+        assert_eq!(busy_backoff_delay(6), Duration::from_millis(5000));
+        assert_eq!(busy_backoff_delay(60), Duration::from_millis(5000));
+        // 最坏总等待(1..=60 全部用尽)≈ 4.6 分钟
+        let total: Duration = (1..=DELTA_JOURNAL_BUSY_RETRY_MAX_ATTEMPTS)
+            .map(busy_backoff_delay)
+            .sum();
+        assert!(
+            total >= Duration::from_secs(240) && total <= Duration::from_secs(300),
+            "busy 总预算应落在 4-5 分钟,实得 {total:?}"
+        );
+    }
+
+    // 覆盖:日志降噪契约——第 1 次与每逢 10 记 warn,其余 debug。
+    #[test]
+    fn busy_retry_logging_is_noise_bounded() {
+        assert!(busy_attempt_is_noisy(1));
+        assert!(!busy_attempt_is_noisy(2));
+        assert!(!busy_attempt_is_noisy(9));
+        assert!(busy_attempt_is_noisy(10));
+        assert!(busy_attempt_is_noisy(20));
+        assert!(busy_attempt_is_noisy(60));
     }
 }

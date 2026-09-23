@@ -808,6 +808,7 @@ where
                     terminal_kind,
                     output.final_text.as_deref(),
                     spawned_at,
+                    event.sanitized_reason.clone(),
                 );
             crate::subagent::spawn_provenance::record_spawn_terminal(
                 std::env::var("TIANQUAN_SPAWN_PG_URL").ok().as_deref(),

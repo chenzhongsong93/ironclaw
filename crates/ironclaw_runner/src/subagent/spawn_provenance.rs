@@ -47,6 +47,11 @@ pub(crate) struct SpawnProvenanceRecord {
     /// raw final_text 的 sha256(通用契约:天权 validator 用 LLM 传的 prose 原文比对此值,
     /// 证明 prose 真来自 spawn;领域提取不参与此 hash)。
     pub final_text_hash: Option<String>,
+    /// sanitized terminal reason(失败类别,如 iteration_limit / driver_protocol_violation)。
+    /// 通用契约:settle 侧 event.sanitized_reason 忠实落库,零领域判断;天权侧按它归类
+    /// 失败 spawn(ISSUE-IRONCLAW-009 留观项:child loop-exit 空转的失败归类)。
+    /// Completed 恒 None。
+    pub failure_category: Option<String>,
 }
 
 impl SpawnProvenanceRecord {
@@ -60,6 +65,7 @@ impl SpawnProvenanceRecord {
         terminal_kind: EdgeTerminalKind,
         final_text: Option<&str>,
         spawned_at: TurnTimestamp,
+        failure_category: Option<String>,
     ) -> Self {
         Self {
             child_run_id: child_run_id.to_string(),
@@ -75,6 +81,11 @@ impl SpawnProvenanceRecord {
             // (不剥围栏/不做领域判断)。领域提取(剥围栏/拒汇报/判正文)在天权 api 读取侧实现;
             // 天权 validator 用 LLM 传的 prose 原文比对此值,证明 prose 真来自 spawn。
             final_text_hash: final_text.map(sha256_hex),
+            failure_category: match terminal_kind {
+                // Completed 无失败类别;其余终态忠实记录(调用方已 sanitize,不再加工)。
+                EdgeTerminalKind::Completed => None,
+                _ => failure_category.filter(|reason| !reason.trim().is_empty()),
+            },
         }
     }
 }
@@ -198,15 +209,16 @@ async fn upsert_spawn_record(
     let result = client
         .execute(
             "INSERT INTO spawn_records \
-             (child_run_id, subagent_type, project_id, layer, spawned_at, terminal_status, final_text_hash) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             (child_run_id, subagent_type, project_id, layer, spawned_at, terminal_status, final_text_hash, failure_category) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT (child_run_id) DO UPDATE SET \
              subagent_type = EXCLUDED.subagent_type, \
              project_id = EXCLUDED.project_id, \
              layer = EXCLUDED.layer, \
              spawned_at = EXCLUDED.spawned_at, \
              terminal_status = EXCLUDED.terminal_status, \
-             final_text_hash = EXCLUDED.final_text_hash",
+             final_text_hash = EXCLUDED.final_text_hash, \
+             failure_category = EXCLUDED.failure_category",
             &[
                 &record.child_run_id,
                 &record.subagent_type,
@@ -215,6 +227,7 @@ async fn upsert_spawn_record(
                 &record.spawned_at,
                 &record.terminal_status,
                 &record.final_text_hash,
+                &record.failure_category,
             ],
         )
         .await;
@@ -300,6 +313,7 @@ mod tests {
             EdgeTerminalKind::Completed,
             None,
             spawned_at,
+            None,
         );
         assert_eq!(rec.final_text_hash, None);
         // 忠实持久化:任意 final_text(含围栏/汇报)hash = raw 的 sha256,不做领域判断
@@ -311,6 +325,7 @@ mod tests {
             EdgeTerminalKind::Completed,
             Some(&direct_prose),
             spawned_at,
+            None,
         );
         assert_eq!(
             rec.final_text_hash.as_deref(),
@@ -329,6 +344,7 @@ mod tests {
             EdgeTerminalKind::Completed,
             Some(&final_text),
             spawned_at,
+            None,
         );
         assert_eq!(
             rec.final_text_hash.as_deref(),
@@ -354,6 +370,7 @@ mod tests {
             EdgeTerminalKind::Failed,
             None,
             Utc::now(),
+            None,
         );
         assert_eq!(rec.project_id, None);
         let scope_some = scope_with_project(Some(ironclaw_host_api::ProjectId::from_trusted(
@@ -366,6 +383,7 @@ mod tests {
             EdgeTerminalKind::Failed,
             None,
             Utc::now(),
+            None,
         );
         assert_eq!(rec.project_id.as_deref(), Some("project:iron-city"));
     }
@@ -381,6 +399,7 @@ mod tests {
             EdgeTerminalKind::Completed,
             Some("x"),
             Utc::now(),
+            None,
         );
         // 无 PG 在跑;若误触网必 panic/超时,返回即证明零开销跳过
         record_spawn_terminal(None, &rec, None).await;
@@ -404,6 +423,7 @@ mod tests {
             EdgeTerminalKind::Completed,
             Some("x"),
             Utc::now(),
+            None,
         );
         // 忠实持久化:任意 final_text(含汇报/围栏)→ 原样落盘(通用平台不判断内容)
         let direct_prose = "夜".repeat(200);
@@ -441,6 +461,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         unsafe {
             std::env::remove_var("TIANQUAN_SPAWN_PROSE_DIR");
+        }
+    }
+
+    // 覆盖:ISSUE-IRONCLAW-009 留观项收口条件①——失败终态的 sanitized reason 忠实落库
+    // (failure_category),Completed 恒 None;天权侧按它归类失败 spawn,不再依赖已丢的网关日志。
+    #[test]
+    fn record_from_terminal_captures_failure_category() {
+        let child_run_id = TurnRunId::new();
+        let scope = scope_with_project(None);
+        // Failed + 非空 reason → 记录
+        let rec = SpawnProvenanceRecord::from_terminal(
+            &child_run_id,
+            &scope,
+            &kind("novelist"),
+            EdgeTerminalKind::Failed,
+            None,
+            Utc::now(),
+            Some("driver_protocol_violation".to_string()),
+        );
+        assert_eq!(
+            rec.failure_category.as_deref(),
+            Some("driver_protocol_violation"),
+            "Failed 终态必须忠实落库 sanitized reason"
+        );
+        // 空白 reason → None(不落噪声)
+        let rec = SpawnProvenanceRecord::from_terminal(
+            &child_run_id,
+            &scope,
+            &kind("novelist"),
+            EdgeTerminalKind::Failed,
+            None,
+            Utc::now(),
+            Some("   ".to_string()),
+        );
+        assert_eq!(rec.failure_category, None);
+        // Completed → 恒 None(即便传入也不记录,Completed 无失败类别)
+        let rec = SpawnProvenanceRecord::from_terminal(
+            &child_run_id,
+            &scope,
+            &kind("novelist"),
+            EdgeTerminalKind::Completed,
+            Some("x"),
+            Utc::now(),
+            Some("iteration_limit".to_string()),
+        );
+        assert_eq!(rec.failure_category, None);
+        // Cancelled / RecoveryRequired → 同样记录
+        for kind_ in [
+            EdgeTerminalKind::Cancelled,
+            EdgeTerminalKind::RecoveryRequired,
+        ] {
+            let rec = SpawnProvenanceRecord::from_terminal(
+                &child_run_id,
+                &scope,
+                &kind("novelist"),
+                kind_,
+                None,
+                Utc::now(),
+                Some("recovery_required".to_string()),
+            );
+            assert_eq!(rec.failure_category.as_deref(), Some("recovery_required"));
         }
     }
 }

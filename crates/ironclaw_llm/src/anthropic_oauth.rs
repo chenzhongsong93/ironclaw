@@ -299,10 +299,10 @@ impl AnthropicOAuthProvider {
             while let Some(line_end) = buffer.find('\n') {
                 let line: String = buffer.drain(..=line_end).collect();
                 let line = line.trim_end();
-                if let Some(payload) = line.strip_prefix("data:") {
-                    if let Ok(event) = serde_json::from_str::<SseEvent>(payload.trim()) {
-                        aggregator.absorb(event);
-                    }
+                if let Some(payload) = line.strip_prefix("data:")
+                    && let Ok(event) = serde_json::from_str::<SseEvent>(payload.trim())
+                {
+                    aggregator.absorb(event);
                 }
             }
         }

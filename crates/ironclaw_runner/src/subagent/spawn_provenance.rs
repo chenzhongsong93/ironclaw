@@ -29,10 +29,10 @@ use std::io::Write as _;
 
 use super::await_edge::EdgeTerminalKind;
 
-/// 铁律(2026-08-07):通用平台能力不做领域判断——本扩展只做**忠实文件持久化**
-/// (子 agent final_text 原文落盘 + raw sha256),零小说领域假设(剥围栏/判正文/拒汇报
-/// 等全属天权业务逻辑,在天权 api 读取侧 `read_prose_from_ssot_file` 实现)。
-/// 落盘 raw = 完整过程记录(可 debug),天权读取时提取纯正文用于呈现/校验。
+// 铁律(2026-08-07):通用平台能力不做领域判断——本扩展只做**忠实文件持久化**
+// (子 agent final_text 原文落盘 + raw sha256),零小说领域假设(剥围栏/判正文/拒汇报
+// 等全属天权业务逻辑,在天权 api 读取侧 `read_prose_from_ssot_file` 实现)。
+// 落盘 raw = 完整过程记录(可 debug),天权读取时提取纯正文用于呈现/校验。
 
 /// One `spawn_records` row (mirror of TianQuan api migration 0005).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,20 +57,32 @@ pub(crate) struct SpawnProvenanceRecord {
     pub failure_category: Option<String>,
 }
 
+pub(crate) struct SpawnTerminalInput<'a> {
+    pub child_run_id: &'a TurnRunId,
+    pub parent_run_id: &'a TurnRunId,
+    pub child_scope: &'a TurnScope,
+    pub subagent_kind: &'a ironclaw_loop_host::SubagentKindId,
+    pub terminal_kind: EdgeTerminalKind,
+    pub final_text: Option<&'a str>,
+    pub spawned_at: TurnTimestamp,
+    pub failure_category: Option<String>,
+}
+
 impl SpawnProvenanceRecord {
     /// Assemble a record from the settle path's in-hand data.
     /// `spawned_at` is the child run's `received_at` (spawn-time proxy,
     /// backfilled at terminal time — the spawn port itself does not write).
-    pub(crate) fn from_terminal(
-        child_run_id: &TurnRunId,
-        parent_run_id: &TurnRunId,
-        child_scope: &TurnScope,
-        subagent_kind: &ironclaw_loop_host::SubagentKindId,
-        terminal_kind: EdgeTerminalKind,
-        final_text: Option<&str>,
-        spawned_at: TurnTimestamp,
-        failure_category: Option<String>,
-    ) -> Self {
+    pub(crate) fn from_terminal(input: SpawnTerminalInput<'_>) -> Self {
+        let SpawnTerminalInput {
+            child_run_id,
+            parent_run_id,
+            child_scope,
+            subagent_kind,
+            terminal_kind,
+            final_text,
+            spawned_at,
+            failure_category,
+        } = input;
         Self {
             child_run_id: child_run_id.to_string(),
             parent_run_id: parent_run_id.to_string(),
@@ -285,6 +297,22 @@ mod tests {
     use super::*;
     use ironclaw_loop_host::SubagentKindId;
 
+    macro_rules! terminal_record {
+        ($child:expr, $parent:expr, $scope:expr, $kind:expr,
+         $terminal:expr, $text:expr, $spawned_at:expr, $failure:expr $(,)?) => {
+            SpawnProvenanceRecord::from_terminal(SpawnTerminalInput {
+                child_run_id: $child,
+                parent_run_id: $parent,
+                child_scope: $scope,
+                subagent_kind: $kind,
+                terminal_kind: $terminal,
+                final_text: $text,
+                spawned_at: $spawned_at,
+                failure_category: $failure,
+            })
+        };
+    }
+
     static PROSE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn kind(id: &str) -> SubagentKindId {
@@ -346,7 +374,7 @@ mod tests {
         let child_run_id = TurnRunId::new();
         let scope = scope_with_project(None);
         let spawned_at = Utc::now();
-        let rec = SpawnProvenanceRecord::from_terminal(
+        let rec = terminal_record!(
             &child_run_id,
             &TurnRunId::new(),
             &scope,
@@ -359,7 +387,7 @@ mod tests {
         assert_eq!(rec.final_text_hash, None);
         // 忠实持久化:任意 final_text(含围栏/汇报)hash = raw 的 sha256,不做领域判断
         let direct_prose = "夜色压城。".repeat(30); // ≥100 字
-        let rec = SpawnProvenanceRecord::from_terminal(
+        let rec = terminal_record!(
             &child_run_id,
             &TurnRunId::new(),
             &scope,
@@ -379,7 +407,7 @@ mod tests {
         let final_text = format!(
             "第24章 开头\n\n{prose}```json\n{{\"prose\": \"{prose}\", \"usedGraphFacts\": [\"F1\"]}}\n```"
         );
-        let rec = SpawnProvenanceRecord::from_terminal(
+        let rec = terminal_record!(
             &child_run_id,
             &TurnRunId::new(),
             &scope,
@@ -406,7 +434,7 @@ mod tests {
     fn record_from_terminal_project_id_passthrough() {
         let child_run_id = TurnRunId::new();
         let scope_none = scope_with_project(None);
-        let rec = SpawnProvenanceRecord::from_terminal(
+        let rec = terminal_record!(
             &child_run_id,
             &TurnRunId::new(),
             &scope_none,
@@ -420,7 +448,7 @@ mod tests {
         let scope_some = scope_with_project(Some(ironclaw_host_api::ProjectId::from_trusted(
             "project:iron-city".to_string(),
         )));
-        let rec = SpawnProvenanceRecord::from_terminal(
+        let rec = terminal_record!(
             &child_run_id,
             &TurnRunId::new(),
             &scope_some,
@@ -438,7 +466,7 @@ mod tests {
         // 来源绑定以子记录上可信父 run 为准，不能从模型任务文本猜项目。
         let parent_run_id = TurnRunId::new();
         let child_run_id = TurnRunId::new();
-        let record = SpawnProvenanceRecord::from_terminal(
+        let record = terminal_record!(
             &child_run_id,
             &parent_run_id,
             &scope_with_project(None),
@@ -455,7 +483,7 @@ mod tests {
     #[tokio::test]
     async fn record_spawn_terminal_none_url_is_noop() {
         let child_run_id = TurnRunId::new();
-        let rec = SpawnProvenanceRecord::from_terminal(
+        let rec = terminal_record!(
             &child_run_id,
             &TurnRunId::new(),
             &scope_with_project(None),
@@ -481,7 +509,7 @@ mod tests {
         }
         let child_run_id = TurnRunId::new();
         // project_id=None 走 fallback "iron-city"(子 agent scope 不带 project,2026-08-04)
-        let rec = SpawnProvenanceRecord::from_terminal(
+        let rec = terminal_record!(
             &child_run_id,
             &TurnRunId::new(),
             &scope_with_project(None),
@@ -515,7 +543,7 @@ mod tests {
             "等待".repeat(30)
         );
         let report_child = TurnRunId::new();
-        let report_record = SpawnProvenanceRecord::from_terminal(
+        let report_record = terminal_record!(
             &report_child,
             &TurnRunId::new(),
             &scope_with_project(None),
@@ -538,7 +566,7 @@ mod tests {
         let fenced =
             format!("```json\n{{\"prose\": \"{prose}\", \"usedGraphFacts\": [\"F1\"]}}\n```");
         let fenced_child = TurnRunId::new();
-        let fenced_record = SpawnProvenanceRecord::from_terminal(
+        let fenced_record = terminal_record!(
             &fenced_child,
             &TurnRunId::new(),
             &scope_with_project(None),
@@ -567,7 +595,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("isolated raw directory");
         unsafe { std::env::set_var("TIANQUAN_SPAWN_PROSE_DIR", temp.path()) };
         let child_run_id = TurnRunId::new();
-        let record = SpawnProvenanceRecord::from_terminal(
+        let record = terminal_record!(
             &child_run_id,
             &TurnRunId::new(),
             &scope_with_project(None),
@@ -600,7 +628,7 @@ mod tests {
         let child_run_id = TurnRunId::new();
         let scope = scope_with_project(None);
         // Failed + 非空 reason → 记录
-        let rec = SpawnProvenanceRecord::from_terminal(
+        let rec = terminal_record!(
             &child_run_id,
             &TurnRunId::new(),
             &scope,
@@ -616,7 +644,7 @@ mod tests {
             "Failed 终态必须忠实落库 sanitized reason"
         );
         // 空白 reason → None(不落噪声)
-        let rec = SpawnProvenanceRecord::from_terminal(
+        let rec = terminal_record!(
             &child_run_id,
             &TurnRunId::new(),
             &scope,
@@ -628,7 +656,7 @@ mod tests {
         );
         assert_eq!(rec.failure_category, None);
         // Completed → 恒 None(即便传入也不记录,Completed 无失败类别)
-        let rec = SpawnProvenanceRecord::from_terminal(
+        let rec = terminal_record!(
             &child_run_id,
             &TurnRunId::new(),
             &scope,
@@ -644,7 +672,7 @@ mod tests {
             EdgeTerminalKind::Cancelled,
             EdgeTerminalKind::RecoveryRequired,
         ] {
-            let rec = SpawnProvenanceRecord::from_terminal(
+            let rec = terminal_record!(
                 &child_run_id,
                 &TurnRunId::new(),
                 &scope,
@@ -684,7 +712,7 @@ mod tests {
         let parent = TurnRunId::new();
         let child = TurnRunId::new();
         let raw = "原文不允许被重写。";
-        let record = SpawnProvenanceRecord::from_terminal(
+        let record = terminal_record!(
             &child,
             &parent,
             &scope_with_project(None),

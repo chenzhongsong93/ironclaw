@@ -802,14 +802,16 @@ where
             // settle path is never affected.
             let provenance =
                 crate::subagent::spawn_provenance::SpawnProvenanceRecord::from_terminal(
-                    &child_run_id,
-                    &parent_run_id,
-                    child_scope,
-                    &edge.subagent_kind,
-                    terminal_kind,
-                    output.final_text.as_deref(),
-                    spawned_at,
-                    event.sanitized_reason.clone(),
+                    crate::subagent::spawn_provenance::SpawnTerminalInput {
+                        child_run_id: &child_run_id,
+                        parent_run_id: &parent_run_id,
+                        child_scope,
+                        subagent_kind: &edge.subagent_kind,
+                        terminal_kind,
+                        final_text: output.final_text.as_deref(),
+                        spawned_at,
+                        failure_category: event.sanitized_reason.clone(),
+                    },
                 );
             crate::subagent::spawn_provenance::record_spawn_terminal(
                 std::env::var("TIANQUAN_SPAWN_PG_URL").ok().as_deref(),

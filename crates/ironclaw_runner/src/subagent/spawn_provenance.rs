@@ -25,6 +25,7 @@
 use chrono::{DateTime, Utc};
 use ironclaw_turns::{TurnRunId, TurnScope, TurnTimestamp};
 use sha2::Digest as _;
+use std::io::Write as _;
 
 use super::await_edge::EdgeTerminalKind;
 
@@ -37,6 +38,8 @@ use super::await_edge::EdgeTerminalKind;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SpawnProvenanceRecord {
     pub child_run_id: String,
+    /// Trusted parent from the persisted child-run relationship, never a model-supplied value.
+    pub parent_run_id: String,
     pub subagent_type: String,
     pub project_id: Option<String>,
     /// Spawn context carries no layer concept today → always `None` (never
@@ -60,6 +63,7 @@ impl SpawnProvenanceRecord {
     /// backfilled at terminal time — the spawn port itself does not write).
     pub(crate) fn from_terminal(
         child_run_id: &TurnRunId,
+        parent_run_id: &TurnRunId,
         child_scope: &TurnScope,
         subagent_kind: &ironclaw_loop_host::SubagentKindId,
         terminal_kind: EdgeTerminalKind,
@@ -69,6 +73,7 @@ impl SpawnProvenanceRecord {
     ) -> Self {
         Self {
             child_run_id: child_run_id.to_string(),
+            parent_run_id: parent_run_id.to_string(),
             subagent_type: subagent_kind.to_string(),
             project_id: child_scope
                 .project_id
@@ -128,7 +133,10 @@ pub(crate) async fn record_spawn_terminal(
     record: &SpawnProvenanceRecord,
     final_text: Option<&str>,
 ) {
-    persist_final_text_to_workspace(final_text, record);
+    if !persist_final_text_to_workspace(final_text, record) {
+        // 已有同 child 的不同原文或落盘失败：不更新 PG hash，保留首次可信来源。
+        return;
+    }
     let Some(pg_url) = pg_url else {
         return;
     };
@@ -147,21 +155,19 @@ pub(crate) async fn record_spawn_terminal(
 /// 铁律(2026-08-07):通用平台只做忠实持久化——落盘 raw final_text 原文,不做领域判断
 /// (剥围栏/判正文/拒汇报全属天权业务逻辑,在天权 api 读取侧 `read_prose_from_ssot_file`
 /// 提取纯正文用于呈现/校验)。raw 落盘 = 完整过程记录(可 debug)。
-/// 路径:{TIANQUAN_SPAWN_PROSE_DIR}/{project_id}/chapters/ch24.txt
-/// project_id 固定 "iron-city"(子 agent scope.project_id 为 None,spawn 链路不传 project;
-/// 当前验证场景固定 iron-city,generalize 时需在 spawn 记录里带 project_id/chapter_no,见
-/// debt-register 落盘债)。env 未设/写失败 → warn 日志跳过(settle 路径不受影响)。
-fn persist_final_text_to_workspace(final_text: Option<&str>, record: &SpawnProvenanceRecord) {
+/// 路径:{TIANQUAN_SPAWN_PROSE_DIR}/runs/{child_run_id}.txt。平台只保存 run 原文，
+/// 不猜领域项目/章号；同 child 重放必须字节相同。env 未设时跳过文件写。
+fn persist_final_text_to_workspace(
+    final_text: Option<&str>,
+    record: &SpawnProvenanceRecord,
+) -> bool {
     let Some(prose_dir) = std::env::var("TIANQUAN_SPAWN_PROSE_DIR").ok() else {
-        return;
+        return true;
     };
     let Some(prose) = final_text else {
-        return;
+        return true;
     };
-    let project_id = record.project_id.as_deref().unwrap_or("iron-city");
-    let dir = std::path::Path::new(&prose_dir)
-        .join(project_id)
-        .join("chapters");
+    let dir = std::path::Path::new(&prose_dir).join("runs");
     if let Err(error) = std::fs::create_dir_all(&dir) {
         tracing::warn!(
             target: "tianquan_spawn_provenance",
@@ -170,25 +176,55 @@ fn persist_final_text_to_workspace(final_text: Option<&str>, record: &SpawnProve
             error = %error,
             "spawn prose dir create failed (best-effort, settle path unaffected)"
         );
-        return;
+        return false;
     }
-    let path = dir.join("ch24.txt");
-    if let Err(error) = std::fs::write(&path, &prose) {
-        tracing::warn!(
-            target: "tianquan_spawn_provenance",
-            child_run_id = %record.child_run_id,
-            path = %path.display(),
-            error = %error,
-            "spawn prose write failed (best-effort, settle path unaffected)"
-        );
-    } else {
-        tracing::info!(
-            target: "tianquan_spawn_provenance",
-            child_run_id = %record.child_run_id,
-            path = %path.display(),
-            byte_len = prose.len(),
-            "spawn prose persisted to workspace"
-        );
+    let path = dir.join(format!("{}.txt", record.child_run_id));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            if let Err(error) = file.write_all(prose.as_bytes()) {
+                tracing::warn!(
+                    target: "tianquan_spawn_provenance",
+                    child_run_id = %record.child_run_id,
+                    error = %error,
+                    "spawn raw write failed; provenance row not updated"
+                );
+                return false;
+            }
+            tracing::info!(
+                target: "tianquan_spawn_provenance",
+                child_run_id = %record.child_run_id,
+                path = %path.display(),
+                byte_len = prose.len(),
+                "spawn raw persisted by child run"
+            );
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            match std::fs::read_to_string(&path) {
+                Ok(existing) if existing == prose => true,
+                Ok(_) | Err(_) => {
+                    tracing::warn!(
+                        target: "tianquan_spawn_provenance",
+                        child_run_id = %record.child_run_id,
+                        "different or unreadable raw already exists for child; provenance row not updated"
+                    );
+                    false
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "tianquan_spawn_provenance",
+                child_run_id = %record.child_run_id,
+                error = %error,
+                "spawn raw open failed; provenance row not updated"
+            );
+            false
+        }
     }
 }
 
@@ -209,9 +245,10 @@ async fn upsert_spawn_record(
     let result = client
         .execute(
             "INSERT INTO spawn_records \
-             (child_run_id, subagent_type, project_id, layer, spawned_at, terminal_status, final_text_hash, failure_category) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             (child_run_id, parent_run_id, subagent_type, project_id, layer, spawned_at, terminal_status, final_text_hash, failure_category) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
              ON CONFLICT (child_run_id) DO UPDATE SET \
+             parent_run_id = EXCLUDED.parent_run_id, \
              subagent_type = EXCLUDED.subagent_type, \
              project_id = EXCLUDED.project_id, \
              layer = EXCLUDED.layer, \
@@ -221,6 +258,7 @@ async fn upsert_spawn_record(
              failure_category = EXCLUDED.failure_category",
             &[
                 &record.child_run_id,
+                &record.parent_run_id,
                 &record.subagent_type,
                 &record.project_id,
                 &record.layer,
@@ -246,6 +284,8 @@ async fn upsert_spawn_record(
 mod tests {
     use super::*;
     use ironclaw_loop_host::SubagentKindId;
+
+    static PROSE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn kind(id: &str) -> SubagentKindId {
         SubagentKindId::new(id).expect("valid kind id")
@@ -308,6 +348,7 @@ mod tests {
         let spawned_at = Utc::now();
         let rec = SpawnProvenanceRecord::from_terminal(
             &child_run_id,
+            &TurnRunId::new(),
             &scope,
             &kind("novelist"),
             EdgeTerminalKind::Completed,
@@ -320,6 +361,7 @@ mod tests {
         let direct_prose = "夜色压城。".repeat(30); // ≥100 字
         let rec = SpawnProvenanceRecord::from_terminal(
             &child_run_id,
+            &TurnRunId::new(),
             &scope,
             &kind("novelist"),
             EdgeTerminalKind::Completed,
@@ -339,6 +381,7 @@ mod tests {
         );
         let rec = SpawnProvenanceRecord::from_terminal(
             &child_run_id,
+            &TurnRunId::new(),
             &scope,
             &kind("novelist"),
             EdgeTerminalKind::Completed,
@@ -365,6 +408,7 @@ mod tests {
         let scope_none = scope_with_project(None);
         let rec = SpawnProvenanceRecord::from_terminal(
             &child_run_id,
+            &TurnRunId::new(),
             &scope_none,
             &kind("general"),
             EdgeTerminalKind::Failed,
@@ -378,6 +422,7 @@ mod tests {
         )));
         let rec = SpawnProvenanceRecord::from_terminal(
             &child_run_id,
+            &TurnRunId::new(),
             &scope_some,
             &kind("general"),
             EdgeTerminalKind::Failed,
@@ -388,12 +433,31 @@ mod tests {
         assert_eq!(rec.project_id.as_deref(), Some("project:iron-city"));
     }
 
+    #[test]
+    fn terminal_record_keeps_trusted_parent_run_id() {
+        // 来源绑定以子记录上可信父 run 为准，不能从模型任务文本猜项目。
+        let parent_run_id = TurnRunId::new();
+        let child_run_id = TurnRunId::new();
+        let record = SpawnProvenanceRecord::from_terminal(
+            &child_run_id,
+            &parent_run_id,
+            &scope_with_project(None),
+            &kind("novelist"),
+            EdgeTerminalKind::Completed,
+            Some("正文"),
+            Utc::now(),
+            None,
+        );
+        assert_eq!(record.parent_run_id, parent_run_id.to_string());
+    }
+
     // 覆盖:§2.2 PH-IC-SKIP-01 — pg_url=None(env 关闭)立即返回,零网络
     #[tokio::test]
     async fn record_spawn_terminal_none_url_is_noop() {
         let child_run_id = TurnRunId::new();
         let rec = SpawnProvenanceRecord::from_terminal(
             &child_run_id,
+            &TurnRunId::new(),
             &scope_with_project(None),
             &kind("novelist"),
             EdgeTerminalKind::Completed,
@@ -407,7 +471,8 @@ mod tests {
 
     // 覆盖:2026-08-04 落盘标准 + 2026-08-07 铁律——raw final_text 忠实落盘(通用平台不做领域判断)
     #[test]
-    fn persist_final_text_writes_ch24_txt_when_env_set() {
+    fn persist_final_text_uses_child_run_address_instead_of_fixed_chapter() {
+        let _guard = PROSE_ENV_LOCK.lock().expect("serialize prose env tests");
         // 用一次性临时目录避免污染真实 workspace
         let tmp = std::env::temp_dir().join(format!("tq-spawn-prose-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -418,6 +483,7 @@ mod tests {
         // project_id=None 走 fallback "iron-city"(子 agent scope 不带 project,2026-08-04)
         let rec = SpawnProvenanceRecord::from_terminal(
             &child_run_id,
+            &TurnRunId::new(),
             &scope_with_project(None),
             &kind("novelist"),
             EdgeTerminalKind::Completed,
@@ -428,8 +494,15 @@ mod tests {
         // 忠实持久化:任意 final_text(含汇报/围栏)→ 原样落盘(通用平台不判断内容)
         let direct_prose = "夜".repeat(200);
         persist_final_text_to_workspace(Some(&direct_prose), &rec);
-        let direct_path = tmp.join("iron-city").join("chapters").join("ch24.txt");
+        let direct_path = tmp.join("runs").join(format!("{child_run_id}.txt"));
         assert!(direct_path.exists(), "正文直出应落盘");
+        assert!(
+            !tmp.join("iron-city")
+                .join("chapters")
+                .join("ch24.txt")
+                .exists(),
+            "平台原文不能覆盖固定项目/章节文件"
+        );
         let written_direct = std::fs::read_to_string(&direct_path).expect("读回");
         assert_eq!(
             written_direct, direct_prose,
@@ -441,8 +514,20 @@ mod tests {
             "当前状态汇报: spawn 被拒 fanout 超限。{}\n<suggestions>[\"重试\"]</suggestions>",
             "等待".repeat(30)
         );
-        persist_final_text_to_workspace(Some(&report), &rec);
-        let written_report = std::fs::read_to_string(&direct_path).expect("读回");
+        let report_child = TurnRunId::new();
+        let report_record = SpawnProvenanceRecord::from_terminal(
+            &report_child,
+            &TurnRunId::new(),
+            &scope_with_project(None),
+            &kind("novelist"),
+            EdgeTerminalKind::Completed,
+            Some(&report),
+            Utc::now(),
+            None,
+        );
+        persist_final_text_to_workspace(Some(&report), &report_record);
+        let report_path = tmp.join("runs").join(format!("{report_child}.txt"));
+        let written_report = std::fs::read_to_string(&report_path).expect("读回");
         assert_eq!(
             written_report, report,
             "忠实落盘:汇报文本也原样落盘(领域判断不在通用平台)"
@@ -452,8 +537,20 @@ mod tests {
         let prose = "夜".repeat(200);
         let fenced =
             format!("```json\n{{\"prose\": \"{prose}\", \"usedGraphFacts\": [\"F1\"]}}\n```");
-        persist_final_text_to_workspace(Some(&fenced), &rec);
-        let written_fenced = std::fs::read_to_string(&direct_path).expect("读回");
+        let fenced_child = TurnRunId::new();
+        let fenced_record = SpawnProvenanceRecord::from_terminal(
+            &fenced_child,
+            &TurnRunId::new(),
+            &scope_with_project(None),
+            &kind("novelist"),
+            EdgeTerminalKind::Completed,
+            Some(&fenced),
+            Utc::now(),
+            None,
+        );
+        persist_final_text_to_workspace(Some(&fenced), &fenced_record);
+        let fenced_path = tmp.join("runs").join(format!("{fenced_child}.txt"));
+        let written_fenced = std::fs::read_to_string(&fenced_path).expect("读回");
         assert_eq!(
             written_fenced, fenced,
             "忠实落盘:围栏形态 = raw 全文(不剥围栏)"
@@ -462,6 +559,38 @@ mod tests {
         unsafe {
             std::env::remove_var("TIANQUAN_SPAWN_PROSE_DIR");
         }
+    }
+
+    #[test]
+    fn a_replayed_child_cannot_replace_its_original_raw_text() {
+        let _guard = PROSE_ENV_LOCK.lock().expect("serialize prose env tests");
+        let temp = tempfile::tempdir().expect("isolated raw directory");
+        unsafe { std::env::set_var("TIANQUAN_SPAWN_PROSE_DIR", temp.path()) };
+        let child_run_id = TurnRunId::new();
+        let record = SpawnProvenanceRecord::from_terminal(
+            &child_run_id,
+            &TurnRunId::new(),
+            &scope_with_project(None),
+            &kind("novelist"),
+            EdgeTerminalKind::Completed,
+            Some("first"),
+            Utc::now(),
+            None,
+        );
+        persist_final_text_to_workspace(Some("first"), &record);
+        persist_final_text_to_workspace(Some("different"), &record);
+        unsafe { std::env::remove_var("TIANQUAN_SPAWN_PROSE_DIR") };
+        let run_path = temp.path().join("runs").join(format!("{child_run_id}.txt"));
+        let old_path = temp.path().join("iron-city/chapters/ch24.txt");
+        let persisted = if run_path.exists() {
+            run_path
+        } else {
+            old_path
+        };
+        assert_eq!(
+            std::fs::read_to_string(persisted).expect("raw text should exist"),
+            "first"
+        );
     }
 
     // 覆盖:ISSUE-IRONCLAW-009 留观项收口条件①——失败终态的 sanitized reason 忠实落库
@@ -473,6 +602,7 @@ mod tests {
         // Failed + 非空 reason → 记录
         let rec = SpawnProvenanceRecord::from_terminal(
             &child_run_id,
+            &TurnRunId::new(),
             &scope,
             &kind("novelist"),
             EdgeTerminalKind::Failed,
@@ -488,6 +618,7 @@ mod tests {
         // 空白 reason → None(不落噪声)
         let rec = SpawnProvenanceRecord::from_terminal(
             &child_run_id,
+            &TurnRunId::new(),
             &scope,
             &kind("novelist"),
             EdgeTerminalKind::Failed,
@@ -499,6 +630,7 @@ mod tests {
         // Completed → 恒 None(即便传入也不记录,Completed 无失败类别)
         let rec = SpawnProvenanceRecord::from_terminal(
             &child_run_id,
+            &TurnRunId::new(),
             &scope,
             &kind("novelist"),
             EdgeTerminalKind::Completed,
@@ -514,6 +646,7 @@ mod tests {
         ] {
             let rec = SpawnProvenanceRecord::from_terminal(
                 &child_run_id,
+                &TurnRunId::new(),
                 &scope,
                 &kind("novelist"),
                 kind_,
@@ -523,5 +656,61 @@ mod tests {
             );
             assert_eq!(rec.failure_category.as_deref(), Some("recovery_required"));
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable atomic_spawn_test PostgreSQL"]
+    async fn postgres_export_keeps_parent_run_id_and_raw_hash() {
+        let pg_url = std::env::var("TIANQUAN_ATOMIC_TEST_PG_URL")
+            .expect("disposable PG URL must be explicit");
+        assert!(
+            pg_url.starts_with("postgres://tq_atomic_test:")
+                && pg_url.ends_with("/atomic_spawn_test"),
+            "the exporter test must not access a business database"
+        );
+        let (client, connection) = tokio_postgres::connect(&pg_url, tokio_postgres::NoTls)
+            .await
+            .expect("connect disposable PG");
+        let driver = tokio::spawn(async move { connection.await.expect("PG connection driver") });
+        client
+            .batch_execute(
+                "CREATE TABLE spawn_records (\
+                 child_run_id TEXT PRIMARY KEY, parent_run_id TEXT, subagent_type TEXT NOT NULL, \
+                 project_id TEXT, layer TEXT, spawned_at TIMESTAMPTZ NOT NULL, \
+                 terminal_status TEXT, final_text_hash TEXT, failure_category TEXT)",
+            )
+            .await
+            .expect("create disposable spawn table");
+        let parent = TurnRunId::new();
+        let child = TurnRunId::new();
+        let raw = "原文不允许被重写。";
+        let record = SpawnProvenanceRecord::from_terminal(
+            &child,
+            &parent,
+            &scope_with_project(None),
+            &kind("novelist"),
+            EdgeTerminalKind::Completed,
+            Some(raw),
+            Utc::now(),
+            None,
+        );
+        upsert_spawn_record(&pg_url, &record)
+            .await
+            .expect("export terminal record");
+        let row = client
+            .query_one(
+                "SELECT parent_run_id, final_text_hash FROM spawn_records WHERE child_run_id=$1",
+                &[&record.child_run_id],
+            )
+            .await
+            .expect("read back exact terminal record");
+        assert_eq!(row.get::<_, Option<String>>(0), Some(parent.to_string()));
+        assert_eq!(row.get::<_, Option<String>>(1), Some(sha256_hex(raw)));
+        client
+            .batch_execute("DROP TABLE spawn_records")
+            .await
+            .expect("remove disposable table");
+        drop(client);
+        driver.await.expect("join PG driver");
     }
 }

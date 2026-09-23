@@ -51,8 +51,9 @@ use ironclaw_loop_host::{
     HostRuntimeLoopCapabilityPort, HostSkillContextBuildError, HostSkillContextCandidate,
     HostSkillContextSource, HostUserProfileSource, IdentityApplicability, IdentityFileName,
     JsonSpawnSubagentInputCodec, LoopCapabilityInputResolver, LoopCapabilityPortFactory,
-    LoopCapabilityResultWriter, ProductLiveCancellationProbe, RunCancellationFactory,
-    RunCancellationHandle, SubagentPromptComposer, SubagentPromptGoal, SubagentPromptMaterial,
+    LoopCapabilityResultWriter, PinnedRoleBundle, PinnedRoleBundleSpec,
+    ProductLiveCancellationProbe, RunCancellationFactory, RunCancellationHandle,
+    SubagentPromptComposer, SubagentPromptGoal, SubagentPromptMaterial,
     SubagentPromptMaterialSource, SubagentSpawnGoalStore, identity_message_ref,
     loop_driver_execution_extension_id,
 };
@@ -3421,20 +3422,21 @@ async fn subagent_planned_host_factory_create_host_requires_prompt_composer() {
     }
 }
 
-struct FixedNovelistMaterialSource {
+struct FixedSubagentMaterialSource {
+    direction_markdown: String,
     allowed: BTreeSet<CapabilityId>,
 }
 
 #[async_trait]
-impl SubagentPromptMaterialSource for FixedNovelistMaterialSource {
+impl SubagentPromptMaterialSource for FixedSubagentMaterialSource {
     async fn material_for_run(
         &self,
         _run_context: &LoopRunContext,
     ) -> Result<SubagentPromptMaterial, AgentLoopHostError> {
         Ok(SubagentPromptMaterial {
-            direction_markdown: "# Novelist Agent\nSYSTEM_SOUL_SENTINEL".to_owned(),
+            direction_markdown: self.direction_markdown.clone(),
             goal: SubagentPromptGoal {
-                task: "NOVELIST_GOAL_SENTINEL".to_owned(),
+                task: "SUBAGENT_GOAL_SENTINEL".to_owned(),
                 handoff: Some("PARENT_HANDOFF_SENTINEL".to_owned()),
             },
             allowed_capabilities: self.allowed.clone(),
@@ -3442,19 +3444,24 @@ impl SubagentPromptMaterialSource for FixedNovelistMaterialSource {
     }
 }
 
-#[tokio::test]
-async fn novelist_host_final_model_request_contains_system_direction() {
-    let fixture = HostFixture::new("thread-novelist-provider-capture", "parent task").await;
+async fn capture_subagent_final_request(
+    thread_name: &str,
+    profile_id: &str,
+    direction_markdown: String,
+    role_allowed: BTreeSet<CapabilityId>,
+    allowed_id: CapabilityId,
+    denied_id: CapabilityId,
+    provider: &'static str,
+) -> (HostManagedModelRequest, Vec<CapabilityId>) {
+    let fixture = HostFixture::new(thread_name, "parent task").await;
     fixture.gateway.enable_tool_capture();
-    let allowed_id = CapabilityId::new("demo.allowed").unwrap();
-    let denied_id = CapabilityId::new("demo.denied").unwrap();
     let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
         capability_descriptor(allowed_id.as_str()),
         capability_descriptor(denied_id.as_str()),
     ])));
     let capability_factory = Arc::new(TestHostRuntimeCapabilityFactory {
         runtime,
-        visible_request: host_runtime_visible_request(&fixture, ["demo"]),
+        visible_request: host_runtime_visible_request(&fixture, [provider]),
         io: Arc::new(InMemoryCapabilityIo::default()),
         milestone_sink: fixture.milestone_sink.clone(),
     });
@@ -3464,18 +3471,18 @@ async fn novelist_host_final_model_request_contains_system_direction() {
     let profile = default_planned_run_profile_resolver()
         .expect("profile resolver")
         .resolve_run_profile(
-            RunProfileResolutionRequest::interactive_default().with_requested_run_profile(
-                RunProfileRequest::new(SUBAGENT_NOVELIST_PROFILE_ID).unwrap(),
-            ),
+            RunProfileResolutionRequest::interactive_default()
+                .with_requested_run_profile(RunProfileRequest::new(profile_id).unwrap()),
         )
         .await
-        .expect("novelist profile");
+        .expect("subagent profile");
     let mut claimed = fixture.claimed.clone();
     claimed.state.resolved_run_profile_id = profile.profile_id.clone();
     claimed.state.resolved_run_profile_version = profile.loop_driver.version;
     claimed.resolved_run_profile = profile;
-    let composer = SubagentPromptComposer::new(Arc::new(FixedNovelistMaterialSource {
-        allowed: BTreeSet::from([allowed_id]),
+    let composer = SubagentPromptComposer::new(Arc::new(FixedSubagentMaterialSource {
+        direction_markdown,
+        allowed: role_allowed,
     }));
     let host = fixture
         .factory()
@@ -3487,7 +3494,7 @@ async fn novelist_host_final_model_request_contains_system_direction() {
         .with_subagent_prompt_composer(composer)
         .create_host(&claimed)
         .await
-        .expect("novelist host");
+        .expect("subagent host");
     let surface = host
         .visible_capabilities(VisibleCapabilityRequest)
         .await
@@ -3503,7 +3510,7 @@ async fn novelist_host_final_model_request_contains_system_direction() {
             inline_messages: Vec::new(),
         })
         .await
-        .expect("novelist prompt bundle");
+        .expect("subagent prompt bundle");
     host.stream_model(LoopModelRequest {
         messages: bundle.messages,
         inline_messages: Vec::new(),
@@ -3514,19 +3521,104 @@ async fn novelist_host_final_model_request_contains_system_direction() {
     .await
     .expect("host model call");
     let requests = fixture.gateway.requests();
+    let captured_tools = fixture.gateway.captured_tool_definitions();
     assert_eq!(requests.len(), 1);
-    assert!(requests[0].messages.iter().any(|message| {
+    assert_eq!(captured_tools.len(), 1);
+    (
+        requests.into_iter().next().unwrap(),
+        captured_tools.into_iter().next().unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn novelist_host_final_model_request_contains_system_direction() {
+    let (request, captured_tools) = capture_subagent_final_request(
+        "thread-novelist-provider-capture",
+        SUBAGENT_NOVELIST_PROFILE_ID,
+        "# Novelist Agent\nSYSTEM_SOUL_SENTINEL".to_owned(),
+        BTreeSet::from([CapabilityId::new("demo.allowed").unwrap()]),
+        CapabilityId::new("demo.allowed").unwrap(),
+        CapabilityId::new("demo.denied").unwrap(),
+        "demo",
+    )
+    .await;
+    assert!(request.messages.iter().any(|message| {
         message.role == HostManagedModelMessageRole::System
             && message.content.contains("SYSTEM_SOUL_SENTINEL")
     }));
-    assert!(requests[0].messages.iter().any(|message| {
+    assert!(request.messages.iter().any(|message| {
         message.role == HostManagedModelMessageRole::User
-            && message.content.contains("NOVELIST_GOAL_SENTINEL")
+            && message.content.contains("SUBAGENT_GOAL_SENTINEL")
     }));
-    let captured_tools = fixture.gateway.captured_tool_definitions();
-    assert_eq!(captured_tools.len(), 1, "最终模型调用应携带一份工具视图");
-    assert!(captured_tools[0].contains(&CapabilityId::new("demo.allowed").unwrap()));
-    assert!(!captured_tools[0].contains(&CapabilityId::new("demo.denied").unwrap()));
+    assert!(captured_tools.contains(&CapabilityId::new("demo.allowed").unwrap()));
+    assert!(!captured_tools.contains(&CapabilityId::new("demo.denied").unwrap()));
+}
+
+#[tokio::test]
+#[ignore = "requires TIANQUAN_SOUL_TEST_BUNDLE_DIR pointing to the sibling TianQuan worktree"]
+async fn real_tianquan_worldsmith_bundle_reaches_final_model_request() {
+    const KINDS: &[&str] = &[
+        "market-researcher",
+        "story-architect",
+        "market-evaluator",
+        "schema-architect",
+        "ontologist",
+        "worldsmith",
+        "plotter",
+        "event-simulator",
+        "discourse-planner",
+        "chapter-packer",
+        "scene-reasoner",
+        "novelist",
+        "auditor",
+        "committer",
+        "chapter-reviewer",
+        "polisher",
+    ];
+    let root = std::env::var("TIANQUAN_SOUL_TEST_BUNDLE_DIR").unwrap();
+    let bundle = PinnedRoleBundle::load_from_dir(
+        std::path::Path::new(&root),
+        PinnedRoleBundleSpec {
+            schema_version: "soul-catalog/1",
+            bundle_id: "novel-studio-souls",
+            version: "1.0.0",
+            marker: "SOUL-BUNDLE",
+            expected_roles: KINDS,
+            max_material_bytes: 16 * 1024,
+        },
+    )
+    .unwrap();
+    let role = bundle.role("worldsmith").unwrap();
+    let allowed = CapabilityId::new("tianquan-graph.run_world_patch").unwrap();
+    let denied = CapabilityId::new("tianquan-graph.import_graph").unwrap();
+    assert!(role.allowed_capabilities.contains(&allowed));
+    assert!(!role.allowed_capabilities.contains(&denied));
+    let (request, tools) = capture_subagent_final_request(
+        "thread-worldsmith-real-bundle-capture",
+        SUBAGENT_PLANNED_PROFILE_ID,
+        role.direction_markdown.clone(),
+        role.allowed_capabilities.clone(),
+        allowed.clone(),
+        denied,
+        "tianquan-graph",
+    )
+    .await;
+    assert!(request.messages.iter().any(|message| {
+        message.role == HostManagedModelMessageRole::System
+            && message.content.contains(&role.direction_markdown)
+            && message.content.contains("roleSha256=")
+    }));
+    assert!(request.messages.iter().any(|message| {
+        message.role == HostManagedModelMessageRole::User
+            && message.content.contains("SUBAGENT_GOAL_SENTINEL")
+    }));
+    assert_eq!(
+        tools.into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            CapabilityId::new("ironclaw.loop.capability_info").unwrap(),
+            allowed,
+        ])
+    );
 }
 
 #[tokio::test]

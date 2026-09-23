@@ -37,6 +37,7 @@ mod input_port;
 mod input_queue;
 mod model_capability_view;
 mod prompt_context_budget;
+mod pinned_role_bundle;
 mod skill_bundle_context_source;
 mod skill_bundle_source;
 mod skill_context;
@@ -89,6 +90,7 @@ pub use identity_context::{
     build_identity_messages_for_run_detailed, identity_applicability_allowed_for_run,
     identity_message_ref,
 };
+pub use pinned_role_bundle::{PinnedRole, PinnedRoleBundle, PinnedRoleBundleSpec};
 pub use input_port::HostQueueLoopInputPort;
 pub use input_queue::{HostInputBatch, HostInputEnvelope, HostInputQueue, HostInputQueueError};
 pub use ironclaw_turns::run_profile::PromptContextTokenBudget;

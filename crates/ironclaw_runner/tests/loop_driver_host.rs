@@ -76,7 +76,7 @@ use ironclaw_runner::model_routes::{
 };
 use ironclaw_runner::planned_driver::PlannedDriver;
 use ironclaw_runner::planned_driver_factory::{
-    SUBAGENT_PLANNED_PROFILE_ID, default_planned_run_profile_resolver,
+    SUBAGENT_NOVELIST_PROFILE_ID, SUBAGENT_PLANNED_PROFILE_ID, default_planned_run_profile_resolver,
 };
 use ironclaw_runner::runtime::{
     DefaultPlannedRuntimeConfig, DefaultPlannedRuntimeParts, SchedulerWakeWiring,
@@ -3379,39 +3379,45 @@ async fn subagent_planned_host_factory_create_host_requires_prompt_composer() {
     let surface_resolver = Arc::new(StaticCapabilitySurfaceProfileResolver::new(
         CapabilityAllowSet::All,
     ));
-    let planned = default_planned_run_profile_resolver()
-        .expect("planned default profile resolver")
-        .resolve_run_profile(
-            RunProfileResolutionRequest::interactive_default().with_requested_run_profile(
-                RunProfileRequest::new(SUBAGENT_PLANNED_PROFILE_ID).unwrap(),
-            ),
-        )
-        .await
-        .unwrap();
-    let mut claimed = fixture.claimed.clone();
-    claimed.state.resolved_run_profile_id = planned.profile_id.clone();
-    claimed.state.resolved_run_profile_version = planned.loop_driver.version;
-    claimed.resolved_run_profile = planned;
+    for profile_id in [SUBAGENT_PLANNED_PROFILE_ID, SUBAGENT_NOVELIST_PROFILE_ID] {
+        let planned = default_planned_run_profile_resolver()
+            .expect("planned default profile resolver")
+            .resolve_run_profile(
+                RunProfileResolutionRequest::interactive_default()
+                    .with_requested_run_profile(RunProfileRequest::new(profile_id).unwrap()),
+            )
+            .await
+            .unwrap();
+        let mut claimed = fixture.claimed.clone();
+        claimed.state.resolved_run_profile_id = planned.profile_id.clone();
+        claimed.state.resolved_run_profile_version = planned.loop_driver.version;
+        claimed.resolved_run_profile = planned;
 
-    let error = match fixture
-        .factory()
-        .with_driver_requirements(driver_requirements_for(
-            &claimed.resolved_run_profile.loop_driver,
-            DriverRequirements::all_required(),
-        ))
-        .with_profiled_capability_port_factory(capability_factory, surface_resolver)
-        .create_host(&claimed)
-        .await
-    {
-        Ok(_) => panic!("subagent hosts must fail closed without prompt composer"),
-        Err(error) => error,
-    };
+        let error = match fixture
+            .factory()
+            .with_driver_requirements(driver_requirements_for(
+                &claimed.resolved_run_profile.loop_driver,
+                DriverRequirements::all_required(),
+            ))
+            .with_profiled_capability_port_factory(
+                capability_factory.clone(),
+                surface_resolver.clone(),
+            )
+            .create_host(&claimed)
+            .await
+        {
+            Ok(_) => panic!("{profile_id} must fail closed without prompt composer"),
+            Err(error) => error,
+        };
 
-    assert!(
-        error
-            .reason
-            .contains("subagent prompt composer is required")
-    );
+        assert!(
+            error
+                .reason
+                .contains("subagent prompt composer is required"),
+            "{profile_id}: {}",
+            error.reason
+        );
+    }
 }
 
 #[tokio::test]

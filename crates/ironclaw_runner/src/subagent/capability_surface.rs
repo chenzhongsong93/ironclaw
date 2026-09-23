@@ -78,11 +78,14 @@ mod tests {
         CapabilityAllowSet, CapabilityResolveError, SubagentPromptMaterial,
         SubagentPromptMaterialSource,
     };
-    use ironclaw_turns::run_profile::{AgentLoopHostError, AgentLoopHostErrorKind, LoopRunContext};
+    use ironclaw_turns::run_profile::{
+        AgentLoopHostError, AgentLoopHostErrorKind, CapabilitySurfaceProfileId, LoopRunContext,
+    };
     use ironclaw_turns::{RunProfileId, RunProfileVersion};
 
     use crate::planned_driver_factory::{
-        PLANNED_DRIVER_DEFAULT_VERSION, SUBAGENT_PLANNED_DRIVER_ID, SUBAGENT_PLANNED_PROFILE_ID,
+        PLANNED_DRIVER_DEFAULT_VERSION, SUBAGENT_CAPABILITY_SURFACE_PROFILE_ID,
+        SUBAGENT_NOVELIST_PROFILE_ID, SUBAGENT_PLANNED_DRIVER_ID, SUBAGENT_PLANNED_PROFILE_ID,
     };
 
     use super::{SubagentCapabilitySurfaceResolver, intersect_allow_sets};
@@ -100,6 +103,16 @@ mod tests {
                 .expect("subagent planned driver id");
         context.resolved_run_profile.loop_driver.version =
             RunProfileVersion::new(PLANNED_DRIVER_DEFAULT_VERSION);
+        context.resolved_run_profile.capability_surface_profile_id =
+            CapabilitySurfaceProfileId::new(SUBAGENT_CAPABILITY_SURFACE_PROFILE_ID)
+                .expect("subagent capability surface profile id");
+        context
+    }
+
+    fn planned_novelist_context() -> LoopRunContext {
+        let mut context = planned_subagent_context();
+        context.resolved_run_profile.profile_id =
+            RunProfileId::new(SUBAGENT_NOVELIST_PROFILE_ID).expect("novelist profile id");
         context
     }
 
@@ -275,6 +288,29 @@ mod tests {
             .await
             .expect("subagent runs with an all base allowset should return the material allowset");
 
+        assert_eq!(resolved, CapabilityAllowSet::allowlist(material_caps));
+    }
+
+    #[tokio::test]
+    async fn novelist_profile_intersects_material_allowset_instead_of_using_base() {
+        // ISSUE-IRONCLAW-011: 专用模型 profile 仍须执行子角色工具白名单。
+        let material_caps = BTreeSet::from([cap("builtin.read_file")]);
+        let resolver = SubagentCapabilitySurfaceResolver::new(
+            Arc::new(StaticResolver(CapabilityAllowSet::All)),
+            Arc::new(SucceedingSource(SubagentPromptMaterial {
+                direction_markdown: "novelist".to_string(),
+                goal: ironclaw_loop_host::SubagentPromptGoal {
+                    task: "write scene".to_string(),
+                    handoff: None,
+                },
+                allowed_capabilities: material_caps.clone(),
+            })),
+        );
+
+        let resolved = resolver
+            .resolve(&planned_novelist_context())
+            .await
+            .expect("novelist must use subagent material permissions");
         assert_eq!(resolved, CapabilityAllowSet::allowlist(material_caps));
     }
 

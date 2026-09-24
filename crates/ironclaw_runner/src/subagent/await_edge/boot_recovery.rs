@@ -448,6 +448,25 @@ where
         self.store.record_awaited_child(record).await
     }
 
+    async fn record_child_submitted(
+        &self,
+        child_scope: &TurnScope,
+        parent_run_id: ironclaw_turns::TurnRunId,
+        child_run_id: ironclaw_turns::TurnRunId,
+        subagent_kind: &ironclaw_loop_host::SubagentKindId,
+        submitted_at: ironclaw_turns::TurnTimestamp,
+    ) {
+        self.store
+            .record_child_submitted(
+                child_scope,
+                parent_run_id,
+                child_run_id,
+                subagent_kind,
+                submitted_at,
+            )
+            .await;
+    }
+
     async fn abandon_awaited_child(
         &self,
         child_scope: &TurnScope,

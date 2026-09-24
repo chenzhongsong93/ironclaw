@@ -128,6 +128,16 @@ impl AwaitEdgeWriter for CountingAwaitEdgeRecovery {
         Ok(())
     }
 
+    async fn record_child_submitted(
+        &self,
+        _child_scope: &TurnScope,
+        _parent_run_id: TurnRunId,
+        _child_run_id: TurnRunId,
+        _subagent_kind: &ironclaw_loop_host::SubagentKindId,
+        _submitted_at: ironclaw_turns::TurnTimestamp,
+    ) {
+    }
+
     async fn abandon_awaited_child(
         &self,
         _child_scope: &TurnScope,
@@ -171,6 +181,16 @@ impl AwaitEdgeWriter for BlockingAwaitEdgeRecovery {
         _record: AwaitedChildSetRecord,
     ) -> Result<(), ironclaw_turns::run_profile::AgentLoopHostError> {
         Ok(())
+    }
+
+    async fn record_child_submitted(
+        &self,
+        _child_scope: &TurnScope,
+        _parent_run_id: TurnRunId,
+        _child_run_id: TurnRunId,
+        _subagent_kind: &ironclaw_loop_host::SubagentKindId,
+        _submitted_at: ironclaw_turns::TurnTimestamp,
+    ) {
     }
 
     async fn abandon_awaited_child(

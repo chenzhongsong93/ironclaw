@@ -2,10 +2,12 @@
 //! `spawn-provenance-hardgate`, cross-repo SSOT
 //! `TianQuan/tests/TEST-SPEC-provenance-hardgate.md`).
 //!
-//! When a spawned subagent run reaches a terminal state, the settle path
+//! After `submit_child_run` returns Accepted, the await-edge writer inserts a
+//! provisional `Spawned` row into the shared Postgres `spawn_records` table.
+//! When the child reaches a terminal state, the settle path
 //! (`await_edge::resolver::settle_and_maybe_drain`) calls
-//! [`record_spawn_terminal`] to upsert one row into the shared Postgres
-//! `spawn_records` table (TianQuan api migration `0005_spawn_records.sql`).
+//! [`record_spawn_terminal`] to update that same row (TianQuan api migration
+//! `0005_spawn_records.sql`).
 //! The TianQuan api's `run_novelist_validator` dispatch then verifies
 //! `provenance.sessionId` against that table (record exists +
 //! `subagent_type == "novelist"` + `terminal_status == "Completed"` +
@@ -26,6 +28,9 @@ use chrono::{DateTime, Utc};
 use ironclaw_turns::{TurnRunId, TurnScope, TurnTimestamp};
 use sha2::Digest as _;
 use std::io::Write as _;
+
+#[cfg(test)]
+pub(super) static TEST_PG_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 use super::await_edge::EdgeTerminalKind;
 
@@ -69,9 +74,35 @@ pub(crate) struct SpawnTerminalInput<'a> {
 }
 
 impl SpawnProvenanceRecord {
-    /// Assemble a record from the settle path's in-hand data.
-    /// `spawned_at` is the child run's `received_at` (spawn-time proxy,
-    /// backfilled at terminal time — the spawn port itself does not write).
+    /// Assemble the provisional provenance row after the awaited-child edge is durable.
+    pub(crate) fn from_spawned(
+        child_run_id: &TurnRunId,
+        parent_run_id: &TurnRunId,
+        child_scope: &TurnScope,
+        subagent_kind: &ironclaw_loop_host::SubagentKindId,
+        spawned_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            child_run_id: child_run_id.to_string(),
+            parent_run_id: parent_run_id.to_string(),
+            subagent_type: subagent_kind.to_string(),
+            project_id: child_scope
+                .project_id
+                .as_ref()
+                .map(|project| project.as_str().to_string()),
+            // Generic host scope has no layer concept. Keep it unknown; TianQuan
+            // rejects layer-bound scope refs until the trusted label is propagated.
+            layer: None,
+            spawned_at,
+            terminal_status: "Spawned".to_string(),
+            final_text_hash: None,
+            failure_category: None,
+        }
+    }
+
+    /// Assemble a terminal update from the settle path's in-hand data.
+    /// If no start row exists (for example, an older run or exporter outage),
+    /// the child's `received_at` remains a compatibility timestamp fallback.
     pub(crate) fn from_terminal(input: SpawnTerminalInput<'_>) -> Self {
         let SpawnTerminalInput {
             child_run_id,
@@ -159,6 +190,35 @@ pub(crate) async fn record_spawn_terminal(
             error = %error,
             "spawn provenance upsert failed (best-effort, settle path unaffected)"
         );
+    }
+}
+
+/// Best-effort insert of the provisional child identity once its await edge is durable.
+///
+/// The insert is idempotent and never overwrites an existing terminal row. Errors are
+/// logged and swallowed, matching the terminal exporter so provenance cannot break spawn.
+pub(crate) async fn record_spawn_started(pg_url: Option<&str>, record: &SpawnProvenanceRecord) {
+    let Some(pg_url) = pg_url else {
+        return;
+    };
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        insert_spawn_started(pg_url, record),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
+            target: "tianquan_spawn_provenance",
+            child_run_id = %record.child_run_id,
+            error = %error,
+            "spawn start provenance insert failed (best-effort, spawn path unaffected)"
+        ),
+        Err(_) => tracing::warn!(
+            target: "tianquan_spawn_provenance",
+            child_run_id = %record.child_run_id,
+            "spawn start provenance insert timed out after 2 seconds (best-effort)"
+        ),
     }
 }
 
@@ -256,15 +316,17 @@ async fn upsert_spawn_record(
     });
     let result = client
         .execute(
+            // Terminal callbacks complete provenance but may not erase the
+            // identity captured at accepted submission.
             "INSERT INTO spawn_records \
              (child_run_id, parent_run_id, subagent_type, project_id, layer, spawned_at, terminal_status, final_text_hash, failure_category) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-             ON CONFLICT (child_run_id) DO UPDATE SET \
-             parent_run_id = EXCLUDED.parent_run_id, \
-             subagent_type = EXCLUDED.subagent_type, \
-             project_id = EXCLUDED.project_id, \
-             layer = EXCLUDED.layer, \
-             spawned_at = EXCLUDED.spawned_at, \
+            ON CONFLICT (child_run_id) DO UPDATE SET \
+             parent_run_id = COALESCE(spawn_records.parent_run_id, EXCLUDED.parent_run_id), \
+             subagent_type = spawn_records.subagent_type, \
+             project_id = COALESCE(spawn_records.project_id, EXCLUDED.project_id), \
+             layer = COALESCE(spawn_records.layer, EXCLUDED.layer), \
+             spawned_at = spawn_records.spawned_at, \
              terminal_status = EXCLUDED.terminal_status, \
              final_text_hash = EXCLUDED.final_text_hash, \
              failure_category = EXCLUDED.failure_category",
@@ -287,6 +349,47 @@ async fn upsert_spawn_record(
             target: "tianquan_spawn_provenance",
             error = %error,
             "spawn provenance pg connection task join error"
+        );
+    }
+    result.map(|_| ())
+}
+
+async fn insert_spawn_started(
+    pg_url: &str,
+    record: &SpawnProvenanceRecord,
+) -> Result<(), tokio_postgres::Error> {
+    let (client, connection) = tokio_postgres::connect(pg_url, tokio_postgres::NoTls).await?;
+    let connection_task = tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            tracing::warn!(
+                target: "tianquan_spawn_provenance",
+                error = %error,
+                "spawn-start provenance pg connection driver error"
+            );
+        }
+    });
+    let result = client
+        .execute(
+            "INSERT INTO spawn_records \
+             (child_run_id,parent_run_id,subagent_type,project_id,layer,spawned_at,terminal_status,final_text_hash,failure_category) \
+             VALUES ($1,$2,$3,$4,$5,$6,'Spawned',NULL,NULL) \
+             ON CONFLICT (child_run_id) DO NOTHING",
+            &[
+                &record.child_run_id,
+                &record.parent_run_id,
+                &record.subagent_type,
+                &record.project_id,
+                &record.layer,
+                &record.spawned_at,
+            ],
+        )
+        .await;
+    drop(client);
+    if let Err(error) = connection_task.await {
+        tracing::warn!(
+            target: "tianquan_spawn_provenance",
+            error = %error,
+            "spawn-start provenance pg connection task join error"
         );
     }
     result.map(|_| ())
@@ -689,6 +792,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires disposable atomic_spawn_test PostgreSQL"]
     async fn postgres_export_keeps_parent_run_id_and_raw_hash() {
+        let _env_guard = super::TEST_PG_ENV_LOCK.lock().await;
         let pg_url = std::env::var("TIANQUAN_ATOMIC_TEST_PG_URL")
             .expect("disposable PG URL must be explicit");
         assert!(
@@ -712,6 +816,39 @@ mod tests {
         let parent = TurnRunId::new();
         let child = TurnRunId::new();
         let raw = "原文不允许被重写。";
+        let scope = scope_with_project(Some(ironclaw_host_api::ProjectId::from_trusted(
+            "atomic-spawn".to_string(),
+        )));
+        let spawned_at = Utc::now();
+        let started = SpawnProvenanceRecord::from_spawned(
+            &child,
+            &parent,
+            &scope,
+            &kind("novelist"),
+            spawned_at,
+        );
+        record_spawn_started(Some(&pg_url), &started).await;
+        record_spawn_started(Some(&pg_url), &started).await;
+        let started_row = client
+            .query_one(
+                "SELECT parent_run_id, subagent_type, project_id, terminal_status, \
+                 final_text_hash, spawned_at FROM spawn_records WHERE child_run_id=$1",
+                &[&started.child_run_id],
+            )
+            .await
+            .expect("read back idempotent spawn-start record");
+        assert_eq!(
+            started_row.get::<_, Option<String>>(0),
+            Some(parent.to_string())
+        );
+        assert_eq!(started_row.get::<_, String>(1), "novelist");
+        assert_eq!(
+            started_row.get::<_, Option<String>>(2),
+            Some("atomic-spawn".into())
+        );
+        assert_eq!(started_row.get::<_, String>(3), "Spawned");
+        assert_eq!(started_row.get::<_, Option<String>>(4), None);
+        let persisted_spawned_at: DateTime<Utc> = started_row.get(5);
         let record = terminal_record!(
             &child,
             &parent,
@@ -719,21 +856,23 @@ mod tests {
             &kind("novelist"),
             EdgeTerminalKind::Completed,
             Some(raw),
-            Utc::now(),
+            spawned_at,
             None,
         );
-        upsert_spawn_record(&pg_url, &record)
-            .await
-            .expect("export terminal record");
+        record_spawn_terminal(Some(&pg_url), &record, None).await;
         let row = client
             .query_one(
-                "SELECT parent_run_id, final_text_hash FROM spawn_records WHERE child_run_id=$1",
+                "SELECT parent_run_id, project_id, final_text_hash, terminal_status, spawned_at \
+                 FROM spawn_records WHERE child_run_id=$1",
                 &[&record.child_run_id],
             )
             .await
             .expect("read back exact terminal record");
         assert_eq!(row.get::<_, Option<String>>(0), Some(parent.to_string()));
-        assert_eq!(row.get::<_, Option<String>>(1), Some(sha256_hex(raw)));
+        assert_eq!(row.get::<_, Option<String>>(1), Some("atomic-spawn".into()));
+        assert_eq!(row.get::<_, Option<String>>(2), Some(sha256_hex(raw)));
+        assert_eq!(row.get::<_, String>(3), "Completed");
+        assert_eq!(row.get::<_, DateTime<Utc>>(4), persisted_spawned_at);
         client
             .batch_execute("DROP TABLE spawn_records")
             .await

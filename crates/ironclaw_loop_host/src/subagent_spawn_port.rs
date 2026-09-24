@@ -23,6 +23,7 @@ use ironclaw_turns::{
     LoopGateRef, LoopResultRef, ReplyTargetBindingRef, RunProfileRequest, SanitizedCancelReason,
     SourceBindingRef, SubmitChildRunRequest, SubmitTurnResponse, TurnActor, TurnCoordinator,
     TurnError, TurnErrorCategory, TurnRunId, TurnScope, TurnSpawnTreePort, TurnSpawnTreeStateStore,
+    TurnTimestamp,
     run_profile::{
         AgentLoopHostError, AgentLoopHostErrorKind, CapabilityBatchInvocation,
         CapabilityCallCandidate, CapabilityDeniedReasonKind, CapabilityDescriptorView,
@@ -1167,6 +1168,16 @@ impl SubagentSpawnCapabilityPort {
             .map_err(map_turn_error)?;
         compensation.submitted_child_tree = Some((self.run_context.scope.clone(), tree_root));
         compensation.submitted_child_run = Some((child_turn_scope.clone(), actor.clone(), run_id));
+        self.deps
+            .await_edge_writer
+            .record_child_submitted(
+                &child_turn_scope,
+                self.run_context.run_id,
+                run_id,
+                &definition.subagent_kind,
+                Utc::now(),
+            )
+            .await;
         if let Err(error) = self
             .deps
             .thread_service
@@ -1513,11 +1524,16 @@ impl SpawnSubagentInputCodec for JsonSpawnSubagentInputCodec {
 #[derive(Default)]
 pub struct InMemoryAwaitEdgeWriter {
     inner: parking_lot::Mutex<HashMap<(TurnRunId, TurnRunId), AwaitedChildSetRecord>>,
+    submitted: parking_lot::Mutex<Vec<(TurnRunId, TurnRunId, String)>>,
 }
 
 impl InMemoryAwaitEdgeWriter {
     pub fn records(&self) -> Vec<AwaitedChildSetRecord> {
         self.inner.lock().values().cloned().collect()
+    }
+
+    pub fn submitted_children(&self) -> Vec<(TurnRunId, TurnRunId, String)> {
+        self.submitted.lock().clone()
     }
 }
 
@@ -1530,6 +1546,19 @@ impl crate::AwaitEdgeWriter for InMemoryAwaitEdgeWriter {
         let key = (record.parent_run_context.run_id, record.child_run_id);
         self.inner.lock().insert(key, record);
         Ok(())
+    }
+
+    async fn record_child_submitted(
+        &self,
+        _child_scope: &TurnScope,
+        parent_run_id: TurnRunId,
+        child_run_id: TurnRunId,
+        subagent_kind: &SubagentKindId,
+        _submitted_at: TurnTimestamp,
+    ) {
+        self.submitted
+            .lock()
+            .push((parent_run_id, child_run_id, subagent_kind.to_string()));
     }
 
     async fn abandon_awaited_child(

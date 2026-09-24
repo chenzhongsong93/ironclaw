@@ -722,6 +722,28 @@ where
             .map_err(super::map_await_edge_error)
     }
 
+    async fn record_child_submitted(
+        &self,
+        child_scope: &TurnScope,
+        parent_run_id: TurnRunId,
+        child_run_id: TurnRunId,
+        subagent_kind: &ironclaw_loop_host::SubagentKindId,
+        submitted_at: ironclaw_turns::TurnTimestamp,
+    ) {
+        let provenance = crate::subagent::spawn_provenance::SpawnProvenanceRecord::from_spawned(
+            &child_run_id,
+            &parent_run_id,
+            child_scope,
+            subagent_kind,
+            submitted_at,
+        );
+        crate::subagent::spawn_provenance::record_spawn_started(
+            std::env::var("TIANQUAN_SPAWN_PG_URL").ok().as_deref(),
+            &provenance,
+        )
+        .await;
+    }
+
     async fn abandon_awaited_child(
         &self,
         child_scope: &TurnScope,
@@ -784,13 +806,33 @@ mod tests {
 
     use ironclaw_filesystem::InMemoryBackend;
     use ironclaw_host_api::{
-        AgentId, CapabilityId, MountAlias, MountGrant, MountPermissions, MountView, TenantId,
-        ThreadId, VirtualPath,
+        AgentId, CapabilityId, MountAlias, MountGrant, MountPermissions, MountView, ProjectId,
+        TenantId, ThreadId, VirtualPath,
     };
-    use ironclaw_loop_host::{SpawnSubagentMode, SubagentKindId};
+    use ironclaw_loop_host::{
+        AwaitEdgeWriter, AwaitedChildSetRecord, SpawnSubagentMode, SubagentKindId,
+    };
     use ironclaw_turns::{GateRef, LoopResultRef, ReplyTargetBindingRef, SourceBindingRef};
 
     use super::*;
+
+    struct UnusedSpawnStartResultWriter;
+
+    #[async_trait::async_trait]
+    impl ironclaw_loop_host::LoopCapabilityResultWriter for UnusedSpawnStartResultWriter {
+        async fn write_capability_result(
+            &self,
+            _write: ironclaw_loop_host::CapabilityResultWrite<'_>,
+        ) -> Result<
+            ironclaw_loop_host::CapabilityWriteResult,
+            ironclaw_turns::run_profile::AgentLoopHostError,
+        > {
+            Err(ironclaw_turns::run_profile::AgentLoopHostError::new(
+                ironclaw_turns::run_profile::AgentLoopHostErrorKind::Unavailable,
+                "spawn-start provenance test does not write a result",
+            ))
+        }
+    }
 
     fn scoped_fs() -> Arc<ScopedFilesystem<InMemoryBackend>> {
         let mounts = MountView::new(vec![MountGrant::new(
@@ -842,6 +884,135 @@ mod tests {
             ),
             settled_at: None,
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable atomic_spawn_test PostgreSQL"]
+    #[allow(clippy::too_many_lines)] // One PG test covers the production recovery wrapper and its persisted row.
+    async fn submitted_child_writer_registers_spawn_after_child_submission() {
+        let _env_guard = crate::subagent::spawn_provenance::TEST_PG_ENV_LOCK
+            .lock()
+            .await;
+        let pg_url = std::env::var("TIANQUAN_ATOMIC_TEST_PG_URL")
+            .expect("disposable PG URL must be explicit");
+        assert!(
+            pg_url.starts_with("postgres://tq_atomic_test:")
+                && pg_url.ends_with("/atomic_spawn_test"),
+            "the writer test must not access a business database"
+        );
+        let (client, connection) = tokio_postgres::connect(&pg_url, tokio_postgres::NoTls)
+            .await
+            .expect("connect disposable PG");
+        let driver = tokio::spawn(async move { connection.await.expect("PG connection driver") });
+        client
+            .batch_execute(
+                "CREATE TABLE IF NOT EXISTS spawn_records (\
+                 child_run_id TEXT PRIMARY KEY, parent_run_id TEXT, subagent_type TEXT NOT NULL, \
+                 project_id TEXT, layer TEXT, spawned_at TIMESTAMPTZ NOT NULL, \
+                 terminal_status TEXT, final_text_hash TEXT, failure_category TEXT)",
+            )
+            .await
+            .expect("create disposable spawn table");
+
+        let mut parent_context =
+            ironclaw_agent_loop::test_support::test_run_context("spawn-start-provenance");
+        let project = ProjectId::from_trusted("atomic-spawn-writer".to_string());
+        parent_context.scope.project_id = Some(project);
+        let parent_run_id = parent_context.run_id;
+        let child_run_id = TurnRunId::new();
+        let mut child_scope = parent_context.scope.clone();
+        child_scope.thread_id = ThreadId::from_trusted(format!("thread:child-{child_run_id}"));
+        let child_thread_id = child_scope.thread_id.clone();
+        let subagent_kind = SubagentKindId::new("novelist").expect("valid role label");
+        let record = AwaitedChildSetRecord {
+            gate_ref: GateRef::new("gate:spawn-start-provenance").unwrap(),
+            parent_run_context: parent_context,
+            tree_root_run_id: parent_run_id,
+            child_scope,
+            child_run_id,
+            child_thread_id,
+            source_binding_ref: SourceBindingRef::new(format!("subagent-source:{child_run_id}"))
+                .unwrap(),
+            reply_target_binding_ref: ReplyTargetBindingRef::new(format!(
+                "subagent-reply:{child_run_id}"
+            ))
+            .unwrap(),
+            subagent_kind,
+            spawn_capability_id: CapabilityId::new("builtin.spawn_subagent").unwrap(),
+            result_ref: LoopResultRef::new(format!("result:child-{child_run_id}")).unwrap(),
+            mode: SpawnSubagentMode::Blocking,
+        };
+
+        let store = Arc::new(FilesystemAwaitEdgeStore::new(scoped_fs()));
+        let goal_store: Arc<dyn ironclaw_loop_host::SubagentSpawnGoalStore> =
+            Arc::new(crate::subagent::goal_store::InMemoryBoundedSubagentGoalStore::new());
+        let turn_state_store: Arc<dyn ironclaw_turns::TurnSpawnTreeStateStore> =
+            Arc::new(ironclaw_turns::test_support::in_memory_turn_state_store());
+        let resolver = Arc::new(
+            crate::subagent::await_edge::resolver::AwaitEdgeResolver::new_unbound(
+                Arc::clone(&store),
+                goal_store,
+                turn_state_store,
+                Arc::new(UnusedSpawnStartResultWriter),
+                Arc::new(ironclaw_threads::InMemorySessionThreadService::default()),
+            ),
+        );
+        let writer = crate::subagent::await_edge::boot_recovery::ScopeRecoveryDriver::new(
+            resolver,
+            Arc::clone(&store),
+        );
+        let result = writer.record_awaited_child(record.clone()).await;
+        result.expect("awaited child edge should open");
+        let before_submit: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM spawn_records WHERE child_run_id=$1",
+                &[&child_run_id.to_string()],
+            )
+            .await
+            .expect("query pre-submit provenance")
+            .get(0);
+        assert_eq!(before_submit, 0, "await intent is not a spawned child yet");
+        unsafe { std::env::set_var("TIANQUAN_SPAWN_PG_URL", &pg_url) };
+        writer
+            .record_child_submitted(
+                &record.child_scope,
+                parent_run_id,
+                child_run_id,
+                &record.subagent_kind,
+                Utc::now(),
+            )
+            .await;
+        unsafe { std::env::remove_var("TIANQUAN_SPAWN_PG_URL") };
+
+        let row = client
+            .query_one(
+                "SELECT parent_run_id, subagent_type, project_id, terminal_status, \
+                 final_text_hash FROM spawn_records WHERE child_run_id=$1",
+                &[&child_run_id.to_string()],
+            )
+            .await
+            .expect("awaited-child writer must persist its spawn record");
+        assert_eq!(
+            row.get::<_, Option<String>>(0),
+            Some(parent_run_id.to_string())
+        );
+        assert_eq!(row.get::<_, String>(1), "novelist");
+        assert_eq!(
+            row.get::<_, Option<String>>(2),
+            Some("atomic-spawn-writer".into())
+        );
+        assert_eq!(row.get::<_, String>(3), "Spawned");
+        assert_eq!(row.get::<_, Option<String>>(4), None);
+        assert!(
+            store
+                .peek(&record.child_scope, parent_run_id, child_run_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "spawn provenance is recorded only after the awaited-child edge is durable"
+        );
+        drop(client);
+        driver.await.expect("join PG driver");
     }
 
     #[test]

@@ -1,3 +1,20 @@
+# 当前交接：blocking spawn dossier 修复与最新联合隔离验收（2026-09-25）
+
+IronClaw 本轮运行时代码提交为本地主线 `main` 上的 `0ed934f4b`（`fix(reborn-trace): retain blocking spawn dossier steps #13`）；本次交接文档另行提交。修复关闭 TianQuan `ISSUE-IRONCLAW-013`：挂起/阻塞 run 保留同一 run 的 trace 热段，终态压缩合并旧 gzip 前缀与恢复 JSONL 后缀；blocking `spawn_subagent` 特殊路径输出带 `invocation_id` 的 `tool_request/tool_response`，普通工具继续复用既有 exporter。天权 dossier 已同步支持热段/归档段与 invocation 关联。
+
+## 实测与部署
+
+- IronClaw run-trace 单测 7/7、spawn port 请求/响应断言 1/1、runner 仅终态压缩策略 1/1；Linux Gateway 集成 13/13。新增普通 `builtin.time` 调用仍只输出一对关联事件，避免通用 exporter 重复采集。
+- 最新本地 Gateway 镜像 `ironclaw-reborn:tianquan` 为 `sha256:0a470a38bd907b35b27d949b830b8c30b679ecf4b90e9437857be5dfbf7ab022`，revision label `0ed934f4b`；天权 API dossier 镜像 revision `af7e49c`。Compose Gateway 已按此镜像重建运行，日志确认 `tianquan-graph` 扩展激活。API、Gateway、Web、5188 预览均 HTTP 200；主 PostgreSQL 未重启/重置，主 Rena 保持关闭。
+- 新隔离真实 run `14617be9-a52f-4493-a561-16498eb90121` 的天权 dossier 返回 8 events/4 steps，触发 spawn 的首个模型交换、同 invocation 工具调用、resume 的 result_read 与终答均完整。子线程 `subagent-3bb3769526e6462aaf0b0315b342a076` 为 Completed，真实 user/assistant 两条消息；父子检阅、返回、刷新和权限浏览器用例 2/2 通过。模型请求只要求固定短句，未写正文、文件或图谱，不重置账户余额。
+- 隔离 Todo run 的最新 API dossier 读取确认 `todo_write/read` 三轮 revision 1→2→3，最终空步骤；另一线程为 `plan: null`。真实历史切换、刷新与错误/空态恢复浏览器测试 2/2 通过。零额度/API 与正文直接写门的细节及控件覆盖见 TianQuan `docs/handover.md` 顶部。
+
+## 分支与发布边界
+
+当前 `main` 相对 nearai `origin/main` 本地领先 73、落后 35；本地修复保留在 `main`，推送目标是个人 fork 评审分支 `codex/tianquan-mainline-integration-20260923`，不向分叉的上游 main 强推。Todo 与 SOUL catalog 对应的 TianQuan ISSUE-IRONCLAW-010/012 仍以上游合入/正式发布为收口条件。没有删除分支或 worktree；UX 隔离容器/5189 在验收后停止但保留容器和卷，5188 持续可访问。本轮是本地验证，不是生产发布。
+
+---
+
 # 当前交接：已审核本地主线 Gateway 镜像部署（2026-09-24）
 
 Reborn Gateway 已从 IronClaw 本地 `main` `932ae4236` 重建，镜像 `ironclaw-reborn:tianquan` 当前 ID 为 `bd9f16055fa1`；TianQuan `tianquan-graph` 扩展也从主线镜像重新落地，init 容器退出码 0。Gateway 日志确认扩展激活，运行态目录包含 `create_project`、`run_state_writeback`、`run_novelist_validator` 等能力。部署过程没有发模型请求或写正文。

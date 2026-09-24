@@ -2323,6 +2323,7 @@ async fn mcp_http_client_reuses_real_host_staged_network_policy_for_json_rpc_ses
             url: Some("https://api.example.test/v1/run".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .expect("one staged policy must cover the whole MCP JSON-RPC exchange");
@@ -2394,6 +2395,7 @@ async fn mcp_http_client_reuses_staged_credential_for_json_rpc_session() {
             url: Some("https://api.example.test/v1/run".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .expect("staged MCP credential should cover the whole JSON-RPC session");
@@ -2577,6 +2579,7 @@ async fn mcp_http_client_reuses_product_auth_staged_credential_for_json_rpc_sess
             url: Some("https://api.example.test/v1/run".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .expect("product-auth staged credential should cover the whole MCP JSON-RPC session");
@@ -2651,6 +2654,7 @@ async fn mcp_http_client_cannot_use_direct_secret_store_lease_with_production_eg
             url: Some("https://api.example.test/v1/run".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .expect_err("production MCP egress must require staged credentials");

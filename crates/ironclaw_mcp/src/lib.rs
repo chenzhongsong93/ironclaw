@@ -22,10 +22,10 @@ use ironclaw_extensions::{
 use ironclaw_host_api::{
     CapabilityHostHttpRequest, CapabilityHostResult, CapabilityId, ExtensionId, NetworkMethod,
     NetworkPolicy, ResourceEstimate, ResourceReservation, ResourceReservationId, ResourceScope,
-    ResourceUsage, RuntimeCredentialAuthRequirement, RuntimeCredentialInjection,
+    ResourceUsage, RunId, RuntimeCredentialAuthRequirement, RuntimeCredentialInjection,
     RuntimeCredentialRequirement, RuntimeCredentialRequirementSource, RuntimeCredentialSource,
     RuntimeHttpEgress, RuntimeHttpEgressError, RuntimeHttpEgressResponse, RuntimeKind,
-    SecretHandle,
+    SecretHandle, UserId,
 };
 use ironclaw_resources::{ResourceError, ResourceGovernor, ResourceReceipt};
 use serde_json::Value;
@@ -62,6 +62,18 @@ pub struct McpInvocation {
     pub input: Value,
 }
 
+/// Host-authenticated caller identity for an MCP execution.
+///
+/// This value is deliberately separate from [`McpInvocation::input`] and has
+/// no serialization contract. An MCP client must not place it in
+/// model-authored tool arguments; any network forwarding needs a separate,
+/// explicit host egress policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpTrustedExecutionContext {
+    pub authenticated_actor_user_id: Option<UserId>,
+    pub run_id: Option<RunId>,
+}
+
 /// Full resource-governed MCP execution request.
 #[derive(Debug)]
 pub struct McpExecutionRequest<'a> {
@@ -71,6 +83,7 @@ pub struct McpExecutionRequest<'a> {
     pub estimate: ResourceEstimate,
     pub resource_reservation: Option<ResourceReservation>,
     pub invocation: McpInvocation,
+    pub trusted_context: Option<McpTrustedExecutionContext>,
 }
 
 /// Host-normalized request handed to the configured MCP client adapter.
@@ -85,6 +98,7 @@ pub struct McpClientRequest {
     pub url: Option<String>,
     pub input: Value,
     pub max_output_bytes: u64,
+    pub trusted_context: Option<McpTrustedExecutionContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1647,6 +1661,7 @@ where
                 url: url.clone(),
                 input: request.invocation.input.clone(),
                 max_output_bytes: self.config.max_output_bytes,
+                trusted_context: request.trusted_context.clone(),
             },
             auth_context,
         })
@@ -2220,7 +2235,11 @@ mod tests {
         );
         let parsed = parse_mcp_response(&response, Some(10)).expect("parse non-string safe_hint");
         assert!(
-            parsed.error.as_ref().and_then(|e| e.safe_hint.as_ref()).is_none(),
+            parsed
+                .error
+                .as_ref()
+                .and_then(|e| e.safe_hint.as_ref())
+                .is_none(),
             "non-string safe_hint must be ignored"
         );
     }

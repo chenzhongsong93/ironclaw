@@ -34,6 +34,7 @@ async fn mcp_lane_executes_manifest_transport_and_reconciles_resources() {
 
     let requests = client.requests();
     assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].trusted_context, None);
     assert_eq!(requests[0].transport, "http");
     assert_eq!(
         requests[0].url.as_deref(),
@@ -42,6 +43,34 @@ async fn mcp_lane_executes_manifest_transport_and_reconciles_resources() {
     assert_eq!(requests[0].command, None);
     assert!(requests[0].args.is_empty());
     assert_eq!(requests[0].input, json!({"query":"ironclaw"}));
+}
+
+#[tokio::test]
+async fn mcp_lane_keeps_host_identity_separate_from_model_tool_arguments() {
+    let client = RecordingMcpClient::new(Ok(McpClientOutput::json(json!({"ok":true}))));
+    let runtime = McpRuntime::new(McpRuntimeConfig::for_testing(), client.clone());
+    let (governor, _account) = mcp_governor();
+    let trusted_context = McpTrustedExecutionContext {
+        authenticated_actor_user_id: Some(UserId::new("host-user").unwrap()),
+        run_id: Some(RunId::new()),
+    };
+    let model_input = json!({
+        "query":"get world",
+        "runId":"forged-by-model",
+        "authenticatedActorUserId":"forged-by-model"
+    });
+    let mut request = mcp_request(model_input.clone());
+    request.trusted_context = Some(trusted_context.clone());
+
+    runtime
+        .execute_extension_json(&governor, request)
+        .await
+        .expect("the ordinary model arguments still execute");
+
+    let requests = client.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].trusted_context, Some(trusted_context));
+    assert_eq!(requests[0].input, model_input);
 }
 
 #[tokio::test]
@@ -220,6 +249,7 @@ fn mcp_request_from_manifest(
             .set_process_count(1)
             .set_output_bytes(10_000),
         resource_reservation: None,
+        trusted_context: None,
         invocation: McpInvocation { input },
     }
 }

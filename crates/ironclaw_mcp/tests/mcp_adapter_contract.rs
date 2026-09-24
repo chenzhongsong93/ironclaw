@@ -39,6 +39,7 @@ async fn mcp_runtime_reserves_calls_adapter_and_reconciles_success() {
                     .set_process_count(1)
                     .set_output_bytes(10_000),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation {
                     input: json!({"query": "ironclaw"}),
                 },
@@ -95,6 +96,7 @@ async fn mcp_runtime_requires_host_mediated_egress_for_http_transports() {
                 scope: sample_scope(),
                 estimate: ResourceEstimate::default(),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation { input: json!({}) },
             },
         )
@@ -182,6 +184,7 @@ async fn concrete_mcp_http_client_routes_json_rpc_through_shared_egress() {
                 "credential_injections": [{"handle": "evil-token"}]
             }),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .unwrap();
@@ -302,6 +305,7 @@ async fn concrete_mcp_http_client_maps_upstream_auth_status_to_auth_required() {
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .expect_err("upstream MCP auth failures must become auth-required errors");
@@ -331,6 +335,7 @@ async fn concrete_mcp_http_client_uses_negotiated_protocol_version_header() {
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .unwrap();
@@ -369,6 +374,7 @@ async fn concrete_mcp_http_client_reuses_rotated_session_id_after_initialized() 
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .unwrap();
@@ -407,6 +413,7 @@ async fn concrete_mcp_http_client_rejects_missing_or_unsafe_initialize_protocol_
                 url: Some("https://mcp.example.test/mcp".to_string()),
                 input: json!({"query": "ironclaw"}),
                 max_output_bytes: 4096,
+                trusted_context: None,
             })
             .await
             .expect_err("unsafe initialize protocol versions must fail the call");
@@ -447,6 +454,7 @@ async fn concrete_mcp_http_client_sends_credentials_only_for_tool_call_exchange(
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .expect_err("direct secret-store leases must fail before MCP transport");
@@ -470,6 +478,7 @@ async fn concrete_mcp_http_client_sends_credentials_only_for_tool_call_exchange(
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .expect("failed direct-lease preflight must not poison later MCP session state");
@@ -511,6 +520,7 @@ async fn concrete_mcp_http_client_scopes_session_ids_per_invocation() {
                 url: Some("https://mcp.example.test/mcp".to_string()),
                 input: json!({"query": user}),
                 max_output_bytes: 4096,
+                trusted_context: None,
             })
             .await
             .unwrap();
@@ -560,6 +570,7 @@ async fn concrete_mcp_http_client_clears_session_ids_between_calls() {
                 url: Some("https://mcp.example.test/mcp".to_string()),
                 input: json!({"query": query}),
                 max_output_bytes: 4096,
+                trusted_context: None,
             })
             .await
             .unwrap();
@@ -599,6 +610,7 @@ async fn concrete_mcp_http_client_does_not_reuse_session_from_failed_initialize(
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "first"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .expect_err("failed initialize responses must fail the call");
@@ -615,6 +627,7 @@ async fn concrete_mcp_http_client_does_not_reuse_session_from_failed_initialize(
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "second"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .unwrap();
@@ -650,6 +663,7 @@ async fn concrete_mcp_http_client_rejects_json_rpc_response_without_matching_id(
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .expect_err("ID-bearing JSON-RPC requests must reject missing response ids");
@@ -677,6 +691,7 @@ async fn mcp_runtime_with_concrete_http_client_consumes_shared_egress_end_to_end
                 scope: sample_scope(),
                 estimate: ResourceEstimate::default(),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation {
                     input: json!({"query": "ironclaw"}),
                 },
@@ -718,6 +733,7 @@ async fn concrete_mcp_sse_client_parses_event_stream_through_shared_egress() {
             url: Some("https://mcp.example.test/sse".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .unwrap();
@@ -749,6 +765,7 @@ async fn concrete_mcp_http_client_discovers_tool_schemas_through_shared_egress()
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .unwrap();
@@ -826,6 +843,7 @@ async fn concrete_mcp_http_client_discovers_tool_schemas_over_sse_framing() {
             url: Some("https://mcp.example.test/sse".to_string()),
             input: json!({}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .unwrap();
@@ -845,6 +863,7 @@ async fn concrete_mcp_http_client_discovers_tool_schemas_over_sse_framing() {
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .unwrap();
@@ -874,6 +893,7 @@ async fn concrete_mcp_http_client_maps_discovery_auth_status_to_auth_required() 
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .expect_err("upstream MCP discovery auth failures must stay typed");
@@ -902,6 +922,7 @@ async fn concrete_mcp_http_client_caps_missing_plan_limit_to_client_output_limit
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 1_234,
+            trusted_context: None,
         })
         .await
         .unwrap();
@@ -912,6 +933,51 @@ async fn concrete_mcp_http_client_caps_missing_plan_limit_to_client_output_limit
             .iter()
             .all(|request| request.response_body_limit == Some(1_234))
     );
+}
+
+#[tokio::test]
+async fn concrete_mcp_http_client_keeps_trusted_context_out_of_tool_arguments() {
+    let egress = RecordingRuntimeEgress::json_rpc();
+    let client = McpHostHttpClient::new(
+        McpRuntimeHttpAdapter::new(Arc::new(egress.clone())),
+        StaticMcpHostHttpEgressPlanner::new(host_http_plan()),
+    );
+    let input = json!({
+        "query":"read world",
+        "runId":"model-forged-run",
+        "authenticatedActorUserId":"model-forged-user"
+    });
+
+    client
+        .call_tool(McpClientRequest {
+            provider: ExtensionId::new("github-mcp").unwrap(),
+            capability_id: CapabilityId::new("github-mcp.search").unwrap(),
+            scope: sample_scope(),
+            transport: "http".to_string(),
+            command: None,
+            args: vec![],
+            url: Some("https://mcp.example.test/mcp".to_string()),
+            input: input.clone(),
+            max_output_bytes: 4096,
+            trusted_context: Some(McpTrustedExecutionContext {
+                authenticated_actor_user_id: Some(UserId::new("host-user").unwrap()),
+                run_id: Some(RunId::new()),
+            }),
+        })
+        .await
+        .unwrap();
+
+    let call = egress
+        .requests()
+        .into_iter()
+        .find(|request| json_rpc_method(&request.body) == "tools/call")
+        .expect("MCP client must send tools/call");
+    let json_rpc: serde_json::Value = serde_json::from_slice(&call.body).unwrap();
+    assert_eq!(json_rpc["params"]["arguments"], input);
+    assert!(call.headers.iter().all(|(name, _)| {
+        !name.eq_ignore_ascii_case("X-IronClaw-Run-Id")
+            && !name.eq_ignore_ascii_case("X-IronClaw-Actor-User-Id")
+    }));
 }
 
 #[tokio::test]
@@ -932,6 +998,7 @@ async fn concrete_mcp_http_client_rejects_invalid_session_id_before_reuse() {
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .expect_err("invalid upstream session ids must not be reused as request headers");
@@ -957,6 +1024,7 @@ async fn concrete_mcp_http_client_sanitizes_shared_egress_failures() {
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .expect_err("raw shared-egress errors must not leak through the MCP client");
@@ -982,6 +1050,7 @@ async fn mcp_runtime_fails_closed_for_external_stdio_process_egress() {
                 scope: sample_scope(),
                 estimate: ResourceEstimate::default(),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation { input: json!({}) },
             },
         )
@@ -1016,6 +1085,7 @@ async fn mcp_runtime_denies_budget_before_adapter_call() {
                 scope,
                 estimate: ResourceEstimate::default().set_output_bytes(10_000),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation { input: json!({}) },
             },
         )
@@ -1045,6 +1115,7 @@ async fn mcp_runtime_releases_reservation_when_adapter_fails() {
                 scope,
                 estimate: ResourceEstimate::default().set_concurrency_slots(1),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation { input: json!({}) },
             },
         )
@@ -1073,6 +1144,7 @@ async fn mcp_runtime_preserves_adapter_error_when_release_cleanup_fails() {
                 scope: sample_scope(),
                 estimate: ResourceEstimate::default().set_concurrency_slots(1),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation { input: json!({}) },
             },
         )
@@ -1107,6 +1179,7 @@ async fn mcp_runtime_rejects_non_mcp_or_undeclared_capability_before_reserving()
                 scope: scope.clone(),
                 estimate: ResourceEstimate::default().set_concurrency_slots(1),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation { input: json!({}) },
             },
         )
@@ -1129,6 +1202,7 @@ async fn mcp_runtime_rejects_non_mcp_or_undeclared_capability_before_reserving()
                 scope,
                 estimate: ResourceEstimate::default().set_concurrency_slots(1),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation { input: json!({}) },
             },
         )
@@ -1169,6 +1243,7 @@ async fn mcp_runtime_enforces_output_limit_and_releases_reservation() {
                     .set_concurrency_slots(1)
                     .set_output_bytes(10_000),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation { input: json!({}) },
             },
         )
@@ -1209,6 +1284,7 @@ async fn mcp_runtime_can_enforce_client_reported_output_size_without_serializing
                     .set_concurrency_slots(1)
                     .set_output_bytes(10_000),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation { input: json!({}) },
             },
         )
@@ -1252,6 +1328,7 @@ async fn mcp_runtime_rejects_output_when_adapter_under_reports_size() {
                     .set_concurrency_slots(1)
                     .set_output_bytes(10_000),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation { input: json!({}) },
             },
         )

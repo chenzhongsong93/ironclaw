@@ -1,3 +1,19 @@
+# 当前交接：已审核本地主线 Gateway 镜像部署（2026-09-24）
+
+Reborn Gateway 已从 IronClaw 本地 `main` `932ae4236` 重建，镜像 `ironclaw-reborn:tianquan` 当前 ID 为 `bd9f16055fa1`；TianQuan `tianquan-graph` 扩展也从主线镜像重新落地，init 容器退出码 0。Gateway 日志确认扩展激活，运行态目录包含 `create_project`、`run_state_writeback`、`run_novelist_validator` 等能力。部署过程没有发模型请求或写正文。
+
+## 联合运行状态
+
+- 本地 Compose 项目 `docker` 的 API、Web、Gateway 已按 TianQuan 主线重建运行；API 返回 `/api/health=200`，Nginx `/api/health=200`，Web 80/8181=200，5188 预览=200。PostgreSQL 原容器与 `docker_postgres-data` 卷没有重启或重置；主 Rena 仍关闭。
+- UX 验收用的隔离 API/Gateway/PostgreSQL/Rena/init 容器在验收结束后全部停止；5189 临时 Vite 也已关闭。隔离真实委派生成一个 `Completed` 的 `chapter-reviewer` 子线程，父 timeline 与子线程 API 返回实际 user/assistant 消息；父子隔离及用户越权检查通过。测试提示只要求返回固定验收短句，并禁止文件、图谱及正文写入；未重置余额。
+- TianQuan 最新主线为 `71d2494`（本轮 API 运行时代码最后提交 `c28c8c6`）；其 316 个 API 库用例通过，拒绝未知正文、签名回执、force 不激活正文以及隔离 HTTP 直接 PUT/force 422 均有新鲜证据。详细证据和 Rena 测试 fixture 边界见天权 `docs/handover.md` 最新入口。
+
+## 尚未闭环
+
+- 本地 IronClaw `main` `932ae4236` 与 upstream `origin/main` `f7da7dd7b` 分叉（本地独有 71、远端独有 35）。Gateway 按已审阅的本地主线构建；未将未审 upstream 提交带入部署，也未向 upstream 主线强推。个人 fork 评审分支继续保留。
+- TianQuan `ISSUE-IRONCLAW-013` 的 blocking spawn dossier 首步缺失仍开放；实际子线程和权限正确，不代表该诊断采集问题单已关闭。
+- 本地 WebChat 运行配置报告 `LocalDev`/`DevOnly`，只适用于本地开发；未将此容器称为生产发布。本轮没有发布 tag。
+
 # 当前交接：本地分支回合与远端推送（2026-09-23）
 
 本轮按用户要求检查本地分支并回合到 `main`；没有删除任何分支或 worktree。当前 IronClaw `main` 为 `a787b2490`。Todo/runtime 与子运行隔离已在 `61bbca3fd` 合入；`codex/novel-studio-runtime`、`feat/tianquan-timeout-lease-spawn-fixes`、`tianquan-soul-v1` 均可从 main 到达。旧 `tianquan-soul` 通过 `a787b2490` 的合并父链收口，但保留 main 文件树：该线的 20 项 flavor 与当前实际支持的 16 项 resolver 不一致，且其 composition 冲突会关闭 local-dev 所有网络目标的私网 IP 防护；这些效果不应覆盖当前目录与网络边界。原分支仍在，完整提交历史仍可追溯。

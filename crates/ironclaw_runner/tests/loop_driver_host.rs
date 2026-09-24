@@ -3622,6 +3622,74 @@ async fn real_tianquan_worldsmith_bundle_reaches_final_model_request() {
 }
 
 #[tokio::test]
+#[ignore = "requires TIANQUAN_SOUL_TEST_BUNDLE_DIR pointing to the sibling TianQuan worktree"]
+async fn real_tianquan_novelist_bundle_reaches_novelist_profile_final_request() {
+    const KINDS: &[&str] = &[
+        "market-researcher",
+        "story-architect",
+        "market-evaluator",
+        "schema-architect",
+        "ontologist",
+        "worldsmith",
+        "plotter",
+        "event-simulator",
+        "discourse-planner",
+        "chapter-packer",
+        "scene-reasoner",
+        "novelist",
+        "auditor",
+        "committer",
+        "chapter-reviewer",
+        "polisher",
+    ];
+    let root = std::env::var("TIANQUAN_SOUL_TEST_BUNDLE_DIR").unwrap();
+    let bundle = PinnedRoleBundle::load_from_dir(
+        std::path::Path::new(&root),
+        PinnedRoleBundleSpec {
+            schema_version: "soul-catalog/1",
+            bundle_id: "novel-studio-souls",
+            version: "1.0.0",
+            marker: "SOUL-BUNDLE",
+            expected_roles: KINDS,
+            max_material_bytes: 16 * 1024,
+        },
+    )
+    .unwrap();
+    let role = bundle.role("novelist").unwrap();
+    let requested = CapabilityId::new("tianquan-graph.run_novelist_prompt").unwrap();
+    let out_of_role = CapabilityId::new("tianquan-graph.import_graph").unwrap();
+    assert!(!role.allowed_capabilities.contains(&requested));
+    assert!(!role.allowed_capabilities.contains(&out_of_role));
+
+    let (request, tools) = capture_subagent_final_request(
+        "thread-novelist-real-bundle-capture",
+        SUBAGENT_NOVELIST_PROFILE_ID,
+        role.direction_markdown.clone(),
+        role.allowed_capabilities.clone(),
+        requested,
+        out_of_role,
+        "tianquan-graph",
+    )
+    .await;
+    assert!(request.messages.iter().any(|message| {
+        message.role == HostManagedModelMessageRole::System
+            && message.content.contains(&role.direction_markdown)
+            && message
+                .content
+                .contains("SOUL-BUNDLE novel-studio-souls/1.0.0")
+            && message.content.contains("roleSha256=")
+    }));
+    assert!(request.messages.iter().any(|message| {
+        message.role == HostManagedModelMessageRole::User
+            && message.content.contains("SUBAGENT_GOAL_SENTINEL")
+    }));
+    assert_eq!(
+        tools.into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from([CapabilityId::new("ironclaw.loop.capability_info").unwrap()])
+    );
+}
+
+#[tokio::test]
 async fn planned_host_factory_fails_closed_when_driver_requirements_are_missing() {
     let fixture = HostFixture::new("thread-host-planned-missing-requirements", "hello").await;
     let planned = default_planned_run_profile_resolver()

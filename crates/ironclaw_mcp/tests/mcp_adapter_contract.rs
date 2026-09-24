@@ -1,11 +1,16 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac};
 use ironclaw_extensions::*;
 use ironclaw_host_api::*;
 use ironclaw_mcp::*;
 use ironclaw_resources::*;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[tokio::test]
 async fn mcp_runtime_reserves_calls_adapter_and_reconciles_success() {
@@ -978,6 +983,215 @@ async fn concrete_mcp_http_client_keeps_trusted_context_out_of_tool_arguments() 
         !name.eq_ignore_ascii_case("X-IronClaw-Run-Id")
             && !name.eq_ignore_ascii_case("X-IronClaw-Actor-User-Id")
     }));
+}
+
+#[tokio::test]
+async fn tianquan_context_signer_targets_only_internal_route_and_binds_each_http_request() {
+    const SECRET: &[u8] = b"test-only-key-with-at-least-32-bytes";
+    const AUDIENCE: &str = "http://tianquan-api.test:3002/mcp/internal";
+    let egress = RecordingRuntimeEgress::json_rpc();
+    let signer = McpTrustedContextSigner::new(
+        ExtensionId::new("tianquan-graph").unwrap(),
+        SECRET.to_vec(),
+        AUDIENCE.to_string(),
+    )
+    .unwrap();
+    let client = McpHostHttpClient::new(
+        McpRuntimeHttpAdapter::new(Arc::new(egress.clone())),
+        StaticMcpHostHttpEgressPlanner::new(host_http_plan()),
+    )
+    .with_trusted_context_signer(signer);
+    let raw_input = json!({
+        "query":"read world",
+        "runId":"model-forged-run",
+        "authenticatedActorUserId":"model-forged-user"
+    });
+    let host_run = RunId::new();
+
+    client
+        .call_tool(McpClientRequest {
+            provider: ExtensionId::new("tianquan-graph").unwrap(),
+            capability_id: CapabilityId::new("tianquan-graph.get_world").unwrap(),
+            scope: sample_scope_for_user("host-user"),
+            transport: "http".to_string(),
+            command: None,
+            args: vec![],
+            url: Some("http://tianquan-api.test:3002/mcp".to_string()),
+            input: raw_input.clone(),
+            max_output_bytes: 4096,
+            trusted_context: Some(McpTrustedExecutionContext {
+                authenticated_actor_user_id: Some(UserId::new("host-user").unwrap()),
+                run_id: Some(host_run),
+            }),
+        })
+        .await
+        .unwrap();
+
+    let requests = egress.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "initialize, notification, and call are sent"
+    );
+    let mut nonces = std::collections::HashSet::new();
+    for request in &requests {
+        assert_eq!(
+            request.url, AUDIENCE,
+            "only trusted TQ calls use internal route"
+        );
+        assert_eq!(request.method, NetworkMethod::Post);
+        let payload = request
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-tianquan-execution-context"))
+            .map(|(_, value)| value)
+            .expect("internal request must have signed context payload");
+        let signature = request
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-tianquan-execution-signature"))
+            .map(|(_, value)| value)
+            .expect("internal request must have signed context signature");
+        let decoded = URL_SAFE_NO_PAD.decode(payload).unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(claims["version"], 1);
+        assert_eq!(claims["actorUserId"], "host-user");
+        assert_eq!(claims["runId"], host_run.to_string());
+        assert_eq!(claims["projectId"], "project1");
+        assert_eq!(claims["audience"], AUDIENCE);
+        let nonce = claims["nonce"].as_str().unwrap();
+        assert!(
+            nonces.insert(nonce.to_string()),
+            "nonce must be unique per HTTP request"
+        );
+
+        let body_hash = hex::encode(Sha256::digest(&request.body));
+        let session_id = request
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("mcp-session-id"))
+            .map_or("", |(_, value)| value.as_str());
+        let canonical =
+            format!("TQ-MCP-CONTEXT-V1\nPOST\n/mcp/internal\n{body_hash}\n{payload}\n{session_id}");
+        let mut mac = HmacSha256::new_from_slice(SECRET).unwrap();
+        mac.update(canonical.as_bytes());
+        mac.verify_slice(&hex::decode(signature).unwrap())
+            .expect("signature must bind the actual JSON-RPC request and session");
+    }
+
+    let call = requests
+        .iter()
+        .find(|request| json_rpc_method(&request.body) == "tools/call")
+        .expect("MCP client must send tools/call");
+    let json_rpc: serde_json::Value = serde_json::from_slice(&call.body).unwrap();
+    assert_eq!(json_rpc["params"]["arguments"], raw_input);
+}
+
+#[tokio::test]
+async fn tianquan_context_policy_fails_closed_without_key_and_never_signs_other_providers() {
+    let provider = ExtensionId::new("tianquan-graph").unwrap();
+    let unconfigured = McpTrustedContextSigner::unconfigured(provider.clone());
+    let failed_egress = RecordingRuntimeEgress::json_rpc();
+    let failed_client = McpHostHttpClient::new(
+        McpRuntimeHttpAdapter::new(Arc::new(failed_egress.clone())),
+        StaticMcpHostHttpEgressPlanner::new(host_http_plan()),
+    )
+    .with_trusted_context_signer(unconfigured);
+    let error = failed_client
+        .call_tool(McpClientRequest {
+            provider: provider.clone(),
+            capability_id: CapabilityId::new("tianquan-graph.get_world").unwrap(),
+            scope: sample_scope_for_user("host-user"),
+            transport: "http".to_string(),
+            command: None,
+            args: vec![],
+            url: Some("http://tianquan-api.test:3002/mcp".to_string()),
+            input: json!({}),
+            max_output_bytes: 4096,
+            trusted_context: Some(McpTrustedExecutionContext {
+                authenticated_actor_user_id: Some(UserId::new("host-user").unwrap()),
+                run_id: Some(RunId::new()),
+            }),
+        })
+        .await
+        .expect_err("missing signing configuration must not fall back to legacy MCP");
+    assert_eq!(
+        error.stable_reason(),
+        "mcp_trusted_context_signer_unavailable"
+    );
+    assert!(failed_egress.requests().is_empty());
+
+    let egress = RecordingRuntimeEgress::json_rpc();
+    let signer = McpTrustedContextSigner::new(
+        provider.clone(),
+        b"test-only-key-with-at-least-32-bytes".to_vec(),
+        "http://tianquan-api.test:3002/mcp/internal".to_string(),
+    )
+    .unwrap();
+    let mismatch_egress = RecordingRuntimeEgress::json_rpc();
+    let mismatch_client = McpHostHttpClient::new(
+        McpRuntimeHttpAdapter::new(Arc::new(mismatch_egress.clone())),
+        StaticMcpHostHttpEgressPlanner::new(host_http_plan()),
+    )
+    .with_trusted_context_signer(signer.clone());
+    let error = mismatch_client
+        .call_tool(McpClientRequest {
+            provider: provider.clone(),
+            capability_id: CapabilityId::new("tianquan-graph.get_world").unwrap(),
+            scope: sample_scope_for_user("host-user"),
+            transport: "http".to_string(),
+            command: None,
+            args: vec![],
+            url: Some("http://tianquan-api.test:3002/mcp".to_string()),
+            input: json!({}),
+            max_output_bytes: 4096,
+            trusted_context: Some(McpTrustedExecutionContext {
+                authenticated_actor_user_id: Some(UserId::new("different-user").unwrap()),
+                run_id: Some(RunId::new()),
+            }),
+        })
+        .await
+        .expect_err("actor identity must match the host resource scope");
+    assert_eq!(error.stable_reason(), "mcp_invalid_trusted_context");
+    assert!(mismatch_egress.requests().is_empty());
+
+    let client = McpHostHttpClient::new(
+        McpRuntimeHttpAdapter::new(Arc::new(egress.clone())),
+        StaticMcpHostHttpEgressPlanner::new(host_http_plan()),
+    )
+    .with_trusted_context_signer(signer);
+    client
+        .call_tool(McpClientRequest {
+            provider: ExtensionId::new("github-mcp").unwrap(),
+            capability_id: CapabilityId::new("github-mcp.search").unwrap(),
+            scope: sample_scope_for_user("host-user"),
+            transport: "http".to_string(),
+            command: None,
+            args: vec![],
+            url: Some("https://mcp.example.test/mcp".to_string()),
+            input: json!({"q":"safe"}),
+            max_output_bytes: 4096,
+            trusted_context: Some(McpTrustedExecutionContext {
+                authenticated_actor_user_id: Some(UserId::new("host-user").unwrap()),
+                run_id: Some(RunId::new()),
+            }),
+        })
+        .await
+        .unwrap();
+    assert!(
+        egress
+            .requests()
+            .iter()
+            .all(|request| request.headers.iter().all(|(name, _)| !name
+                .eq_ignore_ascii_case("x-tianquan-execution-context")
+                && !name.eq_ignore_ascii_case("x-tianquan-execution-signature")))
+    );
+    assert!(
+        egress
+            .requests()
+            .iter()
+            .all(|request| request.url == "https://mcp.example.test/mcp")
+    );
 }
 
 #[tokio::test]

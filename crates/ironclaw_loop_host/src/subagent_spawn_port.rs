@@ -681,6 +681,70 @@ impl SubagentSpawnCapabilityPort {
         }
     }
 
+    fn trace_spawn_request(&self, invocation: &CapabilityInvocation, args: &SpawnSubagentArgs) {
+        let Ok(input) = serde_json::to_value(args) else {
+            tracing::debug!(
+                invocation_id = %invocation.activity_id,
+                "subagent spawn trace input serialization failed"
+            );
+            return;
+        };
+        self.append_spawn_trace_event(
+            "tool_request",
+            serde_json::json!({
+                "invocation_id": invocation.activity_id.to_string(),
+                "capability_id": invocation.capability_id.as_str(),
+                "input": input,
+            }),
+        );
+    }
+
+    fn trace_spawn_response(&self, invocation: &CapabilityInvocation, resolution: &Resolution) {
+        match serde_json::to_value(resolution) {
+            Ok(output) => self.append_spawn_trace_event(
+                "tool_response",
+                serde_json::json!({
+                    "invocation_id": invocation.activity_id.to_string(),
+                    "capability_id": invocation.capability_id.as_str(),
+                    "output": output,
+                }),
+            ),
+            Err(error) => tracing::debug!(
+                %error,
+                invocation_id = %invocation.activity_id,
+                "subagent spawn trace response serialization failed"
+            ),
+        }
+    }
+
+    fn trace_spawn_failure(&self, invocation: &CapabilityInvocation, error: &AgentLoopHostError) {
+        self.append_spawn_trace_event(
+            "tool_response",
+            serde_json::json!({
+                "invocation_id": invocation.activity_id.to_string(),
+                "capability_id": invocation.capability_id.as_str(),
+                "output": {
+                    "status": "failed",
+                    "kind": format!("{:?}", error.kind),
+                    "safe_summary": error.safe_summary,
+                },
+            }),
+        );
+    }
+
+    fn append_spawn_trace_event(&self, kind: &str, data: serde_json::Value) {
+        let run_id = self.run_context.run_id.to_string();
+        let thread_id = self.run_context.thread_id.to_string();
+        let turn_id = self.run_context.turn_id.to_string();
+        ironclaw_common::run_trace::append_trace_event(
+            kind,
+            &run_id,
+            Some(&thread_id),
+            Some(&turn_id),
+            data,
+        );
+    }
+
     fn validate_spawn_provider_tool_call(
         &self,
         tool_call: &ProviderToolCall,
@@ -1306,10 +1370,17 @@ impl LoopCapabilityPort for SubagentSpawnCapabilityPort {
                 .spawn_input_codec
                 .decode(&self.run_context, &request.input_ref)
                 .await?;
-            if let Some(resolution) = self.authorize_spawn(&request).await? {
-                return Ok(resolution);
+            self.trace_spawn_request(&request, &args);
+            let result = match self.authorize_spawn(&request).await {
+                Ok(Some(resolution)) => Ok(resolution),
+                Ok(None) => self.handle_spawn_with_gate(&request, args, None).await,
+                Err(error) => Err(error),
+            };
+            match &result {
+                Ok(resolution) => self.trace_spawn_response(&request, resolution),
+                Err(error) => self.trace_spawn_failure(&request, error),
             }
-            return self.handle_spawn_with_gate(&request, args, None).await;
+            return result;
         }
         self.inner.invoke_capability(request).await
     }
@@ -1350,6 +1421,9 @@ impl LoopCapabilityPort for SubagentSpawnCapabilityPort {
         while index < request.invocations.len() {
             let invocation = &request.invocations[index];
             if self.is_spawn(&invocation.capability_id) {
+                if let Some(args) = spawn_args.get(&index) {
+                    self.trace_spawn_request(invocation, args);
+                }
                 let outcome = match self.authorize_spawn(invocation).await {
                     Ok(Some(outcome)) => outcome,
                     Ok(None) => {
@@ -1378,6 +1452,7 @@ impl LoopCapabilityPort for SubagentSpawnCapabilityPort {
                         {
                             Ok(result) => result,
                             Err(error) => {
+                                self.trace_spawn_failure(invocation, &error);
                                 self.rollback_batch_compensation(&mut batch_compensations)
                                     .await;
                                 return Err(error);
@@ -1387,11 +1462,13 @@ impl LoopCapabilityPort for SubagentSpawnCapabilityPort {
                         outcome
                     }
                     Err(error) => {
+                        self.trace_spawn_failure(invocation, &error);
                         self.rollback_batch_compensation(&mut batch_compensations)
                             .await;
                         return Err(error);
                     }
                 };
+                self.trace_spawn_response(invocation, &outcome);
                 // The spawn helpers now emit the host_api `Resolution` directly; a
                 // coalesced batch-await-dependent is the `Suspended(DependentRun)`
                 // whose preserved loop-gate origin is the shared batch gate.

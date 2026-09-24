@@ -167,16 +167,37 @@ pub fn compact_run_trace(run_id: &str) {
     let safe = sanitize_run_id(run_id);
     let src = root.join(format!("{safe}.jsonl"));
     let dst = root.join(format!("{safe}.jsonl.gz"));
-    let Ok(data) = std::fs::read(&src) else {
+    let Ok(new_segment) = std::fs::read(&src) else {
         return; // 无文件=无事可做(正常态)
     };
+    // A blocked run can be resumed with the same run_id after an earlier
+    // segment was compressed. Preserve that prefix when compacting the resumed
+    // hot segment; replacing the archive with only the suffix loses the exact
+    // model/tool steps needed to explain a blocking capability.
+    let mut data = if dst.exists() {
+        match read_gz_segment(&dst) {
+            Ok(prefix) => prefix,
+            Err(error) => {
+                tracing_stub_debug(format!(
+                    "run trace prior archive read failed({safe}): {error}"
+                ));
+                return;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    if !data.is_empty() && !data.ends_with(b"\n") && !new_segment.is_empty() {
+        data.push(b'\n');
+    }
+    data.extend_from_slice(&new_segment);
     let tmp = root.join(format!("{safe}.jsonl.gz.tmp"));
     let write_gz = || -> std::io::Result<()> {
         let f = std::fs::File::create(&tmp)?;
         let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
         std::io::Write::write_all(&mut enc, &data)?;
         enc.finish()?;
-        std::fs::rename(&tmp, &dst) // 原子替换(半成品留在 .tmp,下轮覆盖)
+        replace_compacted_archive(&tmp, &dst, &root, &safe)
     };
     match write_gz() {
         Ok(()) => {
@@ -186,6 +207,54 @@ pub fn compact_run_trace(run_id: &str) {
             let _ = std::fs::remove_file(&tmp);
             tracing_stub_debug(format!("run trace compact failed({safe}): {e}"));
         }
+    }
+}
+
+fn read_gz_segment(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut decoder = flate2::read::GzDecoder::new(file);
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut decoder, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Replace the archive atomically where the platform permits it. Windows
+/// `rename` does not replace an existing destination, so use a rollback file
+/// there and restore the previous archive if promoting the complete temp file
+/// fails.
+fn replace_compacted_archive(
+    tmp: &std::path::Path,
+    dst: &std::path::Path,
+    root: &std::path::Path,
+    safe: &str,
+) -> std::io::Result<()> {
+    match std::fs::rename(tmp, dst) {
+        Ok(()) => Ok(()),
+        Err(_) if dst.exists() => {
+            let backup = root.join(format!("{safe}.jsonl.gz.previous"));
+            if backup.exists() {
+                std::fs::remove_file(&backup)?;
+            }
+            std::fs::rename(dst, &backup)?;
+            match std::fs::rename(tmp, dst) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(backup);
+                    Ok(())
+                }
+                Err(promote_error) => {
+                    if let Err(restore_error) = std::fs::rename(&backup, dst) {
+                        return Err(std::io::Error::new(
+                            restore_error.kind(),
+                            format!(
+                                "archive promotion failed ({promote_error}); previous archive restore failed ({restore_error})"
+                            ),
+                        ));
+                    }
+                    Err(promote_error)
+                }
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -354,6 +423,35 @@ mod tests {
         let mut out = String::new();
         std::io::Read::read_to_string(&mut dec, &mut out).expect("decompress");
         assert_eq!(out, r#"{"kind":"a"} {"kind":"b"}"#);
+    }
+
+    // 覆盖:blocking run 曾被中途压缩后,恢复写入的热段必须追加到已有冷档案,
+    // 不能以新段覆盖此前的 model/tool 证据。
+    #[test]
+    fn test_compact_merges_existing_archive_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let prior = r#"{"kind":"model_request","run_id":"run-merge"}"#;
+        let resumed = r#"{"kind":"tool_response","run_id":"run-merge"}"#;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, prior.as_bytes()).expect("gzip prior segment");
+        std::fs::write(
+            root.join("run-merge.jsonl.gz"),
+            encoder.finish().expect("finish prior segment"),
+        )
+        .expect("write prior archive");
+        std::fs::write(root.join("run-merge.jsonl"), resumed).expect("write resumed segment");
+        unsafe { std::env::set_var("TIANQUAN_TRACE_DIR", root) };
+
+        super::compact_run_trace("run-merge");
+
+        unsafe { std::env::remove_var("TIANQUAN_TRACE_DIR") };
+        let raw = std::fs::read(root.join("run-merge.jsonl.gz")).expect("read merged archive");
+        let mut decoder = flate2::read::GzDecoder::new(&raw[..]);
+        let mut merged = String::new();
+        std::io::Read::read_to_string(&mut decoder, &mut merged).expect("decompress merged trace");
+        assert_eq!(merged, format!("{prior}\n{resumed}"));
+        assert!(!root.join("run-merge.jsonl").exists());
     }
 
     // 覆盖:rotate——热文件超限压缩最旧;gz 超限删最旧

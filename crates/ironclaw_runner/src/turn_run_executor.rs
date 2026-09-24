@@ -79,6 +79,16 @@ fn trace_executor_latency_error<E: ?Sized>(
     );
 }
 
+fn compact_trace_if_terminal(run_id: &str, status: TurnStatus) {
+    if should_compact_trace(status) {
+        ironclaw_common::run_trace::compact_run_trace(run_id);
+    }
+}
+
+fn should_compact_trace(status: TurnStatus) -> bool {
+    status.is_terminal()
+}
+
 /// A `TurnRunExecutorError` for the static category `"unknown_failure"`.
 ///
 /// Built once on first access via `OnceLock`. Used as a guaranteed-valid
@@ -415,9 +425,10 @@ impl RebornTurnRunExecutor {
                     status = ?state.status,
                     "loop exit applied successfully"
                 );
-                // run 终态:压缩该 run 的 trace 档案(log4j 式轮转第①级,
-                // 契约=天权仓 trace-schema-v1;best-effort 不影响终态)
-                ironclaw_common::run_trace::compact_run_trace(&run_id.to_string());
+                // Blocked/suspended exits can resume the SAME run_id. Keep their
+                // hot suffix attached to any earlier segment until the run is
+                // truly terminal; otherwise compaction can split a blocking spawn.
+                compact_trace_if_terminal(&run_id.to_string(), state.status);
                 Ok(())
             }
             Err(err) => {
@@ -1813,5 +1824,35 @@ mod tests {
             run_id,
             "the terminal failure must target the claimed run"
         );
+    }
+
+    #[test]
+    fn trace_compaction_is_limited_to_terminal_statuses() {
+        for status in [
+            TurnStatus::Queued,
+            TurnStatus::Running,
+            TurnStatus::BlockedApproval,
+            TurnStatus::BlockedAuth,
+            TurnStatus::BlockedResource,
+            TurnStatus::BlockedDependentRun,
+            TurnStatus::BlockedExternalTool,
+            TurnStatus::CancelRequested,
+        ] {
+            assert!(
+                !super::should_compact_trace(status),
+                "non-terminal {status:?} runs can resume under the same run id"
+            );
+        }
+        for status in [
+            TurnStatus::Cancelled,
+            TurnStatus::Completed,
+            TurnStatus::Failed,
+            TurnStatus::RecoveryRequired,
+        ] {
+            assert!(
+                super::should_compact_trace(status),
+                "terminal {status:?} runs should be compressed"
+            );
+        }
     }
 }

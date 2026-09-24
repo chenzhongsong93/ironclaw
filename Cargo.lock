@@ -4647,6 +4647,7 @@ dependencies = [
  "futures",
  "hex",
  "ironclaw_capabilities",
+ "ironclaw_common",
  "ironclaw_filesystem",
  "ironclaw_host_api",
  "ironclaw_host_runtime",

@@ -21,11 +21,39 @@ use ironclaw_turns::{
         RegisterProviderToolCallRequest, ToolObservationDetail, ToolObservationStatus, resolution,
     },
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::capability_port::CapabilityWriteResult;
 
 use super::*;
+
+struct TraceRootGuard(Option<std::ffi::OsString>);
+
+impl TraceRootGuard {
+    fn set(path: &std::path::Path) -> Self {
+        let previous = std::env::var_os("TIANQUAN_TRACE_DIR");
+        unsafe { std::env::set_var("TIANQUAN_TRACE_DIR", path) };
+        Self(previous)
+    }
+}
+
+impl Drop for TraceRootGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0.take() {
+            unsafe { std::env::set_var("TIANQUAN_TRACE_DIR", previous) };
+        } else {
+            unsafe { std::env::remove_var("TIANQUAN_TRACE_DIR") };
+        }
+    }
+}
+
+fn read_trace_events(trace_root: &std::path::Path, run_id: &str) -> Vec<Value> {
+    let hot = trace_root.join(format!("{run_id}.jsonl"));
+    let text = std::fs::read_to_string(hot).expect("read isolated active run trace");
+    text.lines()
+        .map(|line| serde_json::from_str(line).expect("trace event is valid JSON"))
+        .collect()
+}
 
 struct StaticInputResolver {
     value: Result<serde_json::Value, AgentLoopHostError>,
@@ -2744,7 +2772,10 @@ async fn invoke_capability_batch_rolls_back_preceding_spawn_on_inner_batch_failu
 
 #[tokio::test]
 async fn invoke_capability_batch_stops_on_first_spawn_suspension_when_requested() {
+    let trace_root = tempfile::tempdir().expect("isolated trace root");
+    let _trace_root_guard = TraceRootGuard::set(trace_root.path());
     let context = test_run_context_with_agent_actor("spawn-batch-stop").await;
+    let run_id = context.run_id.to_string();
     let actor = context.actor.clone().unwrap();
     let turn_store = Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0))));
     let child_runs = Arc::new(RecordingChildRuns::default());
@@ -2789,6 +2820,33 @@ async fn invoke_capability_batch_stops_on_first_spawn_suspension_when_requested(
         })
         .await
         .unwrap();
+
+    let events = read_trace_events(trace_root.path(), &run_id);
+    let requests = events
+        .iter()
+        .filter(|event| event["kind"] == "tool_request")
+        .collect::<Vec<_>>();
+    let responses = events
+        .iter()
+        .filter(|event| event["kind"] == "tool_response")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the specialized spawn path is traced once"
+    );
+    assert_eq!(responses.len(), 1, "the blocking result is traced once");
+    assert_eq!(
+        requests[0]["data"]["capability_id"],
+        DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID
+    );
+    assert_eq!(requests[0]["data"]["input"]["subagent_type"], "general");
+    assert_eq!(requests[0]["data"]["input"]["task"], "task");
+    assert_eq!(
+        requests[0]["data"]["invocation_id"],
+        responses[0]["data"]["invocation_id"]
+    );
+    assert!(responses[0]["data"]["output"].is_object());
 
     assert_eq!(outcome.resolutions.len(), 1);
     assert!(outcome.stopped_on_suspension);

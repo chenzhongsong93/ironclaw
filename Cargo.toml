@@ -587,6 +587,10 @@ name = "reborn_integration_tracecap"
 path = "tests/integration/tracecap.rs"
 
 [[test]]
+name = "reborn_integration_trace_events"
+path = "tests/integration/trace_events.rs"
+
+[[test]]
 name = "reborn_integration_triggered_submit"
 path = "tests/integration/triggered_submit.rs"
 

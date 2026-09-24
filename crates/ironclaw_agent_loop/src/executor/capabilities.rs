@@ -353,9 +353,7 @@ impl ExecutorStage<CapabilityInput> for CapabilityStage {
                 );
                 for call in visible_calls {
                     push_call_signature_once(&mut state, &mut signatures, &call)?;
-                    state
-                        .recent_failure_kinds
-                        .push(LoopFailureKind::ModelError);
+                    state.recent_failure_kinds.push(LoopFailureKind::ModelError);
                     let summary = CapabilityErrorSummary {
                         class: CapabilityErrorClass::InputInvalid,
                         safe_summary: invalid_summary.clone(),

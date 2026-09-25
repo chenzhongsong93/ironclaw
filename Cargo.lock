@@ -9149,6 +9149,7 @@ name = "tianquan_subagents"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "ironclaw_agent_loop",
  "ironclaw_host_api",
  "ironclaw_loop_host",
  "ironclaw_runner",

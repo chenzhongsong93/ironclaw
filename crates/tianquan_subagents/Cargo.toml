@@ -25,4 +25,6 @@ tokio = { version = "1", features = ["macros", "rt"] }
 tracing = "0.1"
 
 [dev-dependencies]
+ironclaw_agent_loop = { path = "../ironclaw_agent_loop", features = ["test-support"] }
+ironclaw_runner = { path = "../ironclaw_runner", features = ["filesystem-goal-store"] }
 tempfile = "3"

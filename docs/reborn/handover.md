@@ -11,7 +11,7 @@ IronClaw 本轮运行时代码提交为本地主线 `main` 上的 `0ed934f4b`（
 
 ## 分支与发布边界
 
-本地修复保留在 `main`，文档与代码已推送到个人 fork 评审分支 `codex/tianquan-mainline-integration-20260923`；nearai `origin/main` 仍与本地主线分叉，未将上游独有提交带入本地，也未向分叉的上游 main 强推。Todo 与 SOUL catalog 对应的 TianQuan ISSUE-IRONCLAW-010/012 仍以上游合入/正式发布为收口条件。没有删除分支或 worktree；UX 隔离容器/5189 在验收后停止但保留容器和卷，5188 持续可访问。本轮是本地验证，不是生产发布。
+本地修复保留在 `main`，文档与代码已推送到个人 fork 集成分支 `codex/tianquan-mainline-integration-20260923`；nearai `origin/main` 仍与本地主线分叉，未将上游独有提交带入本地，也未向分叉的上游 main 强推。TianQuan ISSUE-IRONCLAW-010/012 已在自维护 fork 代码线上关闭，不依赖 nearai upstream。个人 fork 的 `fork/main` 仍与本地集成线有 61 个远端独有提交并存在多处 Gateway/runner/composition 冲突，故未覆盖或强推；其历史整合须保留双方代码后单独处理。没有删除分支或 worktree；UX 隔离容器/5189 在验收后停止但保留容器和卷，5188 持续可访问。本轮是本地验证，不是生产发布。
 
 ---
 

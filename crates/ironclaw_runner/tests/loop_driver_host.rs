@@ -3453,12 +3453,32 @@ async fn capture_subagent_final_request(
     denied_id: CapabilityId,
     provider: &'static str,
 ) -> (HostManagedModelRequest, Vec<CapabilityId>) {
+    capture_subagent_final_request_with_surface(
+        thread_name,
+        profile_id,
+        direction_markdown,
+        role_allowed,
+        BTreeSet::from([allowed_id, denied_id]),
+        provider,
+    )
+    .await
+}
+
+async fn capture_subagent_final_request_with_surface(
+    thread_name: &str,
+    profile_id: &str,
+    direction_markdown: String,
+    role_allowed: BTreeSet<CapabilityId>,
+    base_capabilities: BTreeSet<CapabilityId>,
+    provider: &'static str,
+) -> (HostManagedModelRequest, Vec<CapabilityId>) {
     let fixture = HostFixture::new(thread_name, "parent task").await;
     fixture.gateway.enable_tool_capture();
-    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
-        capability_descriptor(allowed_id.as_str()),
-        capability_descriptor(denied_id.as_str()),
-    ])));
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface(
+        base_capabilities
+            .iter()
+            .map(|capability| capability_descriptor(capability.as_str())),
+    )));
     let capability_factory = Arc::new(TestHostRuntimeCapabilityFactory {
         runtime,
         visible_request: host_runtime_visible_request(&fixture, [provider]),
@@ -3466,7 +3486,7 @@ async fn capture_subagent_final_request(
         milestone_sink: fixture.milestone_sink.clone(),
     });
     let surface_resolver = Arc::new(StaticCapabilitySurfaceProfileResolver::new(
-        CapabilityAllowSet::allowlist([allowed_id.clone(), denied_id]),
+        CapabilityAllowSet::allowlist(base_capabilities),
     ));
     let profile = default_planned_run_profile_resolver()
         .expect("profile resolver")
@@ -3687,6 +3707,99 @@ async fn real_tianquan_novelist_bundle_reaches_novelist_profile_final_request() 
         tools.into_iter().collect::<BTreeSet<_>>(),
         BTreeSet::from([CapabilityId::new("ironclaw.loop.capability_info").unwrap()])
     );
+}
+
+#[tokio::test]
+#[ignore = "requires TIANQUAN_SOUL_TEST_BUNDLE_DIR pointing to the sibling TianQuan worktree"]
+async fn real_tianquan_all_roles_final_requests_apply_pinned_role_hash_and_allowlist() {
+    const KINDS: &[&str] = &[
+        "market-researcher",
+        "story-architect",
+        "market-evaluator",
+        "schema-architect",
+        "ontologist",
+        "worldsmith",
+        "plotter",
+        "event-simulator",
+        "discourse-planner",
+        "chapter-packer",
+        "scene-reasoner",
+        "novelist",
+        "auditor",
+        "committer",
+        "chapter-reviewer",
+        "polisher",
+    ];
+    let root = std::env::var("TIANQUAN_SOUL_TEST_BUNDLE_DIR").unwrap();
+    let bundle = PinnedRoleBundle::load_from_dir(
+        std::path::Path::new(&root),
+        PinnedRoleBundleSpec {
+            schema_version: "soul-catalog/1",
+            bundle_id: "novel-studio-souls",
+            version: "1.0.0",
+            marker: "SOUL-BUNDLE",
+            expected_roles: KINDS,
+            max_material_bytes: 16 * 1024,
+        },
+    )
+    .unwrap();
+    let denied = CapabilityId::new("tianquan-graph.import_graph").unwrap();
+    let mut base_capabilities = KINDS
+        .iter()
+        .flat_map(|kind| {
+            bundle
+                .role(kind)
+                .unwrap()
+                .allowed_capabilities
+                .iter()
+                .cloned()
+        })
+        .collect::<BTreeSet<_>>();
+    assert!(!base_capabilities.contains(&denied));
+    base_capabilities.insert(denied);
+
+    for kind in KINDS {
+        let role = bundle.role(kind).unwrap();
+        let profile_id = if *kind == "novelist" {
+            SUBAGENT_NOVELIST_PROFILE_ID
+        } else {
+            SUBAGENT_PLANNED_PROFILE_ID
+        };
+        let (request, tools) = capture_subagent_final_request_with_surface(
+            &format!("thread-{kind}-pinned-final-request"),
+            profile_id,
+            role.direction_markdown.clone(),
+            role.allowed_capabilities.clone(),
+            base_capabilities.clone(),
+            "tianquan-graph",
+        )
+        .await;
+
+        assert!(
+            request.messages.iter().any(|message| {
+                message.role == HostManagedModelMessageRole::System
+                    && message.content.contains(&role.direction_markdown)
+                    && message
+                        .content
+                        .contains("SOUL-BUNDLE novel-studio-souls/1.0.0")
+                    && message.content.contains("roleSha256=")
+                    && message.content.contains(&format!("kind={kind}"))
+            }),
+            "final system request must pin the {kind} role material"
+        );
+        assert!(request.messages.iter().any(|message| {
+            message.role == HostManagedModelMessageRole::User
+                && message.content.contains("SUBAGENT_GOAL_SENTINEL")
+        }));
+
+        let mut expected_tools = role.allowed_capabilities.clone();
+        expected_tools.insert(CapabilityId::new("ironclaw.loop.capability_info").unwrap());
+        assert_eq!(
+            tools.into_iter().collect::<BTreeSet<_>>(),
+            expected_tools,
+            "final tools for {kind} must equal the pinned role allowlist plus host introspection"
+        );
+    }
 }
 
 #[tokio::test]

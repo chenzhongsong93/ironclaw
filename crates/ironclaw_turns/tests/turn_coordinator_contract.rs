@@ -357,6 +357,45 @@ async fn prepare_turn_mints_ids_without_side_effects_and_submit_binds_requested_
 }
 
 #[tokio::test]
+async fn externally_prepared_run_id_is_reserved_to_its_exact_scope_before_submit() {
+    let (coordinator, store) = coordinator();
+    let owner_scope = scope("thread-external-prepared-run");
+    let requested = TurnRunId::new();
+    coordinator
+        .reserve_prepared_turn_id(owner_scope.clone(), requested)
+        .await
+        .expect("a server-prepared run id should reserve its scope");
+    coordinator
+        .reserve_prepared_turn_id(owner_scope.clone(), requested)
+        .await
+        .expect("an exact reservation replay should be idempotent");
+
+    let mut request = submit_request("thread-external-prepared-run", "idem-external-prepared");
+    request.requested_run_id = Some(requested);
+    let response = coordinator.submit_turn(request.clone()).await.unwrap();
+    assert_eq!(accepted_run_id(&response), requested);
+    assert!(
+        store
+            .get_run_record(&request.scope, requested)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let colliding = TurnRunId::new();
+    coordinator
+        .reserve_prepared_turn_id(owner_scope, colliding)
+        .await
+        .unwrap();
+    assert!(matches!(
+        coordinator
+            .reserve_prepared_turn_id(scope("thread-other-prepared-run"), colliding)
+            .await,
+        Err(TurnError::Unauthorized)
+    ));
+}
+
+#[tokio::test]
 async fn submit_turn_records_advisory_model_route_from_requested_model() {
     let (coordinator, _store) = coordinator();
     let mut request = submit_request("thread-model-select", "idem-model-select");

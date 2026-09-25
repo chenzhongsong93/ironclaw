@@ -7,7 +7,7 @@ use ironclaw_product_workflow::{
     WebUiGateResolution, WebUiInboundAttachment, WebUiInboundCommand, WebUiInboundValidationCode,
     WebUiResolveGateRequest, WebUiRetryRunRequest, WebUiSendMessageRequest,
 };
-use ironclaw_turns::SanitizedCancelReason;
+use ironclaw_turns::{SanitizedCancelReason, TurnRunId};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -85,6 +85,29 @@ fn send_message_maps_body_to_turn_scope_actor_and_content() {
 }
 
 #[test]
+fn send_message_preserves_optional_server_prepared_run_id() {
+    let run_id = TurnRunId::parse("0494c18b-c5e5-4d81-9ea8-6d2bdd93cc81").unwrap();
+    let request: WebUiSendMessageRequest = serde_json::from_value(json!({
+        "client_action_id":"send-prepared-run",
+        "thread_id":"thread-alpha",
+        "content":"只构建虚拟世界",
+        "requested_run_id":run_id
+    }))
+    .expect("optional server-prepared run id remains a typed boundary value");
+    assert_eq!(request.requested_run_id, Some(run_id));
+
+    let legacy: WebUiSendMessageRequest = serde_json::from_value(json!({
+        "client_action_id":"send-legacy-run",
+        "thread_id":"thread-alpha",
+        "content":"hello"
+    }))
+    .expect("pre-existing callers omit the optional run id");
+    assert_eq!(legacy.requested_run_id, None);
+    let legacy_wire = serde_json::to_value(&legacy).expect("legacy request serialization");
+    assert!(legacy_wire.get("requested_run_id").is_none());
+}
+
+#[test]
 fn send_message_carries_normalized_llm_subject_without_a_key() {
     let request: WebUiSendMessageRequest = serde_json::from_value(json!({
         "client_action_id": "send-subject",
@@ -112,6 +135,7 @@ fn send_message_drops_blank_llm_subject() {
             attachments: Vec::new(),
             model: None,
             llm_subject: Some(blank.to_string()),
+            requested_run_id: None,
         };
         let WebUiInboundCommand::SendMessage { llm_subject, .. } =
             request.into_command(caller()).expect("valid command")
@@ -132,6 +156,7 @@ fn send_message_carries_requested_model_and_drops_default_alias() {
         attachments: Vec::new(),
         model: Some("gpt-4o".to_string()),
         llm_subject: None,
+        requested_run_id: None,
     };
     let WebUiInboundCommand::SendMessage {
         requested_model, ..
@@ -151,6 +176,7 @@ fn send_message_carries_requested_model_and_drops_default_alias() {
             attachments: Vec::new(),
             model: Some(alias.to_string()),
             llm_subject: None,
+            requested_run_id: None,
         };
         let WebUiInboundCommand::SendMessage {
             requested_model, ..
@@ -381,6 +407,7 @@ fn command_serializes_with_stable_command_tag() {
         attachments: Vec::new(),
         model: None,
         llm_subject: None,
+        requested_run_id: None,
     };
     let command = request.into_command(caller()).expect("valid command");
 
@@ -400,6 +427,7 @@ fn token_fields_reject_control_characters() {
         attachments: Vec::new(),
         model: None,
         llm_subject: None,
+        requested_run_id: None,
     };
 
     let err = request.into_command(caller()).expect_err("control char");
@@ -485,6 +513,7 @@ fn send_with_attachments(attachments: Vec<WebUiInboundAttachment>) -> WebUiSendM
         attachments,
         model: None,
         llm_subject: None,
+        requested_run_id: None,
     }
 }
 

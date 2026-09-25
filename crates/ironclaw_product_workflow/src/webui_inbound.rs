@@ -170,6 +170,11 @@ pub struct WebUiSendMessageRequest {
     /// than falling back to the shared process key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_subject: Option<String>,
+    /// Server-prepared run identity used by trusted upstreams that must bind
+    /// scoped task state before this turn is admitted. Ordinary browser sends
+    /// omit it and keep the coordinator-generated run-id path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_run_id: Option<ironclaw_turns::TurnRunId>,
 }
 
 impl WebUiSendMessageRequest {

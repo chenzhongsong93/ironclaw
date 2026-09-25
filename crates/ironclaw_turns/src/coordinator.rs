@@ -121,6 +121,17 @@ pub trait TurnCoordinator: Send + Sync {
     /// implementation so every coordinator opts into prepared-run semantics.
     async fn prepare_turn(&self, scope: TurnScope) -> Result<TurnRunId, TurnError>;
 
+    /// Reserve a caller-generated run ID against its canonical scope before
+    /// submit. Product adapters use this only when a trusted upstream must
+    /// bind durable task state before the run is queued.
+    async fn reserve_prepared_turn_id(
+        &self,
+        _scope: TurnScope,
+        _run_id: TurnRunId,
+    ) -> Result<(), TurnError> {
+        Err(TurnError::Unauthorized)
+    }
+
     /// Release a run id minted by `prepare_turn` when the caller fails before
     /// submitting it. Coordinators without a prepared-id cache can treat this
     /// as a no-op.
@@ -211,6 +222,13 @@ where
             Ok(prepared) => prepared,
             Err(poisoned) => poisoned.into_inner(),
         };
+        if let Some(existing_scope) = prepared.get(&run_id) {
+            return if existing_scope == &scope {
+                Ok(())
+            } else {
+                Err(TurnError::Unauthorized)
+            };
+        }
         if prepared.len() >= MAX_PREPARED_RUN_IDS {
             return Err(TurnError::CapacityExceeded {
                 resource: TurnCapacityResource::SubmitTurn,
@@ -304,6 +322,14 @@ where
         let run_id = TurnRunId::new();
         self.record_prepared_run_id(run_id, scope)?;
         Ok(run_id)
+    }
+
+    async fn reserve_prepared_turn_id(
+        &self,
+        scope: TurnScope,
+        run_id: TurnRunId,
+    ) -> Result<(), TurnError> {
+        self.record_prepared_run_id(run_id, scope)
     }
 
     async fn abort_prepared_turn(&self, run_id: TurnRunId) -> Result<(), TurnError> {
@@ -562,6 +588,14 @@ impl<C> TurnCoordinator for Arc<C>
 where
     C: TurnCoordinator + ?Sized,
 {
+    async fn reserve_prepared_turn_id(
+        &self,
+        scope: TurnScope,
+        run_id: TurnRunId,
+    ) -> Result<(), TurnError> {
+        self.as_ref().reserve_prepared_turn_id(scope, run_id).await
+    }
+
     async fn prepare_turn(&self, scope: TurnScope) -> Result<TurnRunId, TurnError> {
         self.as_ref().prepare_turn(scope).await
     }

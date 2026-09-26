@@ -488,6 +488,7 @@ fn unique_temp_path(
     Ok(parent.join(format!(".{name}.tmp.{counter}")))
 }
 
+#[cfg(not(windows))]
 async fn sync_parent_dir(virtual_path: &VirtualPath, parent: &Path) -> Result<(), FilesystemError> {
     let dir = tokio::fs::File::open(parent)
         .await
@@ -495,6 +496,18 @@ async fn sync_parent_dir(virtual_path: &VirtualPath, parent: &Path) -> Result<()
     dir.sync_all()
         .await
         .map_err(|error| io_error(virtual_path.clone(), FilesystemOperation::WriteFile, error))
+}
+
+#[cfg(windows)]
+fn sync_parent_dir(
+    _virtual_path: &VirtualPath,
+    _parent: &Path,
+) -> impl std::future::Future<Output = Result<(), FilesystemError>> {
+    // Tokio's portable File wrapper cannot open a Windows directory handle for
+    // FlushFileBuffers. The file contents were already synced before the
+    // atomic install; reporting a post-commit directory-sync failure would
+    // make callers retry an already-created CAS target and misreport success.
+    std::future::ready(Ok(()))
 }
 
 async fn ensure_existing_ancestor_contained(
@@ -583,6 +596,55 @@ fn io_reason(error: std::io::Error) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn disk_filesystem_absent_cas_creates_atomically_and_rejects_replay() {
+        let storage = tempdir().expect("tempdir");
+        let mut filesystem = DiskFilesystem::new();
+        filesystem
+            .mount_local(
+                VirtualPath::new("/projects").expect("virtual root"),
+                HostPath::from_path_buf(storage.path().to_path_buf()),
+            )
+            .expect("mount temporary local root");
+        let path = VirtualPath::new("/projects/system/skills/.ironclaw-reborn-bundled.lock")
+            .expect("bundled skill lock path");
+
+        let first = filesystem
+            .put(
+                &path,
+                Entry::bytes(b"lock-owner".to_vec()),
+                CasExpectation::Absent,
+            )
+            .await;
+        if first.is_err() {
+            let installed = std::fs::read(
+                storage
+                    .path()
+                    .join("system/skills/.ironclaw-reborn-bundled.lock"),
+            )
+            .expect("the CAS target exists if the error happened after installation");
+            assert_eq!(installed, b"lock-owner");
+        }
+        first.expect("first absent-CAS write should work on the local filesystem");
+        assert_eq!(
+            filesystem
+                .read_file(&path)
+                .await
+                .expect("read installed lock"),
+            b"lock-owner"
+        );
+        assert!(matches!(
+            filesystem
+                .put(
+                    &path,
+                    Entry::bytes(b"other-owner".to_vec()),
+                    CasExpectation::Absent
+                )
+                .await,
+            Err(FilesystemError::VersionMismatch { .. })
+        ));
+    }
 
     #[tokio::test]
     #[tracing_test::traced_test]

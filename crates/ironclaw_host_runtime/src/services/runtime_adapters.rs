@@ -375,6 +375,18 @@ where
                     invocation: McpInvocation {
                         input: request.input,
                     },
+                    trusted_context: match (
+                        request.authenticated_actor_user_id.clone(),
+                        request.run_id,
+                    ) {
+                        (None, None) => None,
+                        (authenticated_actor_user_id, run_id) => {
+                            Some(ironclaw_mcp::McpTrustedExecutionContext {
+                                authenticated_actor_user_id,
+                                run_id,
+                            })
+                        }
+                    },
                 },
             )
             .await
@@ -1011,7 +1023,10 @@ fn dispatch_error_for_runtime(
     kind: RuntimeDispatchErrorKind,
 ) -> DispatchError {
     match runtime {
-        RuntimeKind::Mcp => DispatchError::Mcp { kind, safe_summary: None },
+        RuntimeKind::Mcp => DispatchError::Mcp {
+            kind,
+            safe_summary: None,
+        },
         RuntimeKind::Script => DispatchError::Script { kind },
         RuntimeKind::Wasm => DispatchError::Wasm {
             kind,

@@ -71,6 +71,7 @@ pub(crate) async fn discover_hosted_mcp_package(
             url,
             input: serde_json::Value::Null,
             max_output_bytes: MCP_RESPONSE_BODY_LIMIT,
+            trusted_context: None,
         })
         .await
         .map_err(|error| HostedMcpDiscoveryError::Transient(error.stable_reason().to_string()))?;

@@ -429,14 +429,15 @@ mod tests {
         };
         use ironclaw_turns::run_profile::{
             AgentLoopHostError, CapabilityBatchInvocation, CapabilityDescriptorView,
-            CapabilityInputRef, CapabilityInvocation, CapabilitySurfaceVersion, ConcurrencyHint,
-            LoopCapabilityPort, LoopDriverId, ProviderToolDefinition, VisibleCapabilityRequest,
-            VisibleCapabilitySurface, resolution,
+            CapabilityInputRef, CapabilityInvocation, CapabilitySurfaceProfileId,
+            CapabilitySurfaceVersion, ConcurrencyHint, LoopCapabilityPort, LoopDriverId,
+            ProviderToolDefinition, VisibleCapabilityRequest, VisibleCapabilitySurface, resolution,
         };
         use ironclaw_turns::{LoopResultRef, RunProfileId, RunProfileVersion};
 
         use crate::planned_driver_factory::{
-            PLANNED_DRIVER_DEFAULT_VERSION, SUBAGENT_PLANNED_DRIVER_ID, SUBAGENT_PLANNED_PROFILE_ID,
+            PLANNED_DRIVER_DEFAULT_VERSION, SUBAGENT_CAPABILITY_SURFACE_PROFILE_ID,
+            SUBAGENT_PLANNED_DRIVER_ID, SUBAGENT_PLANNED_PROFILE_ID,
         };
         use crate::subagent::capability_surface::SubagentCapabilitySurfaceResolver;
         use crate::subagent::flavors::{SubagentFlavorId, lookup_flavor};
@@ -580,6 +581,9 @@ mod tests {
                 LoopDriverId::new(SUBAGENT_PLANNED_DRIVER_ID).expect("subagent driver id");
             context.resolved_run_profile.loop_driver.version =
                 RunProfileVersion::new(PLANNED_DRIVER_DEFAULT_VERSION);
+            context.resolved_run_profile.capability_surface_profile_id =
+                CapabilitySurfaceProfileId::new(SUBAGENT_CAPABILITY_SURFACE_PROFILE_ID)
+                    .expect("subagent capability surface id");
             goal_store
                 .put_goal(
                     &context.scope,

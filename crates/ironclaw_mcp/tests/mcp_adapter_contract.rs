@@ -1,11 +1,16 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac};
 use ironclaw_extensions::*;
 use ironclaw_host_api::*;
 use ironclaw_mcp::*;
 use ironclaw_resources::*;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[tokio::test]
 async fn mcp_runtime_reserves_calls_adapter_and_reconciles_success() {
@@ -39,6 +44,7 @@ async fn mcp_runtime_reserves_calls_adapter_and_reconciles_success() {
                     .set_process_count(1)
                     .set_output_bytes(10_000),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation {
                     input: json!({"query": "ironclaw"}),
                 },
@@ -95,6 +101,7 @@ async fn mcp_runtime_requires_host_mediated_egress_for_http_transports() {
                 scope: sample_scope(),
                 estimate: ResourceEstimate::default(),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation { input: json!({}) },
             },
         )
@@ -182,6 +189,7 @@ async fn concrete_mcp_http_client_routes_json_rpc_through_shared_egress() {
                 "credential_injections": [{"handle": "evil-token"}]
             }),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .unwrap();
@@ -302,6 +310,7 @@ async fn concrete_mcp_http_client_maps_upstream_auth_status_to_auth_required() {
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .expect_err("upstream MCP auth failures must become auth-required errors");
@@ -331,6 +340,7 @@ async fn concrete_mcp_http_client_uses_negotiated_protocol_version_header() {
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .unwrap();
@@ -369,6 +379,7 @@ async fn concrete_mcp_http_client_reuses_rotated_session_id_after_initialized() 
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .unwrap();
@@ -407,6 +418,7 @@ async fn concrete_mcp_http_client_rejects_missing_or_unsafe_initialize_protocol_
                 url: Some("https://mcp.example.test/mcp".to_string()),
                 input: json!({"query": "ironclaw"}),
                 max_output_bytes: 4096,
+                trusted_context: None,
             })
             .await
             .expect_err("unsafe initialize protocol versions must fail the call");
@@ -447,6 +459,7 @@ async fn concrete_mcp_http_client_sends_credentials_only_for_tool_call_exchange(
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .expect_err("direct secret-store leases must fail before MCP transport");
@@ -470,6 +483,7 @@ async fn concrete_mcp_http_client_sends_credentials_only_for_tool_call_exchange(
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .expect("failed direct-lease preflight must not poison later MCP session state");
@@ -511,6 +525,7 @@ async fn concrete_mcp_http_client_scopes_session_ids_per_invocation() {
                 url: Some("https://mcp.example.test/mcp".to_string()),
                 input: json!({"query": user}),
                 max_output_bytes: 4096,
+                trusted_context: None,
             })
             .await
             .unwrap();
@@ -560,6 +575,7 @@ async fn concrete_mcp_http_client_clears_session_ids_between_calls() {
                 url: Some("https://mcp.example.test/mcp".to_string()),
                 input: json!({"query": query}),
                 max_output_bytes: 4096,
+                trusted_context: None,
             })
             .await
             .unwrap();
@@ -599,6 +615,7 @@ async fn concrete_mcp_http_client_does_not_reuse_session_from_failed_initialize(
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "first"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .expect_err("failed initialize responses must fail the call");
@@ -615,6 +632,7 @@ async fn concrete_mcp_http_client_does_not_reuse_session_from_failed_initialize(
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "second"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .unwrap();
@@ -650,6 +668,7 @@ async fn concrete_mcp_http_client_rejects_json_rpc_response_without_matching_id(
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .expect_err("ID-bearing JSON-RPC requests must reject missing response ids");
@@ -677,6 +696,7 @@ async fn mcp_runtime_with_concrete_http_client_consumes_shared_egress_end_to_end
                 scope: sample_scope(),
                 estimate: ResourceEstimate::default(),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation {
                     input: json!({"query": "ironclaw"}),
                 },
@@ -718,6 +738,7 @@ async fn concrete_mcp_sse_client_parses_event_stream_through_shared_egress() {
             url: Some("https://mcp.example.test/sse".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .unwrap();
@@ -749,6 +770,7 @@ async fn concrete_mcp_http_client_discovers_tool_schemas_through_shared_egress()
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .unwrap();
@@ -826,6 +848,7 @@ async fn concrete_mcp_http_client_discovers_tool_schemas_over_sse_framing() {
             url: Some("https://mcp.example.test/sse".to_string()),
             input: json!({}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .unwrap();
@@ -845,6 +868,7 @@ async fn concrete_mcp_http_client_discovers_tool_schemas_over_sse_framing() {
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .unwrap();
@@ -874,6 +898,7 @@ async fn concrete_mcp_http_client_maps_discovery_auth_status_to_auth_required() 
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .expect_err("upstream MCP discovery auth failures must stay typed");
@@ -902,6 +927,7 @@ async fn concrete_mcp_http_client_caps_missing_plan_limit_to_client_output_limit
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 1_234,
+            trusted_context: None,
         })
         .await
         .unwrap();
@@ -911,6 +937,260 @@ async fn concrete_mcp_http_client_caps_missing_plan_limit_to_client_output_limit
             .requests()
             .iter()
             .all(|request| request.response_body_limit == Some(1_234))
+    );
+}
+
+#[tokio::test]
+async fn concrete_mcp_http_client_keeps_trusted_context_out_of_tool_arguments() {
+    let egress = RecordingRuntimeEgress::json_rpc();
+    let client = McpHostHttpClient::new(
+        McpRuntimeHttpAdapter::new(Arc::new(egress.clone())),
+        StaticMcpHostHttpEgressPlanner::new(host_http_plan()),
+    );
+    let input = json!({
+        "query":"read world",
+        "runId":"model-forged-run",
+        "authenticatedActorUserId":"model-forged-user"
+    });
+
+    client
+        .call_tool(McpClientRequest {
+            provider: ExtensionId::new("github-mcp").unwrap(),
+            capability_id: CapabilityId::new("github-mcp.search").unwrap(),
+            scope: sample_scope(),
+            transport: "http".to_string(),
+            command: None,
+            args: vec![],
+            url: Some("https://mcp.example.test/mcp".to_string()),
+            input: input.clone(),
+            max_output_bytes: 4096,
+            trusted_context: Some(McpTrustedExecutionContext {
+                authenticated_actor_user_id: Some(UserId::new("host-user").unwrap()),
+                run_id: Some(RunId::new()),
+            }),
+        })
+        .await
+        .unwrap();
+
+    let call = egress
+        .requests()
+        .into_iter()
+        .find(|request| json_rpc_method(&request.body) == "tools/call")
+        .expect("MCP client must send tools/call");
+    let json_rpc: serde_json::Value = serde_json::from_slice(&call.body).unwrap();
+    assert_eq!(json_rpc["params"]["arguments"], input);
+    assert!(call.headers.iter().all(|(name, _)| {
+        !name.eq_ignore_ascii_case("X-IronClaw-Run-Id")
+            && !name.eq_ignore_ascii_case("X-IronClaw-Actor-User-Id")
+    }));
+}
+
+#[tokio::test]
+async fn tianquan_context_signer_targets_only_internal_route_and_binds_each_http_request() {
+    const SECRET: &[u8] = b"test-only-key-with-at-least-32-bytes";
+    const AUDIENCE: &str = "http://tianquan-api.test:3002/mcp/internal";
+    let egress = RecordingRuntimeEgress::json_rpc();
+    let signer = McpTrustedContextSigner::new(
+        ExtensionId::new("tianquan-graph").unwrap(),
+        SECRET.to_vec(),
+        AUDIENCE.to_string(),
+    )
+    .unwrap();
+    let client = McpHostHttpClient::new(
+        McpRuntimeHttpAdapter::new(Arc::new(egress.clone())),
+        StaticMcpHostHttpEgressPlanner::new(host_http_plan()),
+    )
+    .with_trusted_context_signer(signer);
+    let raw_input = json!({
+        "query":"read world",
+        "runId":"model-forged-run",
+        "authenticatedActorUserId":"model-forged-user"
+    });
+    let host_run = RunId::new();
+
+    client
+        .call_tool(McpClientRequest {
+            provider: ExtensionId::new("tianquan-graph").unwrap(),
+            capability_id: CapabilityId::new("tianquan-graph.get_world").unwrap(),
+            scope: sample_scope_for_user("host-user"),
+            transport: "http".to_string(),
+            command: None,
+            args: vec![],
+            url: Some("http://tianquan-api.test:3002/mcp".to_string()),
+            input: raw_input.clone(),
+            max_output_bytes: 4096,
+            trusted_context: Some(McpTrustedExecutionContext {
+                authenticated_actor_user_id: Some(UserId::new("host-user").unwrap()),
+                run_id: Some(host_run),
+            }),
+        })
+        .await
+        .unwrap();
+
+    let requests = egress.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "initialize, notification, and call are sent"
+    );
+    let mut nonces = std::collections::HashSet::new();
+    for request in &requests {
+        assert_eq!(
+            request.url, AUDIENCE,
+            "only trusted TQ calls use internal route"
+        );
+        assert_eq!(request.method, NetworkMethod::Post);
+        let payload = request
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-tianquan-execution-context"))
+            .map(|(_, value)| value)
+            .expect("internal request must have signed context payload");
+        let signature = request
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-tianquan-execution-signature"))
+            .map(|(_, value)| value)
+            .expect("internal request must have signed context signature");
+        let decoded = URL_SAFE_NO_PAD.decode(payload).unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(claims["version"], 1);
+        assert_eq!(claims["actorUserId"], "host-user");
+        assert_eq!(claims["runId"], host_run.to_string());
+        assert_eq!(claims["projectId"], "project1");
+        assert_eq!(claims["audience"], AUDIENCE);
+        let nonce = claims["nonce"].as_str().unwrap();
+        assert!(
+            nonces.insert(nonce.to_string()),
+            "nonce must be unique per HTTP request"
+        );
+
+        let body_hash = hex::encode(Sha256::digest(&request.body));
+        let session_id = request
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("mcp-session-id"))
+            .map_or("", |(_, value)| value.as_str());
+        let canonical =
+            format!("TQ-MCP-CONTEXT-V1\nPOST\n/mcp/internal\n{body_hash}\n{payload}\n{session_id}");
+        let mut mac = HmacSha256::new_from_slice(SECRET).unwrap();
+        mac.update(canonical.as_bytes());
+        mac.verify_slice(&hex::decode(signature).unwrap())
+            .expect("signature must bind the actual JSON-RPC request and session");
+    }
+
+    let call = requests
+        .iter()
+        .find(|request| json_rpc_method(&request.body) == "tools/call")
+        .expect("MCP client must send tools/call");
+    let json_rpc: serde_json::Value = serde_json::from_slice(&call.body).unwrap();
+    assert_eq!(json_rpc["params"]["arguments"], raw_input);
+}
+
+#[tokio::test]
+async fn tianquan_context_policy_fails_closed_without_key_and_never_signs_other_providers() {
+    let provider = ExtensionId::new("tianquan-graph").unwrap();
+    let unconfigured = McpTrustedContextSigner::unconfigured(provider.clone());
+    let failed_egress = RecordingRuntimeEgress::json_rpc();
+    let failed_client = McpHostHttpClient::new(
+        McpRuntimeHttpAdapter::new(Arc::new(failed_egress.clone())),
+        StaticMcpHostHttpEgressPlanner::new(host_http_plan()),
+    )
+    .with_trusted_context_signer(unconfigured);
+    let error = failed_client
+        .call_tool(McpClientRequest {
+            provider: provider.clone(),
+            capability_id: CapabilityId::new("tianquan-graph.get_world").unwrap(),
+            scope: sample_scope_for_user("host-user"),
+            transport: "http".to_string(),
+            command: None,
+            args: vec![],
+            url: Some("http://tianquan-api.test:3002/mcp".to_string()),
+            input: json!({}),
+            max_output_bytes: 4096,
+            trusted_context: Some(McpTrustedExecutionContext {
+                authenticated_actor_user_id: Some(UserId::new("host-user").unwrap()),
+                run_id: Some(RunId::new()),
+            }),
+        })
+        .await
+        .expect_err("missing signing configuration must not fall back to legacy MCP");
+    assert_eq!(
+        error.stable_reason(),
+        "mcp_trusted_context_signer_unavailable"
+    );
+    assert!(failed_egress.requests().is_empty());
+
+    let egress = RecordingRuntimeEgress::json_rpc();
+    let signer = McpTrustedContextSigner::new(
+        provider.clone(),
+        b"test-only-key-with-at-least-32-bytes".to_vec(),
+        "http://tianquan-api.test:3002/mcp/internal".to_string(),
+    )
+    .unwrap();
+    let mismatch_egress = RecordingRuntimeEgress::json_rpc();
+    let mismatch_client = McpHostHttpClient::new(
+        McpRuntimeHttpAdapter::new(Arc::new(mismatch_egress.clone())),
+        StaticMcpHostHttpEgressPlanner::new(host_http_plan()),
+    )
+    .with_trusted_context_signer(signer.clone());
+    let error = mismatch_client
+        .call_tool(McpClientRequest {
+            provider: provider.clone(),
+            capability_id: CapabilityId::new("tianquan-graph.get_world").unwrap(),
+            scope: sample_scope_for_user("host-user"),
+            transport: "http".to_string(),
+            command: None,
+            args: vec![],
+            url: Some("http://tianquan-api.test:3002/mcp".to_string()),
+            input: json!({}),
+            max_output_bytes: 4096,
+            trusted_context: Some(McpTrustedExecutionContext {
+                authenticated_actor_user_id: Some(UserId::new("different-user").unwrap()),
+                run_id: Some(RunId::new()),
+            }),
+        })
+        .await
+        .expect_err("actor identity must match the host resource scope");
+    assert_eq!(error.stable_reason(), "mcp_invalid_trusted_context");
+    assert!(mismatch_egress.requests().is_empty());
+
+    let client = McpHostHttpClient::new(
+        McpRuntimeHttpAdapter::new(Arc::new(egress.clone())),
+        StaticMcpHostHttpEgressPlanner::new(host_http_plan()),
+    )
+    .with_trusted_context_signer(signer);
+    client
+        .call_tool(McpClientRequest {
+            provider: ExtensionId::new("github-mcp").unwrap(),
+            capability_id: CapabilityId::new("github-mcp.search").unwrap(),
+            scope: sample_scope_for_user("host-user"),
+            transport: "http".to_string(),
+            command: None,
+            args: vec![],
+            url: Some("https://mcp.example.test/mcp".to_string()),
+            input: json!({"q":"safe"}),
+            max_output_bytes: 4096,
+            trusted_context: Some(McpTrustedExecutionContext {
+                authenticated_actor_user_id: Some(UserId::new("host-user").unwrap()),
+                run_id: Some(RunId::new()),
+            }),
+        })
+        .await
+        .unwrap();
+    assert!(
+        egress
+            .requests()
+            .iter()
+            .all(|request| request.headers.iter().all(|(name, _)| !name
+                .eq_ignore_ascii_case("x-tianquan-execution-context")
+                && !name.eq_ignore_ascii_case("x-tianquan-execution-signature")))
+    );
+    assert!(
+        egress
+            .requests()
+            .iter()
+            .all(|request| request.url == "https://mcp.example.test/mcp")
     );
 }
 
@@ -932,6 +1212,7 @@ async fn concrete_mcp_http_client_rejects_invalid_session_id_before_reuse() {
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .expect_err("invalid upstream session ids must not be reused as request headers");
@@ -957,6 +1238,7 @@ async fn concrete_mcp_http_client_sanitizes_shared_egress_failures() {
             url: Some("https://mcp.example.test/mcp".to_string()),
             input: json!({"query": "ironclaw"}),
             max_output_bytes: 4096,
+            trusted_context: None,
         })
         .await
         .expect_err("raw shared-egress errors must not leak through the MCP client");
@@ -982,6 +1264,7 @@ async fn mcp_runtime_fails_closed_for_external_stdio_process_egress() {
                 scope: sample_scope(),
                 estimate: ResourceEstimate::default(),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation { input: json!({}) },
             },
         )
@@ -1016,6 +1299,7 @@ async fn mcp_runtime_denies_budget_before_adapter_call() {
                 scope,
                 estimate: ResourceEstimate::default().set_output_bytes(10_000),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation { input: json!({}) },
             },
         )
@@ -1045,6 +1329,7 @@ async fn mcp_runtime_releases_reservation_when_adapter_fails() {
                 scope,
                 estimate: ResourceEstimate::default().set_concurrency_slots(1),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation { input: json!({}) },
             },
         )
@@ -1073,6 +1358,7 @@ async fn mcp_runtime_preserves_adapter_error_when_release_cleanup_fails() {
                 scope: sample_scope(),
                 estimate: ResourceEstimate::default().set_concurrency_slots(1),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation { input: json!({}) },
             },
         )
@@ -1107,6 +1393,7 @@ async fn mcp_runtime_rejects_non_mcp_or_undeclared_capability_before_reserving()
                 scope: scope.clone(),
                 estimate: ResourceEstimate::default().set_concurrency_slots(1),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation { input: json!({}) },
             },
         )
@@ -1129,6 +1416,7 @@ async fn mcp_runtime_rejects_non_mcp_or_undeclared_capability_before_reserving()
                 scope,
                 estimate: ResourceEstimate::default().set_concurrency_slots(1),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation { input: json!({}) },
             },
         )
@@ -1169,6 +1457,7 @@ async fn mcp_runtime_enforces_output_limit_and_releases_reservation() {
                     .set_concurrency_slots(1)
                     .set_output_bytes(10_000),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation { input: json!({}) },
             },
         )
@@ -1209,6 +1498,7 @@ async fn mcp_runtime_can_enforce_client_reported_output_size_without_serializing
                     .set_concurrency_slots(1)
                     .set_output_bytes(10_000),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation { input: json!({}) },
             },
         )
@@ -1252,6 +1542,7 @@ async fn mcp_runtime_rejects_output_when_adapter_under_reports_size() {
                     .set_concurrency_slots(1)
                     .set_output_bytes(10_000),
                 resource_reservation: None,
+                trusted_context: None,
                 invocation: McpInvocation { input: json!({}) },
             },
         )

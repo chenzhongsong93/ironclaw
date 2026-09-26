@@ -167,6 +167,25 @@ impl crate::AwaitEdgeWriter for AlwaysRecoveringAwaitEdgeWriter {
         self.inner.record_awaited_child(record).await
     }
 
+    async fn record_child_submitted(
+        &self,
+        child_scope: &TurnScope,
+        parent_run_id: TurnRunId,
+        child_run_id: TurnRunId,
+        subagent_kind: &SubagentKindId,
+        submitted_at: ironclaw_turns::TurnTimestamp,
+    ) {
+        self.inner
+            .record_child_submitted(
+                child_scope,
+                parent_run_id,
+                child_run_id,
+                subagent_kind,
+                submitted_at,
+            )
+            .await;
+    }
+
     async fn abandon_awaited_child(
         &self,
         child_scope: &TurnScope,
@@ -212,7 +231,6 @@ enum PostPlaceholderFailureStage {
     RecordAwaitedChild,
     AcceptInboundMessage,
     SubmitChildRun,
-    MarkMessageSubmitted,
 }
 
 struct FailingSpawnThreadService {
@@ -838,6 +856,16 @@ impl crate::AwaitEdgeWriter for FailingAwaitEdgeWriter {
             AgentLoopHostErrorKind::Unavailable,
             "forced record_awaited_child failure",
         ))
+    }
+
+    async fn record_child_submitted(
+        &self,
+        _child_scope: &TurnScope,
+        _parent_run_id: TurnRunId,
+        _child_run_id: TurnRunId,
+        _subagent_kind: &SubagentKindId,
+        _submitted_at: ironclaw_turns::TurnTimestamp,
+    ) {
     }
 
     async fn abandon_awaited_child(
@@ -2775,7 +2803,8 @@ async fn invoke_capability_batch_stops_on_first_spawn_suspension_when_requested(
     let trace_root = tempfile::tempdir().expect("isolated trace root");
     let _trace_root_guard = TraceRootGuard::set(trace_root.path());
     let context = test_run_context_with_agent_actor("spawn-batch-stop").await;
-    let run_id = context.run_id.to_string();
+    let parent_run_id = context.run_id;
+    let run_id = parent_run_id.to_string();
     let actor = context.actor.clone().unwrap();
     let turn_store = Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0))));
     let child_runs = Arc::new(RecordingChildRuns::default());
@@ -2858,6 +2887,19 @@ async fn invoke_capability_batch_stops_on_first_spawn_suspension_when_requested(
     assert!(goal_store.deletes().is_empty());
     assert_eq!(goal_store.puts().len(), 1);
     assert_eq!(gate_store.records().len(), 1);
+    let submitted_children = gate_store.submitted_children();
+    assert_eq!(submitted_children.len(), 1);
+    assert_eq!(submitted_children[0].0, parent_run_id);
+    assert_eq!(
+        submitted_children[0].1,
+        child_requests[0]
+            .requested_run_id
+            .expect("requested child run id")
+    );
+    assert_eq!(
+        submitted_children[0].2,
+        gate_store.records()[0].subagent_kind.to_string()
+    );
     assert_eq!(result_writer.writes().len(), 1);
     assert!(
         result_writer.updates().is_empty(),
@@ -2987,7 +3029,6 @@ async fn invoke_spawn_compensates_every_post_placeholder_failure_stage() {
         PostPlaceholderFailureStage::RecordAwaitedChild,
         PostPlaceholderFailureStage::AcceptInboundMessage,
         PostPlaceholderFailureStage::SubmitChildRun,
-        PostPlaceholderFailureStage::MarkMessageSubmitted,
     ] {
         let context = test_run_context_with_agent_actor("spawn-post-placeholder-failure").await;
         let result_writer = Arc::new(RecordingResultWriter::default());
@@ -2998,9 +3039,6 @@ async fn invoke_spawn_compensates_every_post_placeholder_failure_stage() {
             )),
             PostPlaceholderFailureStage::AcceptInboundMessage => Arc::new(
                 FailingSpawnThreadService::new(SpawnThreadFailurePoint::AcceptInboundMessage),
-            ),
-            PostPlaceholderFailureStage::MarkMessageSubmitted => Arc::new(
-                FailingSpawnThreadService::new(SpawnThreadFailurePoint::MarkMessageSubmitted),
             ),
             PostPlaceholderFailureStage::PutGoal
             | PostPlaceholderFailureStage::RecordAwaitedChild

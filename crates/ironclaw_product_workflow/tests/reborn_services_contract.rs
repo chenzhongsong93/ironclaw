@@ -57,9 +57,9 @@ use ironclaw_product_workflow::{
     RebornAutomationState, RebornChannelConnectAction, RebornChannelConnectStrategy,
     RebornConnectableChannelInfo, RebornCreateProjectRequest, RebornDeleteProjectRequest,
     RebornDeleteThreadRequest, RebornExtensionOnboardingState, RebornFsListRequest,
-    RebornGetProjectRequest, RebornGetRunStateRequest, RebornListMembersRequest,
-    RebornListMembersResponse, RebornListProjectsRequest, RebornListProjectsResponse,
-    RebornLogLevel, RebornLogQueryRequest, RebornLogQueryResponse,
+    RebornGetProjectRequest, RebornGetRunStateRequest, RebornGetThreadPlanRequest,
+    RebornListMembersRequest, RebornListMembersResponse, RebornListProjectsRequest,
+    RebornListProjectsResponse, RebornLogLevel, RebornLogQueryRequest, RebornLogQueryResponse,
     RebornOperatorConfigDiagnosticSeverity, RebornOperatorConfigSetRequest,
     RebornOperatorLogsQuery, RebornOperatorSetupRequest, RebornOperatorSetupStatus,
     RebornOperatorStatusCheck, RebornOperatorStatusResponse, RebornOperatorStatusSeverity,
@@ -259,6 +259,7 @@ async fn setup_owned_thread(
 
 struct FakeTurnCoordinator {
     submissions: Mutex<Vec<SubmitTurnRequest>>,
+    prepared_run_ids: Mutex<Vec<(TurnScope, TurnRunId)>>,
     cancellations: Mutex<Vec<CancelRunRequest>>,
     resumptions: Mutex<Vec<ResumeTurnRequest>>,
     retries: Mutex<Vec<RetryTurnRequest>>,
@@ -281,6 +282,7 @@ impl Default for FakeTurnCoordinator {
     fn default() -> Self {
         Self {
             submissions: Mutex::default(),
+            prepared_run_ids: Mutex::default(),
             cancellations: Mutex::default(),
             resumptions: Mutex::default(),
             retries: Mutex::default(),
@@ -371,6 +373,10 @@ impl FakeTurnCoordinator {
 
     fn submission_count(&self) -> usize {
         self.submissions.lock().expect("lock").len()
+    }
+
+    fn last_prepared_run_id(&self) -> Option<(TurnScope, TurnRunId)> {
+        self.prepared_run_ids.lock().expect("lock").last().cloned()
     }
 
     fn cancellation_count(&self) -> usize {
@@ -467,6 +473,18 @@ impl TurnCoordinator for FakeTurnCoordinator {
         Ok(TurnRunId::new())
     }
 
+    async fn reserve_prepared_turn_id(
+        &self,
+        scope: TurnScope,
+        run_id: TurnRunId,
+    ) -> Result<(), TurnError> {
+        self.prepared_run_ids
+            .lock()
+            .expect("lock")
+            .push((scope, run_id));
+        Ok(())
+    }
+
     async fn submit_turn(
         &self,
         request: SubmitTurnRequest,
@@ -474,10 +492,11 @@ impl TurnCoordinator for FakeTurnCoordinator {
         if let Some(error) = self.submit_error.lock().expect("lock").take() {
             return Err(error);
         }
+        let run_id = request.requested_run_id.unwrap_or_default();
         self.submissions.lock().expect("lock").push(request.clone());
         Ok(SubmitTurnResponse::Accepted {
             turn_id: TurnId::new(),
-            run_id: TurnRunId::new(),
+            run_id,
             status: TurnStatus::Queued,
             resolved_run_profile_id: RunProfileId::default_profile(),
             resolved_run_profile_version: RunProfileVersion::new(1),
@@ -2420,6 +2439,69 @@ async fn create_thread_scopes_to_authorized_project() {
 }
 
 #[tokio::test]
+async fn submit_turn_adopts_only_an_authorized_project_scope() {
+    let threads: Arc<dyn SessionThreadService> = Arc::new(InMemorySessionThreadService::default());
+    let coordinator = Arc::new(FakeTurnCoordinator::default());
+    let services = RebornServices::new(threads, coordinator.clone()).with_project_service(
+        Arc::new(AuthorizingProjectService {
+            allowed_project_id: "project-scoped".to_string(),
+        }),
+    );
+    let default_caller = caller_with_project(Some("project-alpha"));
+    services
+        .create_thread(
+            default_caller.clone(),
+            serde_json::from_value::<WebUiCreateThreadRequest>(json!({
+                "client_action_id": "create-scoped-send",
+                "requested_thread_id": "thread-scoped-send",
+                "project_id": "project-scoped"
+            }))
+            .expect("request"),
+        )
+        .await
+        .expect("authorized scoped thread creation");
+
+    services
+        .submit_turn(
+            default_caller.clone(),
+            serde_json::from_value::<WebUiSendMessageRequest>(json!({
+                "client_action_id": "send-scoped",
+                "thread_id": "thread-scoped-send",
+                "content": "scoped message",
+                "project_id": "project-scoped"
+            }))
+            .expect("request"),
+        )
+        .await
+        .expect("authorized project scope on the turn");
+    assert_eq!(
+        coordinator
+            .last_submission_scope()
+            .expect("submitted scope")
+            .project_id
+            .expect("project scope")
+            .as_str(),
+        "project-scoped"
+    );
+
+    let error = services
+        .submit_turn(
+            default_caller,
+            serde_json::from_value::<WebUiSendMessageRequest>(json!({
+                "client_action_id": "send-forbidden-scope",
+                "thread_id": "thread-scoped-send",
+                "content": "must not dispatch",
+                "project_id": "project-forbidden"
+            }))
+            .expect("request"),
+        )
+        .await
+        .expect_err("unowned project scope must fail before dispatch");
+    assert_eq!(error.code, RebornServicesErrorCode::NotFound);
+    assert_eq!(coordinator.submission_count(), 1);
+}
+
+#[tokio::test]
 async fn create_thread_rejects_unauthorized_project() {
     let services = RebornServices::new(
         Arc::new(InMemorySessionThreadService::default()),
@@ -2601,6 +2683,80 @@ async fn submit_turn_uses_facade_and_thread_history_without_route_store_access()
         Some(TurnOriginKind::WebUi),
         "WebUI submit must produce WebUi origin"
     );
+}
+
+#[tokio::test]
+async fn submit_turn_reserves_server_prepared_run_id_before_submitting() {
+    let threads: Arc<dyn SessionThreadService> = Arc::new(InMemorySessionThreadService::default());
+    let coordinator = Arc::new(FakeTurnCoordinator::default());
+    let services = RebornServices::new(threads, coordinator.clone());
+    create_thread_for(&services, caller(), "thread-prepared-world-only").await;
+    services
+        .get_timeline(
+            caller(),
+            RebornTimelineRequest::new("thread-prepared-world-only"),
+        )
+        .await
+        .expect("prepared-run thread remains caller-owned");
+    let requested_run_id = TurnRunId::new();
+    let request = serde_json::from_value::<WebUiSendMessageRequest>(json!({
+        "client_action_id":"send-prepared-world-only",
+        "thread_id":"thread-prepared-world-only",
+        "content":"只构建虚拟世界",
+        "requested_run_id":requested_run_id
+    }))
+    .expect("valid prepared-run request");
+    assert_eq!(request.requested_run_id, Some(requested_run_id));
+
+    let submit_result = services.submit_turn(caller(), request).await;
+    assert_eq!(
+        coordinator.last_prepared_run_id().map(|(_, run_id)| run_id),
+        Some(requested_run_id),
+        "the facade must reserve before invoking the turn coordinator"
+    );
+    assert_eq!(
+        coordinator.submission_count(),
+        1,
+        "coordinator submit count"
+    );
+    assert!(submit_result.is_ok(), "submit result: {submit_result:?}");
+    let response = submit_result.expect("pre-reserved run id is submitted");
+    let RebornSubmitTurnResponse::Submitted { run_id, .. } = response else {
+        panic!("expected a submitted run");
+    };
+    assert_eq!(run_id, requested_run_id);
+    let (reserved_scope, reserved_run_id) = coordinator
+        .last_prepared_run_id()
+        .expect("facade reserves caller-prepared id with resolved scope");
+    assert_eq!(reserved_run_id, requested_run_id);
+    assert_eq!(
+        reserved_scope.thread_id.as_str(),
+        "thread-prepared-world-only"
+    );
+    let submissions = coordinator.submissions.lock().expect("lock");
+    assert_eq!(submissions.len(), 1);
+    assert_eq!(submissions[0].requested_run_id, Some(requested_run_id));
+}
+
+#[tokio::test]
+async fn thread_plan_read_stays_explicitly_unavailable_without_a_reader() {
+    let services = RebornServices::new(
+        Arc::new(InMemorySessionThreadService::default()),
+        Arc::new(FakeTurnCoordinator::default()),
+    );
+    create_thread_for(&services, caller(), "thread-plan-unwired").await;
+
+    let error = services
+        .get_thread_plan(
+            caller(),
+            RebornGetThreadPlanRequest {
+                thread_id: "thread-plan-unwired".into(),
+            },
+        )
+        .await
+        .expect_err("unwired read-only port must fail closed");
+    assert_eq!(error.status_code, 503);
+    assert!(error.retryable);
 }
 
 #[tokio::test]

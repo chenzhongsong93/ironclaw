@@ -3637,7 +3637,7 @@ impl RebornServicesApi for RebornServices {
         // thread's scope for this request only. Without a proposed project the
         // caller's default scope is used unchanged.
         let caller = self
-            .authorize_create_thread_project(caller, request.project_id.clone())
+            .authorize_project_scope(caller, request.project_id.clone())
             .await?;
         let command = request.into_command(caller)?;
         let WebUiInboundCommand::CreateThread {
@@ -3682,6 +3682,10 @@ impl RebornServicesApi for RebornServices {
         caller: WebUiAuthenticatedCaller,
         request: WebUiSendMessageRequest,
     ) -> Result<RebornSubmitTurnResponse, RebornServicesError> {
+        let caller = self
+            .authorize_project_scope(caller, request.project_id.clone())
+            .await?;
+        let requested_run_id = request.requested_run_id;
         // Decode + budget inline attachment bytes before the request is
         // consumed into the (bytes-free, serializable) command.
         let attachments = request.decode_attachments()?;
@@ -3703,6 +3707,7 @@ impl RebornServicesApi for RebornServices {
         let source_binding_id = webui_source_binding_id(&scope, &actor);
         let external_event_id = client_action_id.as_str().to_string();
 
+        let mut prepared_run_id_reserved = false;
         let handoff = if let Some((replay, replay_source_binding_id)) = replay_webui_send_message(
             &*self.thread_service,
             &thread_scope,
@@ -3796,7 +3801,14 @@ impl RebornServicesApi for RebornServices {
                     .await?;
                 MessageContent::with_attachments(content.clone(), refs)
             };
-            let accepted = self
+            if let Some(run_id) = requested_run_id {
+                self.turn_coordinator
+                    .reserve_prepared_turn_id(scope.clone(), run_id)
+                    .await
+                    .map_err(map_turn_error)?;
+                prepared_run_id_reserved = true;
+            }
+            let accepted = match self
                 .thread_service
                 .accept_inbound_message(AcceptInboundMessageRequest {
                     scope: thread_scope.clone(),
@@ -3808,7 +3820,15 @@ impl RebornServicesApi for RebornServices {
                     content: message_content,
                 })
                 .await
-                .map_err(map_thread_error)?;
+            {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    if let Some(run_id) = requested_run_id {
+                        let _ = self.turn_coordinator.abort_prepared_turn(run_id).await;
+                    }
+                    return Err(map_thread_error(error));
+                }
+            };
             AcceptedWebUiMessage {
                 thread_id: accepted.thread_id,
                 message_id: accepted.message_id,
@@ -3826,6 +3846,14 @@ impl RebornServicesApi for RebornServices {
             &handoff.reply_target_binding_id,
         )?;
         let product_context = ironclaw_product_context::resolve_web_ui(scope.product_owner(&actor));
+        if let Some(run_id) = requested_run_id
+            && !prepared_run_id_reserved
+        {
+            self.turn_coordinator
+                .reserve_prepared_turn_id(scope.clone(), run_id)
+                .await
+                .map_err(map_turn_error)?;
+        }
         let submit = SubmitTurnRequest {
             requested_model,
             llm_subject,
@@ -3837,14 +3865,21 @@ impl RebornServicesApi for RebornServices {
             requested_run_profile: None,
             idempotency_key: client_action_id.clone(),
             received_at: Utc::now(),
-            requested_run_id: None,
+            requested_run_id,
             parent_run_id: None,
             subagent_depth: 0,
             spawn_tree_root_run_id: None,
             product_context: Some(product_context),
         };
 
-        self.record_skill_activation_message(&scope, &accepted_message_ref, &content)?;
+        if let Err(error) =
+            self.record_skill_activation_message(&scope, &accepted_message_ref, &content)
+        {
+            if let Some(run_id) = requested_run_id {
+                let _ = self.turn_coordinator.abort_prepared_turn(run_id).await;
+            }
+            return Err(error);
+        }
         match self.turn_coordinator.submit_turn(submit).await {
             Ok(SubmitTurnResponse::Accepted {
                 turn_id,
@@ -3888,6 +3923,9 @@ impl RebornServicesApi for RebornServices {
                     "webui submit_turn deferred: thread busy with an active run"
                 );
                 self.clear_skill_activation_message(&scope, &accepted_message_ref)?;
+                if let Some(run_id) = requested_run_id {
+                    let _ = self.turn_coordinator.abort_prepared_turn(run_id).await;
+                }
                 mark_message_rejected_busy_or_replay(
                     &*self.thread_service,
                     &thread_scope,
@@ -3912,6 +3950,9 @@ impl RebornServicesApi for RebornServices {
                     "webui submit_turn rejected by coordinator; no run enqueued"
                 );
                 self.clear_skill_activation_message(&scope, &accepted_message_ref)?;
+                if let Some(run_id) = requested_run_id {
+                    let _ = self.turn_coordinator.abort_prepared_turn(run_id).await;
+                }
                 Err(map_turn_error(error))
             }
         }
@@ -6155,8 +6196,8 @@ impl RebornServices {
             .ok_or_else(|| RebornServicesError::service_unavailable(false))
     }
 
-    /// Authorize a browser-proposed project for a new thread and, on success,
-    /// adopt it as the caller's scope for that thread only.
+    /// Authorize a server/browser-proposed project and, on success, adopt it
+    /// only for this thread or turn.
     ///
     /// The project must never be trusted from the request body alone: the
     /// proposed id is authorized through the same access-controlled
@@ -6164,7 +6205,7 @@ impl RebornServices {
     /// route uses (`Ok` only when the caller can access the project, otherwise a
     /// not-found/denied error). Without a proposed project the caller's default
     /// scope is returned unchanged.
-    async fn authorize_create_thread_project(
+    async fn authorize_project_scope(
         &self,
         caller: WebUiAuthenticatedCaller,
         requested_project_id: Option<String>,

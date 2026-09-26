@@ -10,6 +10,7 @@ use ironclaw_host_api::{
 use ironclaw_mcp::{
     McpHostHttpClient, McpHostHttpEgressPlan, McpHostHttpEgressPlanRequest,
     McpHostHttpEgressPlanner, McpRuntime, McpRuntimeConfig, McpRuntimeHttpAdapter,
+    McpTrustedContextSigner,
 };
 
 pub(crate) const MCP_RESPONSE_BODY_LIMIT: u64 = 2 * 1024 * 1024;
@@ -28,7 +29,13 @@ pub(crate) fn hosted_http_mcp_runtime(
     } else {
         RegistryMcpEgressPlanner::new(registry)
     };
-    let client = McpHostHttpClient::new(McpRuntimeHttpAdapter::new(runtime_http_egress), planner);
+    // The platform remains domain-neutral: TianQuan's thin exporter binds this
+    // signer policy to its provider ID. Other MCP providers never receive these headers.
+    let trusted_context_signer = McpTrustedContextSigner::from_env(
+        ExtensionId::new("tianquan-graph").expect("static TianQuan provider ID is valid"),
+    );
+    let client = McpHostHttpClient::new(McpRuntimeHttpAdapter::new(runtime_http_egress), planner)
+        .with_trusted_context_signer(trusted_context_signer);
     McpRuntime::new(McpRuntimeConfig::default(), client)
 }
 

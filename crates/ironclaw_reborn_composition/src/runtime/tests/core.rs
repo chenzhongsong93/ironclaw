@@ -4912,6 +4912,8 @@ async fn local_dev_runtime_webui_bundle_reuses_thread_and_turn_facades() {
                 attachments: Vec::new(),
                 model: None,
                 llm_subject: None,
+                project_id: None,
+                requested_run_id: None,
             },
         )
         .await
@@ -6262,6 +6264,8 @@ async fn local_dev_webui_bundle_records_selectable_filesystem_skill_context() {
                 attachments: Vec::new(),
                 model: None,
                 llm_subject: None,
+                project_id: None,
+                requested_run_id: None,
             },
         )
         .await
@@ -6652,6 +6656,8 @@ async fn rejected_busy_message_not_auto_resubmitted_after_run_cancellation() {
                 attachments: Vec::new(),
                 model: None,
                 llm_subject: None,
+                project_id: None,
+                requested_run_id: None,
             },
         )
         .await
@@ -6764,6 +6770,8 @@ async fn rejected_busy_message_not_auto_resubmitted_after_run_cancellation() {
                 attachments: Vec::new(),
                 model: None,
                 llm_subject: None,
+                project_id: None,
+                requested_run_id: None,
             },
         )
         .await

@@ -170,6 +170,15 @@ pub struct WebUiSendMessageRequest {
     /// than falling back to the shared process key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_subject: Option<String>,
+    /// Server-proposed project scope. The Reborn facade authorizes access
+    /// before applying it to this turn; a browser field alone grants nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Server-prepared run identity used by trusted upstreams that must bind
+    /// scoped task state before this turn is admitted. Ordinary browser sends
+    /// omit it and keep the coordinator-generated run-id path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_run_id: Option<ironclaw_turns::TurnRunId>,
 }
 
 impl WebUiSendMessageRequest {

@@ -4225,6 +4225,7 @@ fn issue_prompt_grant(context: &LoopRunContext, messages: &[LoopModelMessage]) {
         bundle_ref: LoopPromptBundleRef::for_run(context, "test-bundle").unwrap(),
         messages: messages.to_vec(),
         surface_version: None,
+        capability_view: None,
         compaction_message_index: Vec::new(),
         instruction_fingerprint: None,
         identity_message_count: 0,

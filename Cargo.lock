@@ -4667,6 +4667,7 @@ dependencies = [
  "rust_decimal_macros",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -4680,14 +4681,20 @@ name = "ironclaw_mcp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "futures-util",
+ "hex",
+ "hmac 0.12.1",
  "ironclaw_extensions",
  "ironclaw_host_api",
  "ironclaw_resources",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -5480,13 +5487,14 @@ name = "ironclaw_tianquan_subagents"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "ironclaw_agent_loop",
  "ironclaw_host_api",
  "ironclaw_loop_host",
  "ironclaw_runner",
  "ironclaw_threads",
  "ironclaw_turns",
- "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

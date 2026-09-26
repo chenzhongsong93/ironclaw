@@ -1,5 +1,6 @@
 target/
 .git/
+.pnpm-store/
 .env
 .env.*
 *.md

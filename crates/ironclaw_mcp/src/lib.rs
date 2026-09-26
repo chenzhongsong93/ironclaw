@@ -22,14 +22,17 @@ use ironclaw_extensions::{
 use ironclaw_host_api::{
     CapabilityHostHttpRequest, CapabilityHostResult, CapabilityId, ExtensionId, NetworkMethod,
     NetworkPolicy, ResourceEstimate, ResourceReservation, ResourceReservationId, ResourceScope,
-    ResourceUsage, RuntimeCredentialAuthRequirement, RuntimeCredentialInjection,
+    ResourceUsage, RunId, RuntimeCredentialAuthRequirement, RuntimeCredentialInjection,
     RuntimeCredentialRequirement, RuntimeCredentialRequirementSource, RuntimeCredentialSource,
     RuntimeHttpEgress, RuntimeHttpEgressError, RuntimeHttpEgressResponse, RuntimeKind,
-    SecretHandle,
+    SecretHandle, UserId,
 };
 use ironclaw_resources::{ResourceError, ResourceGovernor, ResourceReceipt};
 use serde_json::Value;
 use thiserror::Error;
+
+mod trusted_context;
+pub use trusted_context::{McpTrustedContextSigner, McpTrustedContextSignerError};
 
 const STREAMABLE_HTTP_MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MCP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
@@ -62,6 +65,18 @@ pub struct McpInvocation {
     pub input: Value,
 }
 
+/// Host-authenticated caller identity for an MCP execution.
+///
+/// This value is deliberately separate from [`McpInvocation::input`] and has
+/// no serialization contract. An MCP client must not place it in
+/// model-authored tool arguments; any network forwarding needs a separate,
+/// explicit host egress policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpTrustedExecutionContext {
+    pub authenticated_actor_user_id: Option<UserId>,
+    pub run_id: Option<RunId>,
+}
+
 /// Full resource-governed MCP execution request.
 #[derive(Debug)]
 pub struct McpExecutionRequest<'a> {
@@ -71,6 +86,7 @@ pub struct McpExecutionRequest<'a> {
     pub estimate: ResourceEstimate,
     pub resource_reservation: Option<ResourceReservation>,
     pub invocation: McpInvocation,
+    pub trusted_context: Option<McpTrustedExecutionContext>,
 }
 
 /// Host-normalized request handed to the configured MCP client adapter.
@@ -85,6 +101,7 @@ pub struct McpClientRequest {
     pub url: Option<String>,
     pub input: Value,
     pub max_output_bytes: u64,
+    pub trusted_context: Option<McpTrustedExecutionContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -357,6 +374,7 @@ impl McpHostHttpEgressPlanner for StaticMcpHostHttpEgressPlanner {
 pub struct McpHostHttpClient<H, P> {
     http: H,
     planner: P,
+    trusted_context_signer: Option<McpTrustedContextSigner>,
     state: Arc<McpHostHttpClientState>,
 }
 
@@ -442,11 +460,17 @@ where
         Self {
             http,
             planner,
+            trusted_context_signer: None,
             state: Arc::new(McpHostHttpClientState {
                 next_id: AtomicU64::new(1),
                 sessions: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    pub fn with_trusted_context_signer(mut self, signer: McpTrustedContextSigner) -> Self {
+        self.trusted_context_signer = Some(signer);
+        self
     }
 
     fn next_request_id(&self) -> u64 {
@@ -473,9 +497,22 @@ where
         method: McpJsonRpcMethod,
         params: Option<Value>,
     ) -> Result<PlannedMcpJsonRpc, McpClientError> {
-        let url = request.url.as_deref().ok_or_else(|| {
+        let configured_url = request.url.as_deref().ok_or_else(|| {
             McpClientError::client(request_denied(McpRequestDeniedCause::MissingUrl))
         })?;
+        let url = match self.trusted_context_signer.as_ref() {
+            Some(signer)
+                if signer.provider_id() == &request.provider
+                    && request.trusted_context.is_some() =>
+            {
+                signer.audience().ok_or_else(|| {
+                    McpClientError::client(request_denied(
+                        McpRequestDeniedCause::TrustedContextSignerUnavailable,
+                    ))
+                })?
+            }
+            _ => configured_url,
+        };
         let body =
             encode_json_rpc_request(id, method.as_str(), params).map_err(McpClientError::client)?;
         let policy_headers = vec![
@@ -513,7 +550,9 @@ where
         planned: PlannedMcpJsonRpc,
     ) -> Result<McpJsonRpcExchange, McpClientError> {
         let mut headers = planned.policy_headers;
-        if let Some(session) = self.current_session(session_key)? {
+        let session = self.current_session(session_key)?;
+        let session_id = session.as_ref().and_then(|value| value.session_id.clone());
+        if let Some(session) = session {
             headers.push((
                 MCP_PROTOCOL_VERSION_HEADER.to_string(),
                 session.protocol_version,
@@ -521,6 +560,28 @@ where
             if let Some(session_id) = session.session_id {
                 headers.push(("Mcp-Session-Id".to_string(), session_id));
             }
+        }
+        if let Some(signer) = self.trusted_context_signer.as_ref()
+            && signer.provider_id() == &request.provider
+            && let Some(context) = request.trusted_context.as_ref()
+        {
+            let signed_headers = signer
+                .sign_request(
+                    &request.scope,
+                    context,
+                    &planned.body,
+                    session_id.as_deref(),
+                )
+                .map_err(|error| {
+                    let cause = match error {
+                        McpTrustedContextSignerError::InvalidConfiguration => {
+                            McpRequestDeniedCause::TrustedContextSignerUnavailable
+                        }
+                        _ => McpRequestDeniedCause::InvalidTrustedContext,
+                    };
+                    McpClientError::client(request_denied(cause))
+                })?;
+            headers.extend(signed_headers);
         }
 
         let response_body_limit = effective_mcp_response_body_limit(
@@ -1336,6 +1397,10 @@ enum McpRequestDeniedCause {
     DeniedCredentialSource,
     /// The in-memory session map lock was poisoned.
     SessionStatePoisoned,
+    /// A trusted TianQuan call has no configured HMAC signer.
+    TrustedContextSignerUnavailable,
+    /// Host identity does not match the scoped MCP caller.
+    InvalidTrustedContext,
 }
 
 impl McpRequestDeniedCause {
@@ -1351,6 +1416,10 @@ impl McpRequestDeniedCause {
             Self::UnsupportedTransport => "mcp_unsupported_transport".to_string(),
             Self::DeniedCredentialSource => "mcp_denied_credential_source".to_string(),
             Self::SessionStatePoisoned => "mcp_session_state_poisoned".to_string(),
+            Self::TrustedContextSignerUnavailable => {
+                "mcp_trusted_context_signer_unavailable".to_string()
+            }
+            Self::InvalidTrustedContext => "mcp_invalid_trusted_context".to_string(),
         }
     }
 }
@@ -1647,6 +1716,7 @@ where
                 url: url.clone(),
                 input: request.invocation.input.clone(),
                 max_output_bytes: self.config.max_output_bytes,
+                trusted_context: request.trusted_context.clone(),
             },
             auth_context,
         })
@@ -2220,7 +2290,11 @@ mod tests {
         );
         let parsed = parse_mcp_response(&response, Some(10)).expect("parse non-string safe_hint");
         assert!(
-            parsed.error.as_ref().and_then(|e| e.safe_hint.as_ref()).is_none(),
+            parsed
+                .error
+                .as_ref()
+                .and_then(|e| e.safe_hint.as_ref())
+                .is_none(),
             "non-string safe_hint must be ignored"
         );
     }

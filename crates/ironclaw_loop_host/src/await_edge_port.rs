@@ -17,7 +17,7 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use ironclaw_turns::{
-    TurnCommittedEventObserver, TurnCoordinator, TurnError, TurnRunId, TurnScope,
+    TurnCommittedEventObserver, TurnCoordinator, TurnError, TurnRunId, TurnScope, TurnTimestamp,
 };
 
 use crate::subagent_spawn_port::AwaitedChildSetRecord;
@@ -71,6 +71,18 @@ pub trait AwaitEdgeWriter: Send + Sync {
         &self,
         record: AwaitedChildSetRecord,
     ) -> Result<(), AgentLoopHostError>;
+
+    /// Records a child only after `submit_child_run` returns its accepted run id.
+    /// Test writers may record this event; production adapters may export
+    /// generic spawn provenance without introducing domain policy here.
+    async fn record_child_submitted(
+        &self,
+        child_scope: &TurnScope,
+        parent_run_id: TurnRunId,
+        child_run_id: TurnRunId,
+        subagent_kind: &crate::subagent_spawn_port::SubagentKindId,
+        submitted_at: TurnTimestamp,
+    );
 
     /// Rollback-only: abandon and delete the just-opened edge (§2 mode-scoped
     /// case (b) — spawn failed after the edge write; explicit teardown, not

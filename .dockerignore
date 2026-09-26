@@ -13,3 +13,10 @@ node_modules/
 **/node_modules/
 crates/ironclaw_webui_v2_static/static/dist/
 crates/ironclaw_webui/frontend/dist/
+crates/ironclaw_webui/frontend/node_modules
+crates/ironclaw_webui/frontend/node_modules/**
+crates/ironclaw_webui/frontend/.pnpm-store/
+crates/ironclaw_webui/frontend/node_modules/.pnpm
+crates/ironclaw_webui/frontend/node_modules/.pnpm/**
+crates/ironclaw_webui/frontend/node_modules/.pnpm/node_modules
+crates/ironclaw_webui/frontend/node_modules/.pnpm/node_modules/**

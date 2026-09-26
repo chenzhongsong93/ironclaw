@@ -12,7 +12,7 @@ IronClaw 以本机 `main` 为集成真源，已合入并验证 `codex/novel-stud
 - 主机 80、8181、API `/api/health`、Gateway 3000 与 5188 均 HTTP 200。API/Gateway 已在本地重建；本轮没有重启或重置 PostgreSQL/Rena。此前隔离 Todo、真实子 Agent 状态/消息/返回与父子权限、整页 UI 控件、零额度、正文直接 PUT/force 422 及活跃续期证据仍见天权交接 2026-09-25 项。
 - `ISSUE-IRONCLAW-011` 的运行时与调用装配代码已修并合入，但该单按其验收条件仍 open：需在隔离新项目用当前 Gateway 生成新 novelist run、保存 dossier 并做独立质量回归。provider-capture、旧 run 和静态 fixture 不充当 L3。`ISSUE-IRONCLAW-013` 保持 closed。
 - Windows `ironclaw_runner` 全 targets 中 `jsonl_durable_log_replays_loop_model_reply_milestones` 仍失败；在未合入前的干净基线 worktree 重跑得到同一失败，故记录为既有缺陷，不声称全目标测试完全通过。除该项外 runner 其他目标跳过此既有用例后通过。
-- 本地 `main` 的 two-parent/fork ancestry 已包含先前自维护 fork 回合，当前仍落后于 `fork/main` 文档同步点；本轮文档提交后普通推送至个人 fork `fork/main`，nearai upstream `origin/main` 不作为发布目标。D 盘 IronClaw 的未跟踪 `.pnpm-store/` 与 TianQuan 所有现存工作树均保留。
+- 本地 `main` 的 two-parent/fork ancestry 已包含先前自维护 fork 回合；代码及本轮交接以普通推送同步到个人 fork `fork/main`，已核实 push 成功。nearai upstream `origin/main` 不作为发布目标。D 盘 IronClaw 的未跟踪 `.pnpm-store/` 与 TianQuan 所有现存工作树均保留。
 
 ## 实测与部署
 

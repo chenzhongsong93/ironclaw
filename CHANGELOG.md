@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Reborn 的 `model_request` 归档现在记录实际交给模型 provider 的工具名称、参数 schema SHA256、完整定义 SHA256 与内容寻址引用；工具面解析后才留痕，压缩与恢复仍可回读同一证据。
+
 - 新增 Reborn 通用线程 Todo：原子持久化计划、真实读写工具、严格 caller scope 的计划读取 API；补齐既有 canonical run-state 的只读 HTTP 入口，支持真实子 Agent 检阅状态。读取失败独立报错，任务空态不再依赖工具计数。详见 [线程计划契约](docs/reborn/contracts/thread-plans.md)。
 
 - 修正 Reborn WebChat 命令控制面：目录与可执行处理器共用注册表，只展示已实现的只读命令；`status` 读取当前调用者会话的真实运行记录，`skills` 读取运行态目录。命令不创建模型 turn。新增 WebChat caller 路由测试验证目录、执行与零模型提交。

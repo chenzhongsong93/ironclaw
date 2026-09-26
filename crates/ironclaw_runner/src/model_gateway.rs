@@ -1220,6 +1220,59 @@ impl CompletionStreamSink for ProviderStreamSink {
     }
 }
 
+/// The request snapshot is taken at the LlmProvider boundary, after the host
+/// capability surface has been resolved and converted to provider tools.
+struct ProviderRequestTraceView<'a> {
+    messages: &'a [ChatMessage],
+    model: Option<&'a str>,
+    max_tokens: Option<u32>,
+    tools: &'a [ToolDefinition],
+}
+
+impl<'a> ProviderRequestTraceView<'a> {
+    fn plain(request: &'a CompletionRequest) -> Self {
+        Self {
+            messages: &request.messages,
+            model: request.model.as_deref(),
+            max_tokens: request.max_tokens,
+            tools: &[],
+        }
+    }
+
+    fn with_tools(request: &'a ToolCompletionRequest) -> Self {
+        Self {
+            messages: &request.messages,
+            model: request.model.as_deref(),
+            max_tokens: request.max_tokens,
+            tools: &request.tools,
+        }
+    }
+}
+
+fn traced_tool_definitions(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            let definition = serde_json::json!({
+                "name": &tool.name,
+                "description": &tool.description,
+                "parameters": &tool.parameters,
+            });
+            let schema_sha256 =
+                ironclaw_common::hashing::sha256_hex(tool.parameters.to_string().as_bytes());
+            let definition_sha256 =
+                ironclaw_common::hashing::sha256_hex(definition.to_string().as_bytes());
+            let definition_ref = ironclaw_common::run_trace::store_trace_content(&definition);
+            serde_json::json!({
+                "name": &tool.name,
+                "schema_sha256": schema_sha256,
+                "definition_sha256": definition_sha256,
+                "definition_ref": definition_ref,
+            })
+        })
+        .collect()
+}
+
 /// 可观测性切片 1(2026-08-26):模型交换全文按 run 落 trace 文件。
 /// provider_turn_scope 形如 run=.../turn=.../model_call=n;request 事件在
 /// dispatch 前写(克隆序列化),response 事件在两个返回点旁写。best-effort。
@@ -1230,7 +1283,7 @@ impl CompletionStreamSink for ProviderStreamSink {
 fn trace_model_request_event(
     provider_turn_scope: Option<&str>,
     provider_id: &str,
-    completion: &CompletionRequest,
+    request: ProviderRequestTraceView<'_>,
 ) {
     use ironclaw_common::run_trace::append_trace_event_slim;
     use std::cell::RefCell;
@@ -1240,7 +1293,8 @@ fn trace_model_request_event(
             const { RefCell::new(Vec::new()) };
     }
     let (run, turn) = parse_provider_turn_scope(provider_turn_scope);
-    let all = serde_json::to_value(&completion.messages).unwrap_or(serde_json::json!([]));
+    let all = serde_json::to_value(request.messages).unwrap_or(serde_json::json!([]));
+    let tool_definitions = traced_tool_definitions(request.tools);
     let seq = LAST_MESSAGES.with(|lm| {
         let mut lm = lm.borrow_mut();
         let seq = lm.len() as u32 + 1;
@@ -1270,8 +1324,9 @@ fn trace_model_request_event(
                 turn.as_deref(),
                 serde_json::json!({
                     "provider_id": provider_id,
-                    "model": completion.model,
-                    "max_tokens": completion.max_tokens,
+                    "model": request.model,
+                    "max_tokens": request.max_tokens,
+                    "tool_definitions": tool_definitions,
                     // 引用:同 run 第 prev_seq 次请求的前 common 条为历史前缀
                     "messages_base_seq": if prefix_ref { prev_seq } else { 0 },
                     "messages_base_count": common,
@@ -1287,8 +1342,9 @@ fn trace_model_request_event(
                 turn.as_deref(),
                 serde_json::json!({
                     "provider_id": provider_id,
-                    "model": completion.model,
-                    "max_tokens": completion.max_tokens,
+                    "model": request.model,
+                    "max_tokens": request.max_tokens,
+                    "tool_definitions": tool_definitions,
                     "messages_base_seq": 0,
                     "messages_base_count": 0,
                     "new_messages": all,
@@ -1354,11 +1410,6 @@ where
     P: LlmProvider + ?Sized,
 {
     let system_prompt_hash = system_prompt_cache_signature(&completion.messages);
-    trace_model_request_event(
-        provider_turn_scope.as_deref(),
-        &replay_identity.provider_id,
-        &completion,
-    );
     if let Some(capabilities) = capabilities {
         let tool_definitions = capabilities
             .tool_definitions()
@@ -1398,6 +1449,11 @@ where
             let tool_definitions_hash = tool_definitions_cache_signature(&recovery_tool_names);
             let tool_request =
                 ToolCompletionRequest::from_completion_request(completion, llm_tool_definitions);
+            trace_model_request_event(
+                provider_turn_scope.as_deref(),
+                &replay_identity.provider_id,
+                ProviderRequestTraceView::with_tools(&tool_request),
+            );
             debug!("reborn model gateway dispatching tool-capable provider request");
             let provider_started_at = live_latency_started_at();
             let response = match if let Some(stream_sink) = stream_sink.as_ref() {
@@ -1481,6 +1537,11 @@ where
                         ));
                     let rejected_response = response;
                     let retry_started_at = live_latency_started_at();
+                    trace_model_request_event(
+                        provider_turn_scope.as_deref(),
+                        &replay_identity.provider_id,
+                        ProviderRequestTraceView::with_tools(&repair_request),
+                    );
                     let response = match provider.complete_with_tools(repair_request).await {
                         Ok(response) => {
                             trace_model_latency_ok(
@@ -1563,6 +1624,11 @@ where
         );
     }
 
+    trace_model_request_event(
+        provider_turn_scope.as_deref(),
+        &replay_identity.provider_id,
+        ProviderRequestTraceView::plain(&completion),
+    );
     let provider_started_at = live_latency_started_at();
     let response = match if let Some(stream_sink) = stream_sink.as_ref() {
         provider

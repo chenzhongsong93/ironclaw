@@ -53,12 +53,14 @@ fn trace_root() -> PathBuf {
 // - 索引事件只存 content_hash 列表 + 元数据 → 单 run 索引 ~50KB 级
 // - dossier 重建:索引+内容库拼装,展示层仍无损
 
-/// 存一条消息到内容库,返回 16 位 hash 引用。
+/// Store one JSON value in the shared trace content directory. This is used
+/// for both prompt messages and provider tool definitions. Tool-definition
+/// indexes additionally keep the full SHA-256 for read-back verification.
 ///
 /// 文件名 = sha256(规范化 JSON) 前 16 hex(碰撞概率对 10^5 条消息 < 10^-7,
 /// 且同 hash 不同内容只影响展示正确性不影响崩溃——可接受)。
-pub fn store_message_content(msg: &serde_json::Value) -> Option<String> {
-    let canonical = serde_json::to_string(msg).ok()?;
+pub fn store_trace_content(value: &serde_json::Value) -> Option<String> {
+    let canonical = serde_json::to_string(value).ok()?;
     let hash = crate::hashing::sha256_hex(canonical.as_bytes());
     let short = hash[..16].to_string();
     let dir = trace_root().join("content");
@@ -71,6 +73,11 @@ pub fn store_message_content(msg: &serde_json::Value) -> Option<String> {
     }
     std::fs::write(&path, canonical).ok()?;
     Some(short)
+}
+
+/// Compatibility entry point for existing message traces.
+pub fn store_message_content(msg: &serde_json::Value) -> Option<String> {
+    store_trace_content(msg)
 }
 
 /// 索引事件追加(消息字段瘦身版):messages/new_messages 数组的每条消息替换为
@@ -339,9 +346,9 @@ fn tracing_stub_debug(msg: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // 注意:多个测试操作进程级 env(TIANQUAN_TRACE_DIR),并发跑会竞争——
-    // 本模块测试须串行:`cargo test run_trace -- --test-threads=1`(或全局
-    // RUST_TEST_THREADS=1)。单独跑 test_slim_event 等均绿(已验证)。
+    // These tests mutate process-wide trace environment variables, so serialize
+    // their setup and execution even when the crate suite runs in parallel.
+    static TRACE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn sanitize_rejects_traversal() {
@@ -356,6 +363,7 @@ mod tests {
     // load 读回原文
     #[test]
     fn test_content_store_dedup_and_load() {
+        let _env_lock = TRACE_ENV_LOCK.lock().expect("trace env lock");
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe { std::env::set_var("TIANQUAN_TRACE_DIR", dir.path()) };
         let msg = serde_json::json!({"role": "system", "content": "abc"});
@@ -378,6 +386,7 @@ mod tests {
     // 覆盖:slim 事件——messages 数组替换为 hash 引用,元数据保留
     #[test]
     fn test_slim_event_replaces_messages_with_refs() {
+        let _env_lock = TRACE_ENV_LOCK.lock().expect("trace env lock");
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe { std::env::set_var("TIANQUAN_TRACE_DIR", dir.path()) };
         let data = serde_json::json!({
@@ -403,6 +412,7 @@ mod tests {
     // 覆盖:轮转——压缩产出 .gz(可解压回原文)+原文件删除
     #[test]
     fn test_compact_creates_gz_and_removes_src() {
+        let _env_lock = TRACE_ENV_LOCK.lock().expect("trace env lock");
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         let src = root.join("run-c.jsonl");
@@ -429,10 +439,40 @@ mod tests {
     // 不能以新段覆盖此前的 model/tool 证据。
     #[test]
     fn test_compact_merges_existing_archive_prefix() {
+        let _env_lock = TRACE_ENV_LOCK.lock().expect("trace env lock");
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
-        let prior = r#"{"kind":"model_request","run_id":"run-merge"}"#;
-        let resumed = r#"{"kind":"tool_response","run_id":"run-merge"}"#;
+        unsafe { std::env::set_var("TIANQUAN_TRACE_DIR", root) };
+        let definition = serde_json::json!({
+            "name": "demo_tool",
+            "description": "A recorded provider tool",
+            "parameters": {"type": "object", "properties": {"value": {"type": "string"}}},
+        });
+        let definition_ref = super::store_trace_content(&definition)
+            .expect("provider definition has a content address");
+        let definition_hash = crate::hashing::sha256_hex(definition.to_string().as_bytes());
+        let tool = serde_json::json!({
+            "name": "demo_tool",
+            "schema_sha256": crate::hashing::sha256_hex(
+                definition["parameters"].to_string().as_bytes()
+            ),
+            "definition_sha256": definition_hash,
+            "definition_ref": definition_ref,
+        });
+        let prior = serde_json::json!({
+            "kind": "model_request",
+            "run_id": "run-merge",
+            "turn_id": "before-block",
+            "data": {"tool_definitions": [tool.clone()]},
+        })
+        .to_string();
+        let resumed = serde_json::json!({
+            "kind": "model_request",
+            "run_id": "run-merge",
+            "turn_id": "after-resume",
+            "data": {"tool_definitions": [tool.clone()]},
+        })
+        .to_string();
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         std::io::Write::write_all(&mut encoder, prior.as_bytes()).expect("gzip prior segment");
         std::fs::write(
@@ -440,8 +480,7 @@ mod tests {
             encoder.finish().expect("finish prior segment"),
         )
         .expect("write prior archive");
-        std::fs::write(root.join("run-merge.jsonl"), resumed).expect("write resumed segment");
-        unsafe { std::env::set_var("TIANQUAN_TRACE_DIR", root) };
+        std::fs::write(root.join("run-merge.jsonl"), &resumed).expect("write resumed segment");
 
         super::compact_run_trace("run-merge");
 
@@ -451,12 +490,25 @@ mod tests {
         let mut merged = String::new();
         std::io::Read::read_to_string(&mut decoder, &mut merged).expect("decompress merged trace");
         assert_eq!(merged, format!("{prior}\n{resumed}"));
+        let events = merged
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid event"))
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        for event in events {
+            assert_eq!(event["data"]["tool_definitions"][0], tool);
+        }
+        let addressed =
+            std::fs::read_to_string(root.join("content").join(format!("{definition_ref}.json")))
+                .expect("tool definition survives archive merge");
+        assert_eq!(addressed, definition.to_string());
         assert!(!root.join("run-merge.jsonl").exists());
     }
 
     // 覆盖:rotate——热文件超限压缩最旧;gz 超限删最旧
     #[test]
     fn test_rotate_enforces_caps() {
+        let _env_lock = TRACE_ENV_LOCK.lock().expect("trace env lock");
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         // 造 4 个热文件,限 2 → 最旧 2 个被压缩

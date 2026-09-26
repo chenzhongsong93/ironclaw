@@ -10,6 +10,8 @@ mod support;
 use reborn_support::{group::RebornIntegrationGroup, reply::RebornScriptedReply};
 use serde_json::{Value, json};
 
+static TRACE_ROOT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct TraceRootGuard(Option<std::ffi::OsString>);
 
 impl TraceRootGuard {
@@ -30,8 +32,70 @@ impl Drop for TraceRootGuard {
     }
 }
 
+fn read_run_events(root: &std::path::Path, run_id: &str) -> Vec<Value> {
+    let archive = root.join(format!("{run_id}.jsonl.gz"));
+    let hot = root.join(format!("{run_id}.jsonl"));
+    let mut text = String::new();
+    if archive.exists() {
+        let bytes = std::fs::read(archive).expect("read completed run archive");
+        let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
+        std::io::Read::read_to_string(&mut decoder, &mut text).expect("decompress trace");
+    }
+    if hot.exists() {
+        text.push_str(&std::fs::read_to_string(hot).expect("read active run trace"));
+    }
+    text.lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("trace event is valid JSON"))
+        .collect()
+}
+
+fn assert_provider_tool_trace(
+    events: &[Value],
+    provider_tools: &[Vec<ironclaw_llm::ToolDefinition>],
+    trace_root: &std::path::Path,
+) {
+    let model_requests = events
+        .iter()
+        .filter(|event| event["kind"] == "model_request")
+        .collect::<Vec<_>>();
+    assert_eq!(model_requests.len(), provider_tools.len());
+    for (request, sent_tools) in model_requests.iter().zip(provider_tools) {
+        let traced_tools = request["data"]["tool_definitions"]
+            .as_array()
+            .expect("final model request must record the provider tool definitions");
+        assert_eq!(traced_tools.len(), sent_tools.len());
+        for (traced, sent) in traced_tools.iter().zip(sent_tools) {
+            assert_eq!(traced["name"], sent.name);
+            assert_eq!(
+                traced["schema_sha256"],
+                ironclaw_common::hashing::sha256_hex(
+                    &serde_json::to_vec(&sent.parameters).expect("schema JSON")
+                )
+            );
+            let content_ref = traced["definition_ref"]
+                .as_str()
+                .expect("provider definition content reference");
+            let stored = std::fs::read(
+                trace_root
+                    .join("content")
+                    .join(format!("{content_ref}.json")),
+            )
+            .expect("read addressed provider definition");
+            let full_hash = ironclaw_common::hashing::sha256_hex(&stored);
+            assert_eq!(traced["definition_sha256"], full_hash);
+            assert_eq!(content_ref, &full_hash[..16]);
+            let stored: Value = serde_json::from_slice(&stored).expect("valid definition JSON");
+            assert_eq!(
+                stored,
+                serde_json::to_value(sent).expect("provider definition JSON")
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn reborn_tool_call_writes_correlated_request_and_response_trace() {
+    let _env_lock = TRACE_ROOT_ENV_LOCK.lock().await;
     let trace_root = tempfile::tempdir().expect("isolated trace root");
     let _trace_root_guard = TraceRootGuard::set(trace_root.path());
     let group = RebornIntegrationGroup::builtin_tools()
@@ -59,21 +123,16 @@ async fn reborn_tool_call_writes_correlated_request_and_response_trace() {
         .await
         .expect("time capability ran");
 
-    let hot = trace_root.path().join(format!("{run_id}.jsonl"));
-    let archive = trace_root.path().join(format!("{run_id}.jsonl.gz"));
-    let trace = if archive.exists() {
-        let bytes = std::fs::read(archive).expect("read completed run archive");
-        let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
-        let mut text = String::new();
-        std::io::Read::read_to_string(&mut decoder, &mut text).expect("decompress trace");
-        text
-    } else {
-        std::fs::read_to_string(hot).expect("read active run trace")
-    };
-    let events = trace
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).expect("trace event is valid JSON"))
-        .collect::<Vec<_>>();
+    let events = read_run_events(trace_root.path(), &run_id.to_string());
+    let provider_tools = harness.scripted_llm.captured_tool_definitions();
+    assert!(
+        provider_tools
+            .iter()
+            .flatten()
+            .any(|tool| tool.name == "builtin__time"),
+        "the recorded provider really received the invoked time tool"
+    );
+    assert_provider_tool_trace(&events, &provider_tools, trace_root.path());
     let kinds = events
         .iter()
         .filter_map(|event| event["kind"].as_str())

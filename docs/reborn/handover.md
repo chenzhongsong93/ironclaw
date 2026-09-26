@@ -1,6 +1,18 @@
-# 当前交接：blocking spawn dossier 修复与最新联合隔离验收（2026-09-25）
+# 当前交接：本机主线回合、天权角色 bundle 与项目 scope（2026-09-26）
 
-IronClaw 本轮运行时代码提交为本地主线 `main` 上的 `0ed934f4b`（`fix(reborn-trace): retain blocking spawn dossier steps #13`）；本次交接文档另行提交。修复关闭 TianQuan `ISSUE-IRONCLAW-013`：挂起/阻塞 run 保留同一 run 的 trace 热段，终态压缩合并旧 gzip 前缀与恢复 JSONL 后缀；blocking `spawn_subagent` 特殊路径输出带 `invocation_id` 的 `tool_request/tool_response`，普通工具继续复用既有 exporter。天权 dossier 已同步支持热段/归档段与 invocation 关联。
+IronClaw 以本机 `main` 为集成真源，已合入并验证 `codex/novel-studio-runtime` 的运行时改动；本地主线当前包含合并提交 `7467920d4909a5a155c33935dc6d4a30b22a31b5` 与 Docker build-context 修复 `d880da4fa39d226805dcb2cf408fc33912be0cb6`。TianQuan 同时实现项目 scope 透传与接收端 MCP 验签。两仓没有删除分支或 worktree，TianQuan D 盘既有未提交任务改动继续保留。
+
+## 2026-09-26 本轮回合、验证与部署
+
+- `codex/novel-studio-runtime` 的 13 个功能提交已通过普通 no-ff 合并进入本地 `main`，分支本身与其干净 worktree 保留；`git branch --no-merged main` 为空。合并使用本机主线树解决冲突，保留 typed CAS Todo store 与 typed `ThreadPlanUpdate` contract，并纳入只读 TianQuan SOUL bundle loader、可信 MCP 出站签名和 caller 侧项目 scope。
+- TianQuan role bundle 运行测试对真实 bundle 做目录/hash 验证：novelist allowlist 为空，worldsmith 仅有 `tianquan-graph.run_world_patch`，market researcher 仅有 `builtin.http`。通过 `ironclaw_tianquan_subagents` bundle 测试 9/9、novelist composition/provider-capture 1/1、MCP adapter/signer/dispatch 59/59；最终 system、User task/handoff 与压缩/resume 后 prompt 的受影响 runner 测试通过。
+- 受影响回归：thread/Todo contracts 6/6、Reborn services 227/227、WebChat inbound 31/31、loop host 相关全套与 runner 相关回归通过。IronClaw 受影响 crates 的严格 Clippy 和 42 个修改 Rust 文件的 rustfmt check 通过。
+- `ironclaw-reborn:tianquan` 已从本机主线通过 Git archive 构建并重建到 Gateway；image ID `sha256:8c41204511590cbb86bc9aab6c765db017176be0fd3b99f35e31ebd2ac89f8`，revision label `d880da4fa39d226805dcb2cf408fc33912be0cb6`。Windows 工作树的 pnpm junction 在 BuildKit context scan 会报不可访问；本轮按 Git archive 生成干净构建上下文，镜像成功且缓存复建退出 0，未清理或改写 `.pnpm-store/`。
+- TianQuan 当前 API 镜像 `tianquan-api:latest` 为 `sha256:3d0ca0e4b4e75d9169a9a0b0ec206d0241e068a3cc882bd196787e514ae8b366`；本机实时 MCP 联验为 initialize/tools-list 200、未签名工具调用 401、同 scope 签名到 handler、跨 project 403、nonce replay 401。旧 thread scope 的 isolated PostgreSQL rollover 4/4。
+- 主机 80、8181、API `/api/health`、Gateway 3000 与 5188 均 HTTP 200。API/Gateway 已在本地重建；本轮没有重启或重置 PostgreSQL/Rena。此前隔离 Todo、真实子 Agent 状态/消息/返回与父子权限、整页 UI 控件、零额度、正文直接 PUT/force 422 及活跃续期证据仍见天权交接 2026-09-25 项。
+- `ISSUE-IRONCLAW-011` 的运行时与调用装配代码已修并合入，但该单按其验收条件仍 open：需在隔离新项目用当前 Gateway 生成新 novelist run、保存 dossier 并做独立质量回归。provider-capture、旧 run 和静态 fixture 不充当 L3。`ISSUE-IRONCLAW-013` 保持 closed。
+- Windows `ironclaw_runner` 全 targets 中 `jsonl_durable_log_replays_loop_model_reply_milestones` 仍失败；在未合入前的干净基线 worktree 重跑得到同一失败，故记录为既有缺陷，不声称全目标测试完全通过。除该项外 runner 其他目标跳过此既有用例后通过。
+- 本地 `main` 的 two-parent/fork ancestry 已包含先前自维护 fork 回合，当前仍落后于 `fork/main` 文档同步点；本轮文档提交后普通推送至个人 fork `fork/main`，nearai upstream `origin/main` 不作为发布目标。D 盘 IronClaw 的未跟踪 `.pnpm-store/` 与 TianQuan 所有现存工作树均保留。
 
 ## 实测与部署
 

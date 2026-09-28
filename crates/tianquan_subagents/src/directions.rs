@@ -19,7 +19,7 @@ impl SoulBundle {
             PinnedRoleBundleSpec {
                 schema_version: "soul-catalog/1",
                 bundle_id: "novel-studio-souls",
-                version: "1.0.0",
+                version: "1.0.1",
                 marker: "SOUL-BUNDLE",
                 expected_roles: TIANQUAN_SOUL_KINDS,
                 max_material_bytes: 16 * 1024,

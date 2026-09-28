@@ -76,7 +76,7 @@ async fn material_source_uses_thread_role_and_real_pinned_novelist_bundle() {
     assert!(
         material
             .direction_markdown
-            .contains("SOUL-BUNDLE novel-studio-souls/1.0.0")
+            .contains("SOUL-BUNDLE novel-studio-souls/1.0.1")
     );
     assert!(material.direction_markdown.contains("roleSha256="));
     assert!(material.direction_markdown.contains("小说正文创作"));

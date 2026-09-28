@@ -152,7 +152,7 @@ async fn production_composition_sends_pinned_novelist_soul_in_final_system_reque
         .iter()
         .filter(|message| message.role == HostManagedModelMessageRole::System)
         .map(|message| message.content.as_str())
-        .find(|content| content.contains("SOUL-BUNDLE novel-studio-souls/1.0.0 kind=novelist"))
+        .find(|content| content.contains("SOUL-BUNDLE novel-studio-souls/1.0.1 kind=novelist"))
         .expect(
             "the final child provider request must contain the pinned novelist SOUL system message",
         );

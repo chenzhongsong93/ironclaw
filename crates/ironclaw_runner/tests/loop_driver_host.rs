@@ -3601,7 +3601,7 @@ async fn real_tianquan_worldsmith_bundle_reaches_final_model_request() {
         PinnedRoleBundleSpec {
             schema_version: "soul-catalog/1",
             bundle_id: "novel-studio-souls",
-            version: "1.0.0",
+            version: "1.0.1",
             marker: "SOUL-BUNDLE",
             expected_roles: KINDS,
             max_material_bytes: 16 * 1024,
@@ -3668,7 +3668,7 @@ async fn real_tianquan_novelist_bundle_reaches_novelist_profile_final_request() 
         PinnedRoleBundleSpec {
             schema_version: "soul-catalog/1",
             bundle_id: "novel-studio-souls",
-            version: "1.0.0",
+            version: "1.0.1",
             marker: "SOUL-BUNDLE",
             expected_roles: KINDS,
             max_material_bytes: 16 * 1024,
@@ -3696,7 +3696,7 @@ async fn real_tianquan_novelist_bundle_reaches_novelist_profile_final_request() 
             && message.content.contains(&role.direction_markdown)
             && message
                 .content
-                .contains("SOUL-BUNDLE novel-studio-souls/1.0.0")
+                .contains("SOUL-BUNDLE novel-studio-souls/1.0.1")
             && message.content.contains("roleSha256=")
     }));
     assert!(request.messages.iter().any(|message| {
@@ -3736,7 +3736,7 @@ async fn real_tianquan_all_roles_final_requests_apply_pinned_role_hash_and_allow
         PinnedRoleBundleSpec {
             schema_version: "soul-catalog/1",
             bundle_id: "novel-studio-souls",
-            version: "1.0.0",
+            version: "1.0.1",
             marker: "SOUL-BUNDLE",
             expected_roles: KINDS,
             max_material_bytes: 16 * 1024,
@@ -3781,7 +3781,7 @@ async fn real_tianquan_all_roles_final_requests_apply_pinned_role_hash_and_allow
                     && message.content.contains(&role.direction_markdown)
                     && message
                         .content
-                        .contains("SOUL-BUNDLE novel-studio-souls/1.0.0")
+                        .contains("SOUL-BUNDLE novel-studio-souls/1.0.1")
                     && message.content.contains("roleSha256=")
                     && message.content.contains(&format!("kind={kind}"))
             }),
@@ -3794,11 +3794,23 @@ async fn real_tianquan_all_roles_final_requests_apply_pinned_role_hash_and_allow
 
         let mut expected_tools = role.allowed_capabilities.clone();
         expected_tools.insert(CapabilityId::new("ironclaw.loop.capability_info").unwrap());
+        let captured_tools = tools.into_iter().collect::<BTreeSet<_>>();
         assert_eq!(
-            tools.into_iter().collect::<BTreeSet<_>>(),
-            expected_tools,
+            captured_tools, expected_tools,
             "final tools for {kind} must equal the pinned role allowlist plus host introspection"
         );
+        let quality_gate = CapabilityId::new("tianquan-graph.run_quality_gates").unwrap();
+        assert_eq!(
+            captured_tools.contains(&quality_gate),
+            *kind == "auditor",
+            "only auditor may receive the quality-gate capability in its final request"
+        );
+        if *kind == "event-simulator" {
+            assert!(
+                !captured_tools.contains(&CapabilityId::new("action.evaluate").unwrap()),
+                "server-only action.evaluate must not become a provider tool"
+            );
+        }
     }
 }
 

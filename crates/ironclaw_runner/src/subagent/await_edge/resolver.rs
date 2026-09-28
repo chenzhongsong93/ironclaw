@@ -805,7 +805,6 @@ where
                     crate::subagent::spawn_provenance::SpawnTerminalInput {
                         child_run_id: &child_run_id,
                         parent_run_id: &parent_run_id,
-                        child_scope,
                         subagent_kind: &edge.subagent_kind,
                         terminal_kind,
                         final_text: output.final_text.as_deref(),

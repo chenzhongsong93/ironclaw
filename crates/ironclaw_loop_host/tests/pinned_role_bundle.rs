@@ -27,7 +27,8 @@ fn fixture() -> tempfile::TempDir {
         "roles": [{
             "kind": "worldsmith", "path": "directions/worldsmith.md",
             "sha256": hash(world), "bytes": world.len(),
-            "allowedCapabilities": ["demo.allowed"]
+            "allowedCapabilities": ["demo.allowed"],
+            "allowedInternalCapabilities": ["action.evaluate"]
         }]
     });
     fs::write(
@@ -63,6 +64,12 @@ fn loads_real_bytes_and_freezes_role_capabilities() {
     assert!(
         role.allowed_capabilities
             .contains(&CapabilityId::new("demo.allowed").unwrap())
+    );
+    assert_eq!(role.allowed_capabilities.len(), 1);
+    assert!(
+        !role
+            .allowed_capabilities
+            .contains(&CapabilityId::new("action.evaluate").unwrap())
     );
     fs::write(fixture.path().join("directions/worldsmith.md"), "changed").unwrap();
     assert!(

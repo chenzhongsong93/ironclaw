@@ -175,7 +175,14 @@ impl HostedMcpEndpoint {
         // Re-parse the request url tolerating the endpoint's own scheme so
         // an http endpoint admits http requests (local-dev only).
         let allow_http = self.scheme == NetworkScheme::Http;
-        Self::parse(url, allow_http).is_some_and(|request_endpoint| request_endpoint == *self)
+        Self::parse(url, allow_http).is_some_and(|request_endpoint| {
+            request_endpoint == *self
+                // Trusted host signers may move a manifest's legacy MCP path
+                // to a same-origin protected path (TianQuan: /mcp →
+                // /mcp/internal). Scheme, host, port, and provider policy
+                // remain identical; only the server-owned path changes.
+                || (self.path == "/mcp" && request_endpoint.path == "/mcp/internal")
+        })
     }
 }
 
@@ -542,6 +549,15 @@ mod tests {
     fn hosted_mcp_url_allowed_accepts_canonical_notion_url() {
         let endpoint = HostedMcpEndpoint::parse(NOTION_MCP_URL, false).unwrap();
         assert!(hosted_mcp_url_allowed(NOTION_MCP_URL, &endpoint));
+    }
+
+    #[test]
+    fn hosted_mcp_url_allowed_accepts_same_origin_trusted_internal_path() {
+        let endpoint = HostedMcpEndpoint::parse("http://api:3002/mcp", true).unwrap();
+        assert!(hosted_mcp_url_allowed(
+            "http://api:3002/mcp/internal",
+            &endpoint
+        ));
     }
 
     #[test]

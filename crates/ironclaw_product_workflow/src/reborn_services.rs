@@ -6072,6 +6072,24 @@ impl RebornServices {
             ) => {
                 let original_error =
                     RebornServicesError::from_status(RebornServicesErrorCode::NotFound, 404, false);
+                if let Some(access) = self
+                    .try_project_scoped_thread_access(&caller, scope, &caller.actor())
+                    .await?
+                {
+                    let resolved_scope = thread_scope_from_turn_scope(
+                        &access.scope,
+                        Some(access.run_actor.user_id.clone()),
+                    )?;
+                    let history = self
+                        .thread_service
+                        .list_thread_history(ThreadHistoryRequest {
+                            scope: resolved_scope.clone(),
+                            thread_id: access.scope.thread_id.clone(),
+                        })
+                        .await
+                        .map_err(map_timeline_probe_error)?;
+                    return Ok((resolved_scope, history));
+                }
                 self.try_automation_trigger_timeline_fallback(caller, scope, original_error)
                     .await
             }
@@ -6104,6 +6122,66 @@ impl RebornServices {
             .await
             .map_err(map_timeline_probe_error)?;
         Ok((true_thread_scope, history))
+    }
+
+    /// Probe authorized project scopes when the browser sends only an opaque
+    /// thread id. The legacy TianQuan API deliberately keeps project identity
+    /// out of the old request body, so a caller with no default project cannot
+    /// resolve a thread created under one of its authorized projects by the
+    /// default-scope probe alone.
+    async fn try_project_scoped_thread_access(
+        &self,
+        caller: &WebUiAuthenticatedCaller,
+        scope: &TurnScope,
+        actor: &TurnActor,
+    ) -> Result<Option<ResolvedThreadAccess>, RebornServicesError> {
+        if scope.project_id.is_some() {
+            return Ok(None);
+        }
+        let Some(project_service) = self.project_service.as_ref() else {
+            return Ok(None);
+        };
+        let projects = project_service
+            .list_projects(
+                project_caller(caller),
+                // ProjectService clamps this to its hard maximum (currently
+                // 500), keeping the fallback bounded while covering the full
+                // caller-visible local-dev project catalog.
+                RebornListProjectsRequest { limit: Some(500) },
+            )
+            .await
+            .map_err(map_project_service_error)?;
+        for project in projects.projects {
+            let project_id = ProjectId::new(project.project_id).map_err(|error| {
+                tracing::error!(?error, "project service returned an invalid project id");
+                RebornServicesError::internal()
+            })?;
+            let mut candidate_scope = scope.clone();
+            candidate_scope.project_id = Some(project_id);
+            let candidate_thread_scope =
+                thread_scope_from_turn_scope(&candidate_scope, Some(actor.user_id.clone()))?;
+            match self
+                .thread_service
+                .read_thread(ThreadHistoryRequest {
+                    scope: candidate_thread_scope,
+                    thread_id: candidate_scope.thread_id.clone(),
+                })
+                .await
+            {
+                Ok(_) => {
+                    return Ok(Some(ResolvedThreadAccess {
+                        scope: candidate_scope,
+                        run_actor: actor.clone(),
+                    }));
+                }
+                Err(
+                    SessionThreadError::UnknownThread { .. }
+                    | SessionThreadError::ThreadScopeMismatch { .. },
+                ) => {}
+                Err(error) => return Err(map_ownership_probe_error(error)),
+            }
+        }
+        Ok(None)
     }
 
     /// Ownership probe for interaction endpoints (stream, cancel, gate resolve,
@@ -6145,6 +6223,12 @@ impl RebornServices {
             ) => {
                 let original_error =
                     RebornServicesError::from_status(RebornServicesErrorCode::NotFound, 404, false);
+                if let Some(access) = self
+                    .try_project_scoped_thread_access(&caller, &scope, actor)
+                    .await?
+                {
+                    return Ok(access);
+                }
                 let access = self
                     .check_automation_trigger_access(caller, &scope, original_error)
                     .await?;

@@ -2242,7 +2242,20 @@ impl ProjectService for AuthorizingProjectService {
         _caller: ProjectCaller,
         _request: RebornListProjectsRequest,
     ) -> Result<RebornListProjectsResponse, ProjectServiceError> {
-        Err(ProjectServiceError::Internal)
+        Ok(RebornListProjectsResponse {
+            projects: vec![RebornProjectInfo {
+                project_id: self.allowed_project_id.clone(),
+                name: "Authorized".to_string(),
+                description: String::new(),
+                icon: None,
+                color: None,
+                metadata: serde_json::json!({}),
+                state: RebornProjectState::Active,
+                role: RebornProjectRole::Owner,
+                created_at: "1970-01-01T00:00:00Z".parse().expect("created at"),
+                updated_at: "1970-01-01T00:00:00Z".parse().expect("updated at"),
+            }],
+        })
     }
 
     async fn create_project(
@@ -2436,6 +2449,40 @@ async fn create_thread_scopes_to_authorized_project() {
         Some("project-scoped"),
         "new thread must adopt the authorized project scope"
     );
+}
+
+#[tokio::test]
+async fn timeline_discovers_authorized_project_scoped_thread_without_body_project_id() {
+    let thread_service = Arc::new(InMemorySessionThreadService::default());
+    let services = RebornServices::new(
+        thread_service.clone(),
+        Arc::new(FakeTurnCoordinator::default()),
+    )
+    .with_project_service(Arc::new(AuthorizingProjectService {
+        allowed_project_id: "project-scoped".to_string(),
+    }));
+
+    services
+        .create_thread(
+            caller_with_project(None),
+            serde_json::from_value::<WebUiCreateThreadRequest>(json!({
+                "client_action_id": "create-scoped-timeline",
+                "requested_thread_id": "thread-scoped-timeline",
+                "project_id": "project-scoped"
+            }))
+            .expect("request"),
+        )
+        .await
+        .expect("authorized project create succeeds");
+
+    let response = services
+        .get_timeline(
+            caller_with_project(None),
+            RebornTimelineRequest::new("thread-scoped-timeline"),
+        )
+        .await
+        .expect("authorized project scope is discovered from the caller's project list");
+    assert_eq!(response.thread.thread_id.as_str(), "thread-scoped-timeline");
 }
 
 #[tokio::test]

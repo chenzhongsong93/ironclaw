@@ -21,9 +21,9 @@ use ironclaw_turns::{TurnActor, TurnScope};
 pub struct ThreadScopeResolver;
 
 impl ThreadScopeResolver {
-    /// Re-point `base`'s `owner_user_id` at the run's authenticated
-    /// `actor`, so each caller's thread I/O is isolated to its own
-    /// `owners/<user>` subtree.
+    /// Re-point `base`'s project and `owner_user_id` at the claimed turn so
+    /// project threads and each caller's `owners/<user>` subtree are read and
+    /// written consistently for the run.
     ///
     /// Only rewrites when the base scope is owner-scoped: an owner-less
     /// base (no declared owner) or an actor-less run is returned
@@ -43,19 +43,28 @@ impl ThreadScopeResolver {
         turn_scope: &TurnScope,
         actor: Option<&TurnActor>,
     ) -> ThreadScope {
+        // A runtime is composed once for an identity, while WebUI threads may
+        // be created inside different projects over that runtime's lifetime.
+        // Keep the base tenant/agent as the composition boundary (the host
+        // validator still rejects a mismatch), but bind the project axis to
+        // the claimed turn so project-scoped transcript reads and writes use
+        // the same durable subtree as the run. Leaving the composition-time
+        // project here (usually `None`) makes every project thread fail closed
+        // during host construction before a model request is emitted.
+        let mut scope = base.clone();
+        scope.project_id = turn_scope.project_id.clone();
         if turn_scope.has_explicit_thread_owner() {
-            let mut scope = base.clone();
             scope.owner_user_id = turn_scope.explicit_owner_user_id().cloned();
             return scope;
         }
-        Self::resolve(base, actor)
+        Self::resolve(&scope, actor)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironclaw_host_api::{AgentId, TenantId, UserId};
+    use ironclaw_host_api::{AgentId, ProjectId, TenantId, UserId};
 
     fn scope(owner: Option<&str>) -> ThreadScope {
         ThreadScope {
@@ -115,5 +124,45 @@ mod tests {
             ThreadScopeResolver::resolve_for_turn(&base, &turn_scope, Some(&actor("alice")));
 
         assert_eq!(resolved.owner_user_id, None);
+    }
+
+    #[test]
+    fn project_axis_follows_the_claimed_turn_scope() {
+        let base = scope(Some("runtime-owner"));
+        let turn_scope = TurnScope::new_with_owner(
+            base.tenant_id.clone(),
+            Some(base.agent_id.clone()),
+            Some(ProjectId::new("project-turn").unwrap()),
+            ironclaw_host_api::ThreadId::new("thread").unwrap(),
+            Some(UserId::new("alice").unwrap()),
+        );
+
+        let resolved = ThreadScopeResolver::resolve_for_turn(&base, &turn_scope, None);
+
+        assert_eq!(
+            resolved.project_id.as_ref().map(|id| id.as_str()),
+            Some("project-turn")
+        );
+        assert_eq!(
+            resolved.owner_user_id.as_ref().map(|id| id.as_str()),
+            Some("alice")
+        );
+    }
+
+    #[test]
+    fn project_axis_is_cleared_for_a_projectless_turn() {
+        let mut base = scope(Some("runtime-owner"));
+        base.project_id = Some(ProjectId::new("stale-project").unwrap());
+        let turn_scope = TurnScope::new_with_owner(
+            base.tenant_id.clone(),
+            Some(base.agent_id.clone()),
+            None,
+            ironclaw_host_api::ThreadId::new("thread").unwrap(),
+            Some(UserId::new("alice").unwrap()),
+        );
+
+        let resolved = ThreadScopeResolver::resolve_for_turn(&base, &turn_scope, None);
+
+        assert_eq!(resolved.project_id, None);
     }
 }

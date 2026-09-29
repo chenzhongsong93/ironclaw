@@ -3540,7 +3540,8 @@ pub async fn build_reborn_runtime(
             reason: error.to_string(),
         })?;
     let durable_milestone_sink: Arc<dyn LoopHostMilestoneSink> = Arc::new(
-        DurableLoopHostMilestoneSink::new(Arc::clone(&event_log), milestone_scope),
+        DurableLoopHostMilestoneSink::new(Arc::clone(&event_log), milestone_scope)
+            .with_run_project_scope(),
     );
     if trusted_laptop_access {
         append_trusted_laptop_access_audit(&audit_log, &thread_scope, &actor_user_id).await?;

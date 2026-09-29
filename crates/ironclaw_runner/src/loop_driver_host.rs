@@ -2353,7 +2353,37 @@ where
                 .capability_factory
                 .create_capability_port(&request.loop_run_context)
                 .await
-                .map_err(|error| crate::turn_runner::HostFactoryError::new(error.safe_summary))?;
+                .map_err(|error| {
+                    // `AgentLoopHostError::safe_summary` is already sanitized for
+                    // model/runtime consumers. Keep the typed kind beside it so
+                    // a host-construction failure can be diagnosed without
+                    // exposing backend details or secrets.
+                    tracing::warn!(
+                        component = "reborn_loop_host_factory",
+                        operation = "create_capability_port",
+                        error_kind = error.kind.as_str(),
+                        error = %error.safe_summary,
+                        tenant_id = %request.loop_run_context.scope.tenant_id,
+                        agent_id = request
+                            .loop_run_context
+                            .scope
+                            .agent_id
+                            .as_ref()
+                            .map(|id| id.as_str())
+                            .unwrap_or(""),
+                        project_id = request
+                            .loop_run_context
+                            .scope
+                            .project_id
+                            .as_ref()
+                            .map(|id| id.as_str())
+                            .unwrap_or(""),
+                        thread_id = %request.loop_run_context.thread_id,
+                        run_id = %request.loop_run_context.run_id,
+                        "profiled capability port creation failed"
+                    );
+                    crate::turn_runner::HostFactoryError::new(error.safe_summary)
+                })?;
             self.build_text_only_host_with_profiled_capabilities(
                 request,
                 capabilities,

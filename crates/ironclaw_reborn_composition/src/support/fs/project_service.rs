@@ -104,12 +104,23 @@ impl ProjectService for RebornProjectService {
         caller: ProjectCaller,
         request: RebornCreateProjectRequest,
     ) -> Result<RebornProjectResponse, ProjectServiceError> {
-        let mut record = ProjectRecord::new(
-            caller.tenant_id.clone(),
-            caller.user_id.clone(),
-            request.name,
-            request.description,
-        )
+        let mut record = match request.project_id {
+            Some(project_id) => ProjectRecord::new_with_id(
+                ProjectId::new(project_id).map_err(|_| ProjectServiceError::InvalidInput {
+                    field: "project_id".into(),
+                })?,
+                caller.tenant_id.clone(),
+                caller.user_id.clone(),
+                request.name,
+                request.description,
+            ),
+            None => ProjectRecord::new(
+                caller.tenant_id.clone(),
+                caller.user_id.clone(),
+                request.name,
+                request.description,
+            ),
+        }
         .map_err(map_repo_error)?;
         record.icon = request.icon;
         record.color = request.color;
@@ -651,6 +662,7 @@ mod tests {
             .create_project(
                 caller(),
                 RebornCreateProjectRequest {
+                    project_id: None,
                     name: "P".to_string(),
                     description: String::new(),
                     icon: None,

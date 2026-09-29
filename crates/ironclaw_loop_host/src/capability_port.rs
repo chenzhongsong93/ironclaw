@@ -3067,7 +3067,13 @@ fn invocation_context_from_visible(
     context.authenticated_actor_user_id = request
         .run_context
         .actor()
-        .map(|actor| actor.user_id.clone());
+        .map(|actor| actor.user_id.clone())
+        // WebChat child runs retain the trusted host scope even when the
+        // scheduler did not materialize a TurnActor. TianQuan's signed MCP
+        // context requires the authenticated actor; falling back to the
+        // host-authored scope user preserves that provenance without trusting
+        // model arguments or child task text.
+        .or_else(|| Some(context.resource_scope.user_id.clone()));
     context.validate().map_err(|_| {
         AgentLoopHostError::new(
             AgentLoopHostErrorKind::InvalidInvocation,

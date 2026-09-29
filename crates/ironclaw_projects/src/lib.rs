@@ -209,6 +209,22 @@ impl ProjectRecord {
     ) -> Result<Self, ProjectError> {
         let project_id = ProjectId::new(Ulid::new().to_string())
             .map_err(|error| ProjectError::invalid_record(error.to_string()))?;
+        Self::new_with_id(project_id, tenant_id, owner_user_id, name, description)
+    }
+
+    /// Construct a project with a server-assigned id.
+    ///
+    /// The browser project surface keeps using [`Self::new`]. This variant is
+    /// for a trusted platform exporter that must make a TianQuan project id
+    /// and the IronClaw ACL record converge without exposing an id override to
+    /// an untrusted caller.
+    pub fn new_with_id(
+        project_id: ProjectId,
+        tenant_id: TenantId,
+        owner_user_id: UserId,
+        name: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Result<Self, ProjectError> {
         let now = Utc::now();
         let record = Self {
             project_id,

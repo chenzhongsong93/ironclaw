@@ -6371,14 +6371,43 @@ impl RebornServices {
         // ownership semantics (UnknownThread / ThreadScopeMismatch
         // collapse to NotFound) must match `list_thread_history`'s
         // path, which `map_ownership_probe_error` guarantees.
-        self.thread_service
+        match self
+            .thread_service
             .read_thread(ThreadHistoryRequest {
                 scope: thread_scope.clone(),
                 thread_id: scope.thread_id.clone(),
             })
             .await
-            .map_err(map_ownership_probe_error)?;
-        Ok((scope, thread_scope))
+        {
+            Ok(_) => Ok((scope, thread_scope)),
+            Err(
+                SessionThreadError::UnknownThread { .. }
+                | SessionThreadError::ThreadScopeMismatch { .. },
+            ) => {
+                let caller = WebUiAuthenticatedCaller::new(
+                    scope.tenant_id.clone(),
+                    actor.user_id.clone(),
+                    scope.agent_id.clone(),
+                    scope.project_id.clone(),
+                );
+                if let Some(access) = self
+                    .try_project_scoped_thread_access(&caller, &scope, actor)
+                    .await?
+                {
+                    let resolved_scope = thread_scope_from_turn_scope(
+                        &access.scope,
+                        Some(access.run_actor.user_id.clone()),
+                    )?;
+                    return Ok((access.scope, resolved_scope));
+                }
+                Err(RebornServicesError::from_status(
+                    RebornServicesErrorCode::NotFound,
+                    404,
+                    false,
+                ))
+            }
+            Err(error) => Err(map_ownership_probe_error(error)),
+        }
     }
 
     async fn resolve_approval_gate(

@@ -2486,6 +2486,100 @@ async fn timeline_discovers_authorized_project_scoped_thread_without_body_projec
 }
 
 #[tokio::test]
+async fn submit_turn_discovers_authorized_project_scoped_thread_without_body_project_id() {
+    let thread_service = Arc::new(InMemorySessionThreadService::default());
+    let coordinator = Arc::new(FakeTurnCoordinator::default());
+    let services = RebornServices::new(thread_service.clone(), coordinator.clone())
+        .with_project_service(Arc::new(AuthorizingProjectService {
+            allowed_project_id: "project-scoped".to_string(),
+        }));
+
+    services
+        .create_thread(
+            caller_with_project(None),
+            serde_json::from_value::<WebUiCreateThreadRequest>(json!({
+                "client_action_id": "create-scoped-submit",
+                "requested_thread_id": "thread-scoped-submit",
+                "project_id": "project-scoped"
+            }))
+            .expect("request"),
+        )
+        .await
+        .expect("authorized project create succeeds");
+
+    let response = services
+        .submit_turn(
+            caller_with_project(None),
+            serde_json::from_value::<WebUiSendMessageRequest>(json!({
+                "client_action_id": "send-scoped-submit",
+                "thread_id": "thread-scoped-submit",
+                "content": "project scoped message"
+            }))
+            .expect("request"),
+        )
+        .await
+        .expect("authorized project submit succeeds");
+    assert!(matches!(
+        response,
+        RebornSubmitTurnResponse::Submitted { .. }
+    ));
+    assert_eq!(coordinator.submission_count(), 1);
+    assert_eq!(
+        coordinator
+            .last_submission_scope()
+            .expect("submission scope")
+            .project_id
+            .expect("project")
+            .as_str(),
+        "project-scoped"
+    );
+}
+
+#[tokio::test]
+async fn submit_turn_does_not_probe_or_write_another_project_thread() {
+    let thread_service = Arc::new(InMemorySessionThreadService::default());
+    let owner_services = RebornServices::new(
+        thread_service.clone(),
+        Arc::new(FakeTurnCoordinator::default()),
+    )
+    .with_project_service(Arc::new(AuthorizingProjectService {
+        allowed_project_id: "project-scoped".to_string(),
+    }));
+    owner_services
+        .create_thread(
+            caller_with_project(None),
+            serde_json::from_value::<WebUiCreateThreadRequest>(json!({
+                "client_action_id": "create-private-project",
+                "requested_thread_id": "thread-private-project",
+                "project_id": "project-scoped"
+            }))
+            .expect("request"),
+        )
+        .await
+        .expect("owner creates project thread");
+
+    let attacker_coordinator = Arc::new(FakeTurnCoordinator::default());
+    let attacker_services = RebornServices::new(thread_service, attacker_coordinator.clone())
+        .with_project_service(Arc::new(AuthorizingProjectService {
+            allowed_project_id: "other-project".to_string(),
+        }));
+    let error = attacker_services
+        .submit_turn(
+            caller_with_project(None),
+            serde_json::from_value::<WebUiSendMessageRequest>(json!({
+                "client_action_id": "attack-private-project",
+                "thread_id": "thread-private-project",
+                "content": "must be rejected"
+            }))
+            .expect("request"),
+        )
+        .await
+        .expect_err("caller without project access must receive not found");
+    assert_eq!(error.code, RebornServicesErrorCode::NotFound);
+    assert_eq!(attacker_coordinator.submission_count(), 0);
+}
+
+#[tokio::test]
 async fn create_thread_rejects_unauthorized_project() {
     let services = RebornServices::new(
         Arc::new(InMemorySessionThreadService::default()),

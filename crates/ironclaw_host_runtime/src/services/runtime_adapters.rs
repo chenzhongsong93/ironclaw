@@ -362,6 +362,9 @@ where
         &self,
         request: RuntimeAdapterRequest<'_, F, G>,
     ) -> Result<RuntimeAdapterResult, DispatchError> {
+        let scope_user_id = request.scope.user_id.clone();
+        let authenticated_actor_user_id = request.authenticated_actor_user_id.clone();
+        let run_id = request.run_id;
         let execution = self
             .executor
             .execute_extension_json(
@@ -390,7 +393,17 @@ where
                 },
             )
             .await
-            .map_err(|error| match error {
+            .map_err(|error| {
+                tracing::warn!(
+                    target = "ironclaw_mcp_runtime",
+                    capability = %request.capability_id,
+                    run_id = ?run_id,
+                    scope_user_id = %scope_user_id,
+                    authenticated_actor_user_id = ?authenticated_actor_user_id,
+                    error = ?error,
+                    "MCP runtime dispatch failed"
+                );
+                match error {
                 McpError::AuthRequired {
                     required_secrets,
                     credential_requirements,
@@ -411,6 +424,7 @@ where
                     kind: mcp_error_kind(&error),
                     safe_summary: None,
                 },
+                }
             })?;
 
         Ok(RuntimeAdapterResult {

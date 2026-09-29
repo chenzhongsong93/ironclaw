@@ -624,9 +624,15 @@ fn ensure_thread_scope_matches_turn_scope(
                 .to_string(),
         });
     };
+    let project_matches = thread_scope.project_id == turn_scope.project_id
+        // The composition-time scope is a reusable tenant/agent template. A
+        // trusted project-scoped turn may bind its concrete project at run
+        // time; `ThreadScopeResolver` applies that binding immediately after
+        // this guard. A non-empty stale project still fails closed.
+        || (thread_scope.project_id.is_none() && turn_scope.project_id.is_some());
     if thread_scope.tenant_id != turn_scope.tenant_id
         || &thread_scope.agent_id != agent_id
-        || thread_scope.project_id.as_ref() != turn_scope.project_id.as_ref()
+        || !project_matches
     {
         return Err(TurnError::InvalidRequest {
             reason: "thread checkpoint loop-exit evidence scope does not match turn scope"

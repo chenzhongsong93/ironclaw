@@ -173,14 +173,16 @@ pub(crate) async fn record_spawn_terminal(
     record: &SpawnProvenanceRecord,
     final_text: Option<&str>,
 ) {
-    if !persist_final_text_to_workspace(final_text, record) {
-        // 已有同 child 的不同原文或落盘失败：不更新 PG hash，保留首次可信来源。
-        return;
+    let raw_persisted = persist_final_text_to_workspace(final_text, record);
+    let mut terminal_record = record.clone();
+    if !raw_persisted {
+        // 文件失败不能隐藏终态，也不能发布未经落盘确认的新 hash。
+        terminal_record.final_text_hash = None;
     }
     let Some(pg_url) = pg_url else {
         return;
     };
-    if let Err(error) = upsert_spawn_record(pg_url, record).await {
+    if let Err(error) = upsert_spawn_record(pg_url, &terminal_record).await {
         tracing::warn!(
             target: "tianquan_spawn_provenance",
             child_run_id = %record.child_run_id,
@@ -398,7 +400,7 @@ async fn upsert_spawn_record(
              layer = COALESCE(spawn_records.layer, EXCLUDED.layer), \
              spawned_at = spawn_records.spawned_at, \
              terminal_status = EXCLUDED.terminal_status, \
-             final_text_hash = EXCLUDED.final_text_hash, \
+             final_text_hash = COALESCE(EXCLUDED.final_text_hash, spawn_records.final_text_hash), \
              failure_category = EXCLUDED.failure_category",
             &[
                 &record.child_run_id,
@@ -959,6 +961,91 @@ mod tests {
         assert_eq!(
             row.get::<_, Option<String>>(5).as_deref(),
             Some("loop:prose")
+        );
+
+        // 覆盖:AE-L2-107/ISSUE-IRONCLAW-021 — raw目录失败不能隐藏终态或发布新hash。
+        let bad_root =
+            tempfile::NamedTempFile::new().expect("ordinary file cannot be raw directory");
+        let good_root = tempfile::tempdir().expect("isolated raw root");
+        let old_root = std::env::var_os("TIANQUAN_SPAWN_PROSE_DIR");
+        unsafe { std::env::set_var("TIANQUAN_SPAWN_PROSE_DIR", bad_root.path()) };
+        let export_child = TurnRunId::new();
+        let export_started = SpawnProvenanceRecord::from_spawned(
+            &export_child,
+            &parent,
+            &scope,
+            &kind("novelist"),
+            spawned_at,
+        );
+        record_spawn_started(Some(&pg_url), &export_started).await;
+        let export_terminal = terminal_record!(
+            &export_child,
+            &parent,
+            &scope,
+            &kind("novelist"),
+            EdgeTerminalKind::Completed,
+            Some("first raw"),
+            spawned_at,
+            None,
+        );
+        record_spawn_terminal(Some(&pg_url), &export_terminal, Some("first raw")).await;
+        let failed_export = client
+            .query_one(
+                "SELECT terminal_status,final_text_hash FROM spawn_records WHERE child_run_id=$1",
+                &[&export_child.to_string()],
+            )
+            .await
+            .expect("failed export row");
+        assert_eq!(
+            failed_export.get::<_, String>(0),
+            "Completed",
+            "file failure must not leave Spawned"
+        );
+        assert_eq!(failed_export.get::<_, Option<String>>(1), None);
+        unsafe { std::env::set_var("TIANQUAN_SPAWN_PROSE_DIR", good_root.path()) };
+        record_spawn_terminal(Some(&pg_url), &export_terminal, Some("first raw")).await;
+        let conflict = terminal_record!(
+            &export_child,
+            &parent,
+            &scope,
+            &kind("novelist"),
+            EdgeTerminalKind::Completed,
+            Some("different raw"),
+            spawned_at,
+            None,
+        );
+        record_spawn_terminal(Some(&pg_url), &conflict, Some("different raw")).await;
+        let unavailable_pg = pg_url.replace("/atomic_spawn_test", "/atomic_spawn_missing");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            record_spawn_terminal(Some(&unavailable_pg), &conflict, Some("different raw")),
+        )
+        .await
+        .expect("raw conflict and unavailable database must not break settle");
+        match old_root {
+            Some(value) => unsafe { std::env::set_var("TIANQUAN_SPAWN_PROSE_DIR", value) },
+            None => unsafe { std::env::remove_var("TIANQUAN_SPAWN_PROSE_DIR") },
+        }
+        let preserved = client
+            .query_one(
+                "SELECT final_text_hash FROM spawn_records WHERE child_run_id=$1",
+                &[&export_child.to_string()],
+            )
+            .await
+            .expect("preserved raw hash");
+        assert_eq!(
+            preserved.get::<_, Option<String>>(0),
+            Some(sha256_hex("first raw"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                good_root
+                    .path()
+                    .join("runs")
+                    .join(format!("{export_child}.txt"))
+            )
+            .expect("first raw"),
+            "first raw"
         );
 
         // Wrong-project and NULL sources never acquire a layer, regardless of novelist role.

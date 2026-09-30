@@ -580,6 +580,12 @@ mod tests {
                 LoopDriverId::new(SUBAGENT_PLANNED_DRIVER_ID).expect("subagent driver id");
             context.resolved_run_profile.loop_driver.version =
                 RunProfileVersion::new(PLANNED_DRIVER_DEFAULT_VERSION);
+            // 覆盖:AE-L1-149 — 与实际子运行的能力面身份一致，避免走普通运行分支。
+            context.resolved_run_profile.capability_surface_profile_id =
+                ironclaw_turns::run_profile::CapabilitySurfaceProfileId::new(
+                    crate::planned_driver_factory::SUBAGENT_CAPABILITY_SURFACE_PROFILE_ID,
+                )
+                .expect("subagent capability surface profile id");
             goal_store
                 .put_goal(
                     &context.scope,

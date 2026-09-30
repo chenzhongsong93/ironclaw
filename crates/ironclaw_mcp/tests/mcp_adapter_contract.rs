@@ -1034,12 +1034,17 @@ async fn tianquan_context_signer_targets_only_internal_route_and_binds_each_http
         "initialize, notification, and call are sent"
     );
     let mut nonces = std::collections::HashSet::new();
-    for request in &requests {
-        assert_eq!(
-            request.url, AUDIENCE,
-            "only trusted TQ calls use internal route"
-        );
+    for (index, request) in requests.iter().enumerate() {
         assert_eq!(request.method, NetworkMethod::Post);
+        if index < 2 {
+            assert_eq!(request.url, "http://tianquan-api.test:3002/mcp");
+            assert!(request.headers.iter().all(|(name, _)| {
+                !name.eq_ignore_ascii_case("x-tianquan-execution-context")
+                    && !name.eq_ignore_ascii_case("x-tianquan-execution-signature")
+            }));
+            continue;
+        }
+        assert_eq!(request.url, AUDIENCE, "only tool calls use internal route");
         let payload = request
             .headers
             .iter()

@@ -6,6 +6,7 @@
 //! runtime dispatch before any handler runs.
 
 mod echo;
+mod ask_user_question;
 mod http;
 mod http_output;
 mod json;
@@ -34,7 +35,8 @@ use ironclaw_first_party_extensions::coding::{
     CodingCapabilityError, CodingCapabilityKind, CodingCapabilityRequest, CodingCapabilityState,
 };
 use ironclaw_host_api::{
-    CapabilityId, CapabilityProfileSchemaRef, EffectKind, ExtensionId, HostApiError,
+    CapabilityDisplayOutputPreview, CapabilityId, CapabilityProfileSchemaRef, EffectKind,
+    ExtensionId, HostApiError,
     PermissionMode, ProcessBackendKind, RequestedTrustClass, ResourceCeiling, ResourceEstimate,
     ResourceProfile, ResourceUsage, RuntimeDispatchErrorKind, RuntimeHttpEgressError,
     RuntimeHttpEgressResponse, TrustClass, VirtualPath,
@@ -48,6 +50,7 @@ use crate::{
 pub(crate) use self::schemas::resolve_builtin_input_schema_ref;
 
 pub use echo::ECHO_CAPABILITY_ID;
+pub(crate) use ask_user_question::ASK_USER_QUESTION_CAPABILITY_ID;
 pub use http::{HTTP_CAPABILITY_ID, HTTP_SAVE_CAPABILITY_ID};
 pub use json::JSON_CAPABILITY_ID;
 pub use memory::{
@@ -156,6 +159,7 @@ pub fn builtin_first_party_package() -> Result<ExtensionPackage, ExtensionError>
             capabilities: {
                 let mut capabilities = vec![
                     echo::manifest()?,
+                    ask_user_question::manifest()?,
                     time::manifest()?,
                     json::manifest()?,
                     http::manifest()?,
@@ -368,6 +372,10 @@ fn builtin_first_party_base_registry() -> Result<FirstPartyCapabilityRegistry, H
     let handler = Arc::new(BuiltinFirstPartyTools::default());
     let mut registry = FirstPartyCapabilityRegistry::new()
         .with_handler(CapabilityId::new(ECHO_CAPABILITY_ID)?, handler.clone())
+        .with_handler(
+            CapabilityId::new(ASK_USER_QUESTION_CAPABILITY_ID)?,
+            handler.clone(),
+        )
         .with_handler(CapabilityId::new(TIME_CAPABILITY_ID)?, handler.clone())
         .with_handler(CapabilityId::new(JSON_CAPABILITY_ID)?, handler.clone())
         .with_handler(CapabilityId::new(TODO_READ_CAPABILITY_ID)?, handler.clone())
@@ -531,6 +539,20 @@ impl FirstPartyCapabilityHandler for BuiltinFirstPartyTools {
         let mut process_count = 0u32;
         let (output, display_preview) = match request.capability_id.as_str() {
             ECHO_CAPABILITY_ID => (echo::dispatch(&request.input)?, None),
+            ASK_USER_QUESTION_CAPABILITY_ID => {
+                let output = ask_user_question::dispatch(&request.input)?;
+                let output_preview = serde_json::to_string(&output).unwrap_or_default();
+                (
+                    output,
+                    Some(CapabilityDisplayOutputPreview {
+                        output_summary: Some("AskUserQuestion".to_string()),
+                        output_preview,
+                        output_kind: "json".to_string(),
+                        subtitle: Some("作者选择".to_string()),
+                        truncated: false,
+                    }),
+                )
+            }
             TIME_CAPABILITY_ID => (time::dispatch(&request.input)?, None),
             JSON_CAPABILITY_ID => (json::dispatch(&request.input)?, None),
             TODO_READ_CAPABILITY_ID | TODO_WRITE_CAPABILITY_ID => {

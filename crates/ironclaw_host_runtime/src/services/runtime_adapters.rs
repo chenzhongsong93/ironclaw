@@ -362,6 +362,10 @@ where
         &self,
         request: RuntimeAdapterRequest<'_, F, G>,
     ) -> Result<RuntimeAdapterResult, DispatchError> {
+        let trusted_actor = request
+            .authenticated_actor_user_id
+            .clone()
+            .or_else(|| Some(request.scope.user_id.clone()));
         let execution = self
             .executor
             .execute_extension_json(
@@ -375,17 +379,17 @@ where
                     invocation: McpInvocation {
                         input: request.input,
                     },
-                    trusted_context: match (
-                        request.authenticated_actor_user_id.clone(),
-                        request.run_id,
-                    ) {
-                        (None, None) => None,
-                        (authenticated_actor_user_id, run_id) => {
-                            Some(ironclaw_mcp::McpTrustedExecutionContext {
-                                authenticated_actor_user_id,
-                                run_id,
-                            })
-                        }
+                    trusted_context: match request.run_id {
+                        None => None,
+                        Some(run_id) => Some(ironclaw_mcp::McpTrustedExecutionContext {
+                            // WebChat's authenticated actor is carried by the
+                            // trusted resource scope in this path. Preserve an
+                            // explicit actor when present; otherwise use the
+                            // scope user so the TianQuan MCP signer can bind
+                            // the HMAC context to the same owner.
+                            authenticated_actor_user_id: trusted_actor,
+                            run_id: Some(run_id),
+                        }),
                     },
                 },
             )

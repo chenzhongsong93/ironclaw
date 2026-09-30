@@ -83,7 +83,9 @@ pub async fn get_thread_plan(
     State(state): State<WebUiV2State>,
     Extension(caller): Extension<WebUiAuthenticatedCaller>,
     Path(thread_id): Path<String>,
+    Query(query): Query<TimelineQuery>,
 ) -> Result<Json<RebornGetThreadPlanResponse>, WebUiV2HttpError> {
+    let caller = caller_with_project_scope(caller, query.project_id);
     let response = state
         .services()
         .get_thread_plan(caller, RebornGetThreadPlanRequest { thread_id })
@@ -96,7 +98,9 @@ pub async fn get_run_state(
     State(state): State<WebUiV2State>,
     Extension(caller): Extension<WebUiAuthenticatedCaller>,
     Path((thread_id, run_id)): Path<(String, String)>,
+    Query(query): Query<TimelineQuery>,
 ) -> Result<Json<RebornGetRunStateResponse>, WebUiV2HttpError> {
+    let caller = caller_with_project_scope(caller, query.project_id);
     let response = state
         .services()
         .get_run_state(caller, RebornGetRunStateRequest { thread_id, run_id })
@@ -421,6 +425,7 @@ pub async fn get_timeline(
     Path(thread_id): Path<String>,
     Query(query): Query<TimelineQuery>,
 ) -> Result<Json<RebornTimelineResponse>, WebUiV2HttpError> {
+    let caller = caller_with_project_scope(caller, query.project_id);
     let request = RebornTimelineRequest {
         thread_id,
         limit: query.limit,
@@ -438,6 +443,8 @@ pub struct TimelineQuery {
     pub limit: Option<u32>,
     #[serde(default)]
     pub cursor: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<ironclaw_host_api::ProjectId>,
 }
 
 /// Default workspace root listed when a `list_project_files` request omits
@@ -925,6 +932,7 @@ pub async fn stream_events(
     headers: HeaderMap,
     Query(query): Query<StreamEventsQuery>,
 ) -> Result<Response, WebUiV2HttpError> {
+    let caller = caller_with_project_scope(caller, query.project_id);
     let slot = state
         .sse_capacity()
         .try_acquire(&caller.tenant_id, &caller.user_id)
@@ -974,6 +982,22 @@ fn sse_concurrency_exhausted() -> WebUiV2HttpError {
 pub struct StreamEventsQuery {
     #[serde(default)]
     pub after_cursor: Option<String>,
+    /// Project scope carried by trusted adapters that use a shared bearer
+    /// token. The facade still authorizes the project/thread pair before
+    /// opening the projection stream; this only restores the caller scope
+    /// that is present on create/send requests.
+    #[serde(default)]
+    pub project_id: Option<ironclaw_host_api::ProjectId>,
+}
+
+fn caller_with_project_scope(
+    mut caller: WebUiAuthenticatedCaller,
+    project_id: Option<ironclaw_host_api::ProjectId>,
+) -> WebUiAuthenticatedCaller {
+    if project_id.is_some() {
+        caller.project_id = project_id;
+    }
+    caller
 }
 
 /// Redacted SSE error payload. Defined as a typed struct (not built with
@@ -2408,6 +2432,7 @@ pub async fn stream_events_ws(
     Query(query): Query<StreamEventsQuery>,
     upgrade: axum::extract::ws::WebSocketUpgrade,
 ) -> Result<axum::response::Response, WebUiV2HttpError> {
+    let caller = caller_with_project_scope(caller, query.project_id);
     let slot = state
         .sse_capacity()
         .try_acquire(&caller.tenant_id, &caller.user_id)

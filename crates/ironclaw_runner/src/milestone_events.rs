@@ -87,10 +87,12 @@ impl DurableLoopHostMilestoneScope {
         &self,
         milestone: &LoopHostMilestone,
     ) -> Result<ResourceScope, AgentLoopHostError> {
-        if milestone.scope.tenant_id != self.tenant_id
-            || milestone.scope.agent_id != self.agent_id
-            || milestone.scope.project_id != self.project_id
-        {
+        // The factory is process-scoped, while WebChat runs may select a
+        // project/agent dynamically after authorization. Tenant remains the
+        // installation boundary; agent/project/owner come from the already
+        // authorized run milestone so a valid WebChat run is not rejected by
+        // the process default scope.
+        if milestone.scope.tenant_id != self.tenant_id {
             return Err(AgentLoopHostError::new(
                 AgentLoopHostErrorKind::ScopeMismatch,
                 "loop milestone scope does not match durable event scope",
@@ -116,9 +118,14 @@ impl DurableLoopHostMilestoneScope {
         }
         Ok(ResourceScope {
             tenant_id: self.tenant_id.clone(),
-            user_id: self.user_id.clone(),
-            agent_id: self.agent_id.clone(),
-            project_id: self.project_id.clone(),
+            user_id: milestone
+                .scope
+                .explicit_owner_user_id()
+                .cloned()
+                .or_else(|| milestone.actor.as_ref().map(|actor| actor.user_id.clone()))
+                .unwrap_or_else(|| self.user_id.clone()),
+            agent_id: milestone.scope.agent_id.clone(),
+            project_id: milestone.scope.project_id.clone(),
             mission_id: self.mission_id.clone(),
             thread_id: Some(milestone.scope.thread_id.clone()),
             invocation_id: InvocationId::from_uuid(milestone.run_id.as_uuid()),

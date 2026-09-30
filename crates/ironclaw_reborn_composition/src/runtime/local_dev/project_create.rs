@@ -73,6 +73,7 @@ impl SyntheticCapabilityHandler for ProjectCreateHandler {
             user_id: effective_user_id(&invocation.run_context, &self.fallback_user_id),
         };
         let request = RebornCreateProjectRequest {
+            project_id: None,
             name: input.name,
             description: input.description,
             icon: None,

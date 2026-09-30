@@ -109,6 +109,10 @@ pub struct RebornProjectResponse {
 /// Browser body for creating a project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RebornCreateProjectRequest {
+    /// Optional canonical id supplied by a trusted product integration.
+    /// Browser callers omit it and receive the normal generated ULID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     pub name: String,
     #[serde(default)]
     pub description: String,

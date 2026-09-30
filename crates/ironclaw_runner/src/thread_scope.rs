@@ -43,12 +43,22 @@ impl ThreadScopeResolver {
         turn_scope: &TurnScope,
         actor: Option<&TurnActor>,
     ) -> ThreadScope {
+        // WebChat v2 authorizes the project/agent scope before admitting the
+        // turn. Host construction must use that same resolved scope; keeping
+        // the process-default project here makes a valid dynamic project look
+        // like a scope mismatch at runtime.
+        let mut scope = base.clone();
+        if let Some(agent_id) = &turn_scope.agent_id {
+            scope.agent_id = agent_id.clone();
+        }
+        if turn_scope.project_id.is_some() {
+            scope.project_id = turn_scope.project_id.clone();
+        }
         if turn_scope.has_explicit_thread_owner() {
-            let mut scope = base.clone();
             scope.owner_user_id = turn_scope.explicit_owner_user_id().cloned();
             return scope;
         }
-        Self::resolve(base, actor)
+        Self::resolve(&scope, actor)
     }
 }
 
@@ -115,5 +125,37 @@ mod tests {
             ThreadScopeResolver::resolve_for_turn(&base, &turn_scope, Some(&actor("alice")));
 
         assert_eq!(resolved.owner_user_id, None);
+    }
+
+    #[test]
+    fn dynamic_agent_and_project_scope_follow_authorized_turn() {
+        let base = ThreadScope {
+            tenant_id: TenantId::new("tenant").expect("tenant"),
+            agent_id: AgentId::new("default-agent").expect("agent"),
+            project_id: None,
+            owner_user_id: Some(UserId::new("runtime-owner").expect("owner")),
+            mission_id: None,
+        };
+        let turn_scope = TurnScope::new_with_owner(
+            base.tenant_id.clone(),
+            Some(AgentId::new("tianquan-creator").expect("agent")),
+            Some(ironclaw_host_api::ProjectId::new("iron-city").expect("project")),
+            ironclaw_host_api::ThreadId::new("thread").expect("thread"),
+            Some(UserId::new("tianquan-admin").expect("owner")),
+        );
+        let resolved = ThreadScopeResolver::resolve_for_turn(
+            &base,
+            &turn_scope,
+            Some(&actor("runtime-actor")),
+        );
+        assert_eq!(resolved.agent_id.as_str(), "tianquan-creator");
+        assert_eq!(
+            resolved.project_id.as_ref().map(|id| id.as_str()),
+            Some("iron-city")
+        );
+        assert_eq!(
+            resolved.owner_user_id.as_ref().map(|id| id.as_str()),
+            Some("tianquan-admin")
+        );
     }
 }

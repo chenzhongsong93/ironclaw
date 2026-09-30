@@ -618,16 +618,17 @@ fn ensure_thread_scope_matches_turn_scope(
     thread_scope: &ThreadScope,
     turn_scope: &TurnScope,
 ) -> Result<(), TurnError> {
-    let Some(agent_id) = turn_scope.agent_id.as_ref() else {
+    let Some(_agent_id) = turn_scope.agent_id.as_ref() else {
         return Err(TurnError::InvalidRequest {
             reason: "thread checkpoint loop-exit evidence requires agent-scoped turn scope"
                 .to_string(),
         });
     };
-    if thread_scope.tenant_id != turn_scope.tenant_id
-        || &thread_scope.agent_id != agent_id
-        || thread_scope.project_id.as_ref() != turn_scope.project_id.as_ref()
-    {
+    // `thread_scope` is the process installation base. WebChat v2 may select
+    // an authorized agent/project per turn; the resolver below rebinds those
+    // axes before reading evidence. Tenant remains the hard installation
+    // boundary here.
+    if thread_scope.tenant_id != turn_scope.tenant_id {
         return Err(TurnError::InvalidRequest {
             reason: "thread checkpoint loop-exit evidence scope does not match turn scope"
                 .to_string(),

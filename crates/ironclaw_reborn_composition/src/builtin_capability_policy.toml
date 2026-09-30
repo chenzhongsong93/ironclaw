@@ -92,6 +92,12 @@ mounts = "workspace"
 network = "default"
 
 [[grants]]
+capability = "builtin.ask_user_question"
+effects = ["dispatch_capability"]
+mounts = "ambient"
+network = "default"
+
+[[grants]]
 capability = "builtin.time"
 effects = ["dispatch_capability", "read_filesystem", "write_filesystem"]
 mounts = "workspace"

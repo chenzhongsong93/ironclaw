@@ -30,6 +30,43 @@ pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value>
             "required": ["message"],
             "additionalProperties": false
         }),
+        "schemas/builtin/ask_user_question.input.v1.json" => json!({
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": { "type": "string", "minLength": 1 },
+                            "header": { "type": "string" },
+                            "options": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 6,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": { "type": "string", "minLength": 1 },
+                                        "description": { "type": "string" }
+                                    },
+                                    "required": ["label"],
+                                    "additionalProperties": false
+                                }
+                            },
+                            "multiSelect": { "type": "boolean", "default": false },
+                            "allowOther": { "type": "boolean", "default": true }
+                        },
+                        "required": ["question", "options"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["questions"],
+            "additionalProperties": false
+        }),
         "schemas/builtin/time.input.v1.json" => json!({
             "type": "object",
             "properties": {

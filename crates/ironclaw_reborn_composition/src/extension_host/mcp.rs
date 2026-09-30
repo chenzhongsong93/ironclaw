@@ -175,7 +175,23 @@ impl HostedMcpEndpoint {
         // Re-parse the request url tolerating the endpoint's own scheme so
         // an http endpoint admits http requests (local-dev only).
         let allow_http = self.scheme == NetworkScheme::Http;
-        Self::parse(url, allow_http).is_some_and(|request_endpoint| request_endpoint == *self)
+        let Some(request_endpoint) = Self::parse(url, allow_http) else {
+            return false;
+        };
+        if request_endpoint == *self {
+            return true;
+        }
+
+        // TianQuan's trusted-context signer redirects the execution request
+        // from the public discovery endpoint (/mcp) to the authenticated
+        // host-only endpoint (/mcp/internal). Keep the host, scheme and port
+        // bound to the manifest endpoint and admit only this exact suffix;
+        // arbitrary paths remain denied.
+        self.path == "/mcp"
+            && request_endpoint.path == "/mcp/internal"
+            && request_endpoint.scheme == self.scheme
+            && request_endpoint.host_pattern == self.host_pattern
+            && request_endpoint.port == self.port
     }
 }
 
@@ -567,6 +583,24 @@ mod tests {
         let endpoint = HostedMcpEndpoint::parse(NOTION_MCP_URL, false).unwrap();
         assert!(!hosted_mcp_url_allowed(
             "https://mcp.notion.com/other",
+            &endpoint
+        ));
+    }
+
+    #[test]
+    fn hosted_mcp_url_allowed_accepts_trusted_internal_suffix() {
+        let endpoint = HostedMcpEndpoint::parse("http://api:3002/mcp", true).unwrap();
+        assert!(hosted_mcp_url_allowed(
+            "http://api:3002/mcp/internal",
+            &endpoint
+        ));
+    }
+
+    #[test]
+    fn hosted_mcp_url_allowed_rejects_unrelated_internal_suffix() {
+        let endpoint = HostedMcpEndpoint::parse(NOTION_MCP_URL, false).unwrap();
+        assert!(!hosted_mcp_url_allowed(
+            "https://mcp.notion.com/mcp/internal",
             &endpoint
         ));
     }

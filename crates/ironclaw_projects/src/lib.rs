@@ -227,6 +227,33 @@ impl ProjectRecord {
         Ok(record)
     }
 
+    /// Construct a project with a canonical id supplied by a trusted product
+    /// integration. Normal browser project creation continues to use `new`.
+    pub fn new_with_id(
+        project_id: ProjectId,
+        tenant_id: TenantId,
+        owner_user_id: UserId,
+        name: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Result<Self, ProjectError> {
+        let now = Utc::now();
+        let record = Self {
+            project_id,
+            tenant_id,
+            owner_user_id,
+            name: name.into(),
+            description: description.into(),
+            icon: None,
+            color: None,
+            metadata: JsonValue::Object(serde_json::Map::new()),
+            state: ProjectState::Active,
+            created_at: now,
+            updated_at: now,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
     pub fn validate(&self) -> Result<(), ProjectError> {
         if self.name.trim().is_empty() {
             return Err(ProjectError::invalid_record(

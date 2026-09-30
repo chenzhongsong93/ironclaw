@@ -58,11 +58,11 @@ fn trace_executor_latency_ok(
     );
 }
 
-fn trace_executor_latency_error<E: ?Sized>(
+fn trace_executor_latency_error<E: ?Sized + std::fmt::Debug>(
     operation: &'static str,
     claimed: &ClaimedTurnRun,
     started_at: Option<Instant>,
-    _error: &E,
+    error: &E,
 ) {
     ironclaw_observability::live_latency_trace_error!(
         "reborn_turn_executor",
@@ -76,6 +76,13 @@ fn trace_executor_latency_error<E: ?Sized>(
         owner_user_id = claimed.state.scope.explicit_owner_user_id().map(|id| id.as_str()).unwrap_or(""),
         run_id = %claimed.state.run_id,
         "reborn turn executor operation failed",
+    );
+    tracing::error!(
+        run_id = %claimed.state.run_id,
+        operation,
+        error_type = std::any::type_name::<E>(),
+        detail = ?error,
+        "reborn turn executor operation failed with detail"
     );
 }
 
@@ -108,6 +115,7 @@ fn unknown_failure_error() -> &'static TurnRunExecutorError {
 ///
 /// Structurally mirrors the `DriverInvocationError` in `turn_runner.rs` but
 /// stripped of the heartbeat/cancel variants that are now owned by the scheduler.
+#[derive(Debug)]
 enum DriverInvocationError {
     DriverNotFound { reason: String },
     HostCreationFailed { reason: String },

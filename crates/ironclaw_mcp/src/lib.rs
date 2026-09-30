@@ -503,7 +503,8 @@ where
         let url = match self.trusted_context_signer.as_ref() {
             Some(signer)
                 if signer.provider_id() == &request.provider
-                    && request.trusted_context.is_some() =>
+                    && request.trusted_context.is_some()
+                    && matches!(method, McpJsonRpcMethod::ToolsCall) =>
             {
                 signer.audience().ok_or_else(|| {
                     McpClientError::client(request_denied(
@@ -563,6 +564,7 @@ where
         }
         if let Some(signer) = self.trusted_context_signer.as_ref()
             && signer.provider_id() == &request.provider
+            && matches!(planned.method, McpJsonRpcMethod::ToolsCall)
             && let Some(context) = request.trusted_context.as_ref()
         {
             let signed_headers = signer

@@ -6766,7 +6766,7 @@ async fn get_thread_plan_route_forwards_caller_and_preserves_null_snapshot_and_r
     let request = || {
         Request::builder()
             .method(Method::GET)
-            .uri("/api/webchat/v2/threads/plan-thread/plan")
+            .uri("/api/webchat/v2/threads/plan-thread/plan?project_id=plan-project")
             .body(Body::empty())
             .unwrap()
     };
@@ -6778,6 +6778,10 @@ async fn get_thread_plan_route_forwards_caller_and_preserves_null_snapshot_and_r
         assert_eq!(calls[0].0.user_id.as_str(), "plan-owner");
         assert_eq!(calls[0].0.tenant_id, caller().tenant_id);
         assert_eq!(calls[0].1.thread_id, "plan-thread");
+        assert_eq!(
+            calls[0].0.project_id.as_ref().map(ProjectId::as_str),
+            Some("plan-project")
+        );
     }
     // The next unprogrammed read is a real facade error, not another null.
     let response = app.oneshot(request()).await.unwrap();
@@ -6810,7 +6814,8 @@ async fn get_run_state_route_forwards_caller_path_and_canonical_status() {
         WebUiV2Capabilities::default(),
         caller_for_user("run-owner"),
     );
-    let uri = format!("/api/webchat/v2/threads/child-thread/runs/{run_id}");
+    let uri =
+        format!("/api/webchat/v2/threads/child-thread/runs/{run_id}?project_id=child-project");
     let response = app
         .clone()
         .oneshot(
@@ -6829,6 +6834,10 @@ async fn get_run_state_route_forwards_caller_path_and_canonical_status() {
     {
         let calls = services.get_run_state_calls.lock().unwrap();
         assert_eq!(calls[0].0.user_id.as_str(), "run-owner");
+        assert_eq!(
+            calls[0].0.project_id.as_ref().map(ProjectId::as_str),
+            Some("child-project")
+        );
         assert_eq!(calls[0].1.thread_id, "child-thread");
         assert_eq!(calls[0].1.run_id, run_id.to_string());
     }

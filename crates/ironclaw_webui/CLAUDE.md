@@ -89,6 +89,7 @@ closed (`500`) if that layer is missing (locked by
 | `webui.v2.logs` | GET | `/api/webchat/v2/logs` | — | `ProjectionOnly` |
 | `webui.v2.stream_events` | GET | `/api/webchat/v2/threads/{thread_id}/events` | **SSE** | `ProjectionOnly` |
 | `webui.v2.stream_events_ws` | GET | `/api/webchat/v2/threads/{thread_id}/ws` | **WebSocket** | `ProjectionOnly` |
+| `webui.v2.get_tool_result` | GET | `/api/webchat/v2/threads/{thread_id}/runs/{run_id}/results?result_ref=…&project_id=…` | — | `ProjectionOnly` |
 | `webui.v2.cancel_run` / `retry_run` / `resolve_gate` | POST | `…/runs/{run_id}/…` | — | `TurnCoordinator` |
 | `webui.v2.list/pause/resume/rename/delete_automation` | GET/POST/DELETE | `/api/webchat/v2/automations…` | — | `ProductWorkflow` |
 | `webui.v2.list_connectable_channels` | GET | `/api/webchat/v2/channels/connectable` | — | `ProjectionOnly` |

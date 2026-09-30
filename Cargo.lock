@@ -4881,6 +4881,7 @@ dependencies = [
  "ironclaw_reborn_traces",
  "ironclaw_run_state",
  "ironclaw_runner",
+ "ironclaw_safety",
  "ironclaw_telegram_v2_adapter",
  "ironclaw_threads",
  "ironclaw_trust",

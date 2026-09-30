@@ -24,6 +24,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | Single-user system | ✅ | ✅ | Explicit instance owner scope for persistent routines, secrets, jobs, settings, extensions, and workspace memory |
 | Multi-agent routing | ✅ | ❌ | Workspace isolation per-agent |
 | Session-based messaging | ✅ | ✅ | Owner scope is separate from sender identity and conversation scope |
+| 历史工具完整结果读取 | — | 已实现 | WebChat v2 results API 复用 owner/project/thread 作用域并绑定同 run 成功回执；4 MiB 上限，结构化脱敏保留嵌套 JSON |
 | Loopback-first networking | ✅ | ✅ | HTTP binds to 0.0.0.0 but can be configured |
 
 ### Owner: _Unassigned_

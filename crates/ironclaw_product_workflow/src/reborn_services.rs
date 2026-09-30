@@ -79,6 +79,7 @@ mod llm_config;
 mod project_fs;
 mod projects;
 mod thread_plan;
+mod tool_results;
 mod trace_credits;
 mod types;
 
@@ -95,6 +96,7 @@ pub use admin_users::{
 };
 pub use error::{RebornServicesError, RebornServicesErrorCode, RebornServicesErrorKind};
 pub use thread_plan::{RebornGetThreadPlanRequest, RebornGetThreadPlanResponse};
+pub use tool_results::{RebornToolResultRequest, RebornToolResultResponse};
 pub use trace_credits::{
     RebornAccountLoginLinkResponse, RebornAccountTrace, RebornAccountTracesResponse,
     RebornTraceCreditsResponse, RebornTraceHoldAuthorizeResponse,
@@ -1775,6 +1777,18 @@ pub trait RebornServicesApi: Send + Sync {
         caller: WebUiAuthenticatedCaller,
         request: RebornTimelineRequest,
     ) -> Result<RebornTimelineResponse, RebornServicesError>;
+
+    async fn get_tool_result(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        _request: RebornToolResultRequest,
+    ) -> Result<RebornToolResultResponse, RebornServicesError> {
+        Err(RebornServicesError::from_status(
+            RebornServicesErrorCode::Unavailable,
+            503,
+            true,
+        ))
+    }
 
     async fn get_thread_plan(
         &self,
@@ -4000,6 +4014,118 @@ impl RebornServicesApi for RebornServices {
             messages,
             summary_artifacts,
             next_cursor,
+        })
+    }
+
+    async fn get_tool_result(
+        &self,
+        caller: WebUiAuthenticatedCaller,
+        request: RebornToolResultRequest,
+    ) -> Result<RebornToolResultResponse, RebornServicesError> {
+        use ironclaw_threads::{
+            CapabilityDisplayPreviewEnvelope, CapabilityDisplayPreviewStatus, MessageKind,
+            ReadToolResultRecordRequest, TOOL_RESULT_RECORD_READ_MAX_BYTES,
+            ToolResultReferenceEnvelope,
+        };
+        let thread_id = parse_thread_id_field("thread_id", request.thread_id)?;
+        let run_id = parse_run_id_field("run_id", request.run_id)?.to_string();
+        ToolResultReferenceEnvelope::validate_result_ref(&request.result_ref).map_err(|error| {
+            tracing::debug!(?error, "invalid tool result reference");
+            RebornServicesError::validation(WebUiInboundValidationError::new(
+                "result_ref",
+                WebUiInboundValidationCode::InvalidId,
+            ))
+        })?;
+        // Match the existing timeline/run-read contract: project is a scoped
+        // selector; the canonical thread store establishes caller ownership.
+        let mut caller = caller;
+        if let Some(project_id) = request.project_id {
+            caller.project_id = Some(ProjectId::new(project_id).map_err(|error| {
+                tracing::debug!(?error, "invalid tool result project selector");
+                RebornServicesError::validation(WebUiInboundValidationError::new(
+                    "project_id",
+                    WebUiInboundValidationCode::InvalidId,
+                ))
+            })?);
+        }
+        let scope = caller.turn_scope(thread_id.clone());
+        let (thread_scope, history) = self
+            .resolve_thread_history_for_caller(caller, &scope)
+            .await?;
+        let not_found =
+            || RebornServicesError::from_status(RebornServicesErrorCode::NotFound, 404, false);
+        if thread_scope.project_id != scope.project_id || history.thread.thread_id != thread_id {
+            return Err(not_found());
+        }
+        let preview = history
+            .messages
+            .iter()
+            .find_map(|message| {
+                if message.kind != MessageKind::CapabilityDisplayPreview
+                    || message.status != MessageStatus::Finalized
+                    || message.redaction_ref.is_some()
+                    || message.turn_run_id.as_deref() != Some(run_id.as_str())
+                    || message.tool_result_ref.as_deref() != Some(request.result_ref.as_str())
+                {
+                    return None;
+                }
+                let preview: CapabilityDisplayPreviewEnvelope =
+                    serde_json::from_str(message.content.as_deref()?).ok()?;
+                (preview.validate().is_ok()
+                    && preview.status == CapabilityDisplayPreviewStatus::Completed
+                    && preview.result_ref.as_deref() == Some(request.result_ref.as_str()))
+                .then_some(preview)
+            })
+            .ok_or_else(not_found)?;
+        let mut bytes = Vec::new();
+        let mut offset = 0;
+        let mut expected_total = None;
+        loop {
+            let chunk = self
+                .thread_service
+                .read_tool_result_record(ReadToolResultRecordRequest {
+                    scope: thread_scope.clone(),
+                    thread_id: thread_id.clone(),
+                    result_ref: request.result_ref.clone(),
+                    offset,
+                    max_bytes: TOOL_RESULT_RECORD_READ_MAX_BYTES,
+                })
+                .await
+                .map_err(map_timeline_probe_error)?
+                .ok_or_else(not_found)?;
+            if chunk.total_bytes > tool_results::MAX_RESULT_BYTES as u64
+                || expected_total.is_some_and(|total| total != chunk.total_bytes)
+                || bytes.len() + chunk.content.len() > tool_results::MAX_RESULT_BYTES
+            {
+                return Err(RebornServicesError::from_status(
+                    RebornServicesErrorCode::Unavailable,
+                    503,
+                    false,
+                ));
+            }
+            expected_total = Some(chunk.total_bytes);
+            bytes.extend_from_slice(&chunk.content);
+            match chunk.next_offset {
+                Some(next) if next > offset && next == bytes.len() as u64 => offset = next,
+                None if bytes.len() as u64 == chunk.total_bytes => break,
+                _ => {
+                    return Err(RebornServicesError::from_status(
+                        RebornServicesErrorCode::Unavailable,
+                        503,
+                        false,
+                    ));
+                }
+            }
+        }
+        let output: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+            tracing::debug!(?error, "tool result record is not JSON");
+            RebornServicesError::from_status(RebornServicesErrorCode::Unavailable, 503, false)
+        })?;
+        Ok(RebornToolResultResponse {
+            result_ref: request.result_ref,
+            run_id,
+            invocation_id: preview.invocation_id.to_string(),
+            content: ironclaw_safety::sanitize_display_json(&output).to_string(),
         })
     }
 

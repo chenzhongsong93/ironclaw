@@ -30,6 +30,7 @@ pub const WEBUI_V2_ROUTE_GET_SESSION: &str = "webui.v2.get_session";
 pub const WEBUI_V2_ROUTE_SEND_MESSAGE: &str = "webui.v2.send_message";
 pub const WEBUI_V2_ROUTE_LIST_THREADS: &str = "webui.v2.list_threads";
 pub const WEBUI_V2_ROUTE_GET_TIMELINE: &str = "webui.v2.get_timeline";
+pub const WEBUI_V2_ROUTE_GET_TOOL_RESULT: &str = "webui.v2.get_tool_result";
 pub const WEBUI_V2_ROUTE_GET_THREAD_PLAN: &str = "webui.v2.get_thread_plan";
 pub const WEBUI_V2_ROUTE_GET_RUN_STATE: &str = "webui.v2.get_run_state";
 pub const WEBUI_V2_ROUTE_GET_ATTACHMENT: &str = "webui.v2.get_attachment";
@@ -126,6 +127,8 @@ pub const WEBUI_V2_PATTERN_DELETE_THREAD: &str = "/api/webchat/v2/threads/{threa
 pub const WEBUI_V2_PATTERN_GET_SESSION: &str = "/api/webchat/v2/session";
 pub const WEBUI_V2_PATTERN_SEND_MESSAGE: &str = "/api/webchat/v2/threads/{thread_id}/messages";
 pub const WEBUI_V2_PATTERN_GET_TIMELINE: &str = "/api/webchat/v2/threads/{thread_id}/timeline";
+pub const WEBUI_V2_PATTERN_GET_TOOL_RESULT: &str =
+    "/api/webchat/v2/threads/{thread_id}/runs/{run_id}/results";
 pub const WEBUI_V2_PATTERN_GET_THREAD_PLAN: &str = "/api/webchat/v2/threads/{thread_id}/plan";
 pub const WEBUI_V2_PATTERN_GET_RUN_STATE: &str =
     "/api/webchat/v2/threads/{thread_id}/runs/{run_id}";
@@ -232,6 +235,7 @@ pub fn webui_v2_routes() -> Vec<IngressRouteDescriptor> {
         send_message_descriptor(),
         list_threads_descriptor(),
         get_timeline_descriptor(),
+        get_tool_result_descriptor(),
         get_thread_plan_descriptor(),
         get_run_state_descriptor(),
         logs_descriptor(),
@@ -799,6 +803,20 @@ fn get_timeline_descriptor() -> IngressRouteDescriptor {
         WEBUI_V2_ROUTE_GET_TIMELINE,
         NetworkMethod::Get,
         WEBUI_V2_PATTERN_GET_TIMELINE,
+        read_policy(
+            read_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProjectionOnly,
+            StreamingMode::None,
+        ),
+    )
+}
+
+fn get_tool_result_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_GET_TOOL_RESULT,
+        NetworkMethod::Get,
+        WEBUI_V2_PATTERN_GET_TOOL_RESULT,
         read_policy(
             read_rate_limit(),
             AuditTraceClass::UserAction,

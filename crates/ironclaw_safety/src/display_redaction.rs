@@ -113,6 +113,65 @@ pub fn sanitize_display_text(text: &str) -> String {
     out
 }
 
+/// Redact structured display output without applying token substitutions to
+/// serialized JSON syntax. JSON carried inside string fields (for example MCP
+/// text blocks) is parsed and serialized again at the same bounded depth.
+pub fn sanitize_display_json(value: &serde_json::Value) -> serde_json::Value {
+    sanitize_display_json_at_depth(value, 32)
+}
+
+fn sanitize_display_json_at_depth(value: &serde_json::Value, depth: usize) -> serde_json::Value {
+    use serde_json::Value;
+    if depth == 0 {
+        return Value::String("[truncated]".to_string());
+    }
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    let compact = key.to_ascii_lowercase().replace(['_', '-'], "");
+                    let sensitive = compact.contains("secret")
+                        || compact.contains("password")
+                        || compact.contains("token")
+                        || compact.contains("credential")
+                        || compact.contains("apikey")
+                        || compact == "key"
+                        || compact.contains("authorization")
+                        || compact.contains("bearer")
+                        || compact.contains("cookie")
+                        || compact.contains("privatekey")
+                        || compact == "xauth"
+                        || compact == "auth";
+                    let safe = if sensitive {
+                        Value::String("[redacted]".to_string())
+                    } else {
+                        sanitize_display_json_at_depth(value, depth - 1)
+                    };
+                    (sanitize_display_text(key), safe)
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|value| sanitize_display_json_at_depth(value, depth - 1))
+                .collect(),
+        ),
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if (trimmed.starts_with('{') || trimmed.starts_with('['))
+                && let Ok(nested) = serde_json::from_str::<Value>(trimmed)
+            {
+                return Value::String(
+                    sanitize_display_json_at_depth(&nested, depth - 1).to_string(),
+                );
+            }
+            Value::String(sanitize_display_text(text))
+        }
+        other => other.clone(),
+    }
+}
+
 fn redact_shared_display_substrings(text: &str) -> String {
     let patterns = shared_display_redaction_patterns();
     let out = patterns[0].replace_all(text, "$1: [redacted]").into_owned();
@@ -858,5 +917,48 @@ mod tests {
 
         assert_eq!(sanitized, "[redacted]");
         assert!(!sanitized.contains("/Users/alice"));
+    }
+}
+
+#[cfg(test)]
+mod structured_result_tests {
+    #[test]
+    fn structured_credentials_keep_context_and_do_not_redact_public_fields() {
+        let value = serde_json::json!({
+            "Authorization":"Basic YWxpY2U6c2VjcmV0",
+            "bearer":"private-value", "X-Auth-Token":"private-header",
+            "Cookie":"session=private-cookie", "private_key":"private-signing-key",
+            "name":"甲", "classification":"character", "edges":[],
+            "content":[{"text":"{\"authorization\":\"Basic YWxpY2U6c2VjcmV0\",\"name\":\"乙\"}"}]
+        });
+        let safe = super::sanitize_display_json(&value);
+        for key in [
+            "Authorization",
+            "bearer",
+            "X-Auth-Token",
+            "Cookie",
+            "private_key",
+        ] {
+            assert_eq!(safe[key], "[redacted]");
+        }
+        assert_eq!(safe["name"], "甲");
+        assert_eq!(safe["classification"], "character");
+        let nested: serde_json::Value =
+            serde_json::from_str(safe["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(nested["authorization"], "[redacted]");
+        assert_eq!(nested["name"], "乙");
+        assert!(!safe.to_string().contains("YWxpY2U6c2VjcmV0"));
+    }
+    #[test]
+    fn nested_json_text_keeps_structure_and_redacts_credentials() {
+        let value = serde_json::json!({"content": [{"type":"text", "text":
+            "{\"personas\":[{\"name\":\"甲\",\"token\":\"private-value\",\"path\":\"/etc/passwd\"}]}"}]});
+        let safe = super::sanitize_display_json(&value);
+        let nested: serde_json::Value =
+            serde_json::from_str(safe["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(nested["personas"][0]["name"], "甲");
+        assert_eq!(nested["personas"][0]["token"], "[redacted]");
+        assert_eq!(nested["personas"][0]["path"], "[redacted]");
+        assert!(!safe.to_string().contains("private-value"));
     }
 }

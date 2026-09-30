@@ -122,6 +122,176 @@ fn caller() -> WebUiAuthenticatedCaller {
     caller_for_user("user-alpha")
 }
 
+#[tokio::test]
+async fn complete_tool_result_is_redacted_and_bound_to_owner_project_thread_and_run() {
+    use ironclaw_product_workflow::RebornToolResultRequest;
+    use ironclaw_threads::{
+        CapabilityDisplayPreviewEnvelope, CapabilityDisplayPreviewEnvelopeInput,
+        CapabilityDisplayPreviewStatus, PutToolResultRecordRequest,
+    };
+    let owner = caller();
+    let scope = thread_scope_for(&owner);
+    let thread_id = ThreadId::new("result-thread").unwrap();
+    let threads = Arc::new(InMemorySessionThreadService::default());
+    threads
+        .ensure_thread(EnsureThreadRequest {
+            scope: scope.clone(),
+            thread_id: Some(thread_id.clone()),
+            created_by_actor_id: owner.user_id.to_string(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+    let run_id = TurnRunId::new().to_string();
+    let invocation_id = InvocationId::new();
+    let result_ref = "result:snapshot".to_string();
+    let preview = CapabilityDisplayPreviewEnvelope::new(CapabilityDisplayPreviewEnvelopeInput {
+        invocation_id,
+        capability_id: CapabilityId::new("test.reader").unwrap(),
+        status: CapabilityDisplayPreviewStatus::Completed,
+        title: "reader".into(),
+        subtitle: None,
+        input_summary: None,
+        output_summary: None,
+        output_preview: Some("small preview".into()),
+        output_kind: Some("json".into()),
+        output_bytes: None,
+        result_ref: Some(result_ref.clone()),
+        truncated: true,
+        updated_at: chrono::Utc::now(),
+        activity_order: None,
+    })
+    .unwrap();
+    let preview_record = threads
+        .append_capability_display_preview(AppendCapabilityDisplayPreviewRequest {
+            scope: scope.clone(),
+            thread_id: thread_id.clone(),
+            turn_run_id: run_id.clone(),
+            preview,
+        })
+        .await
+        .unwrap();
+    let nested = json!({"nodes":[{"name":"甲".repeat(20000),"token":"private-value",
+        "Authorization":"Basic YWxpY2U6c2VjcmV0"}],"edges":[]});
+    let output = json!({"content":[{"type":"text","text":nested.to_string()}]});
+    threads
+        .put_tool_result_record(PutToolResultRecordRequest {
+            scope: scope.clone(),
+            thread_id: thread_id.clone(),
+            result_ref: result_ref.clone(),
+            content: output.to_string().into_bytes(),
+        })
+        .await
+        .unwrap();
+    let services = RebornServices::new(threads.clone(), Arc::new(FakeTurnCoordinator::default()));
+    let request = RebornToolResultRequest {
+        thread_id: thread_id.to_string(),
+        run_id: run_id.clone(),
+        result_ref,
+        project_id: Some("project-alpha".into()),
+    };
+    let result = services
+        .get_tool_result(owner.clone(), request.clone())
+        .await
+        .unwrap();
+    assert_eq!(result.invocation_id, invocation_id.to_string());
+    assert_eq!(result.run_id, run_id);
+    assert!(!result.content.contains("private-value"));
+    let output: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+    let nested: serde_json::Value =
+        serde_json::from_str(output["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        nested["nodes"][0]["name"].as_str().unwrap().chars().count(),
+        20000
+    );
+    assert_eq!(nested["nodes"][0]["token"], "[redacted]");
+    assert_eq!(nested["nodes"][0]["Authorization"], "[redacted]");
+    let error = services
+        .get_tool_result(caller_for_user("other-user"), request.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(error.status_code, 404);
+    for field in ["tenant", "agent"] {
+        let mut other = owner.clone();
+        if field == "tenant" {
+            other.tenant_id = TenantId::new("other-tenant").unwrap();
+        } else {
+            other.agent_id = Some(AgentId::new("other-agent").unwrap());
+        }
+        assert_eq!(
+            services
+                .get_tool_result(other, request.clone())
+                .await
+                .unwrap_err()
+                .status_code,
+            404
+        );
+    }
+    for field in ["project", "thread", "run", "ref"] {
+        let mut wrong = request.clone();
+        match field {
+            "project" => wrong.project_id = Some("other-project".into()),
+            "thread" => wrong.thread_id = "other-thread".into(),
+            "run" => wrong.run_id = TurnRunId::new().to_string(),
+            _ => wrong.result_ref = "result:unlinked".into(),
+        }
+        assert_eq!(
+            services
+                .get_tool_result(owner.clone(), wrong)
+                .await
+                .unwrap_err()
+                .status_code,
+            404
+        );
+    }
+    assert!(
+        threads
+            .update_tool_result_record(ironclaw_threads::UpdateToolResultRecordRequest {
+                scope: scope.clone(),
+                thread_id: thread_id.clone(),
+                result_ref: request.result_ref.clone(),
+                content: vec![b' '; 4 * 1024 * 1024 + 1],
+            })
+            .await
+            .is_err()
+    );
+    threads
+        .update_tool_result_record(ironclaw_threads::UpdateToolResultRecordRequest {
+            scope: scope.clone(),
+            thread_id: thread_id.clone(),
+            result_ref: request.result_ref.clone(),
+            content: b"malformed-result".to_vec(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        services
+            .get_tool_result(owner.clone(), request.clone())
+            .await
+            .unwrap_err()
+            .status_code,
+        503
+    );
+    threads
+        .redact_message(RedactMessageRequest {
+            scope,
+            thread_id,
+            message_id: preview_record.message_id,
+            redaction_ref: "redaction:fixture".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        services
+            .get_tool_result(owner, request)
+            .await
+            .unwrap_err()
+            .status_code,
+        404
+    );
+}
+
 /// Wait until the wall clock is strictly past `floor`, so the next thread
 /// created/used gets a later activity timestamp — deterministic regardless
 /// of clock resolution. Uses async sleep to avoid blocking the test runtime

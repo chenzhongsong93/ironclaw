@@ -379,9 +379,8 @@ where
                     invocation: McpInvocation {
                         input: request.input,
                     },
-                    trusted_context: match request.run_id {
-                        None => None,
-                        Some(run_id) => Some(ironclaw_mcp::McpTrustedExecutionContext {
+                    trusted_context: request.run_id.map(|run_id| {
+                        ironclaw_mcp::McpTrustedExecutionContext {
                             // WebChat's authenticated actor is carried by the
                             // trusted resource scope in this path. Preserve an
                             // explicit actor when present; otherwise use the
@@ -389,8 +388,8 @@ where
                             // the HMAC context to the same owner.
                             authenticated_actor_user_id: trusted_actor,
                             run_id: Some(run_id),
-                        }),
-                    },
+                        }
+                    }),
                 },
             )
             .await

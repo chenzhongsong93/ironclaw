@@ -242,6 +242,7 @@ fn operator_config_diagnostic_command_plane_response(
 
 #[derive(Default)]
 struct StubServices {
+    tool_result_calls: Mutex<Vec<ironclaw_product_workflow::RebornToolResultRequest>>,
     create_thread_calls: Mutex<Vec<WebUiCreateThreadRequest>>,
     delete_thread_calls: Mutex<Vec<RebornDeleteThreadRequest>>,
     submit_turn_calls: Mutex<Vec<WebUiSendMessageRequest>>,
@@ -439,6 +440,19 @@ impl StubServices {
 
 #[async_trait]
 impl RebornServicesApi for StubServices {
+    async fn get_tool_result(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        request: ironclaw_product_workflow::RebornToolResultRequest,
+    ) -> Result<ironclaw_product_workflow::RebornToolResultResponse, RebornServicesError> {
+        self.tool_result_calls.lock().unwrap().push(request.clone());
+        Ok(ironclaw_product_workflow::RebornToolResultResponse {
+            result_ref: request.result_ref,
+            run_id: request.run_id,
+            invocation_id: "invocation-demo".into(),
+            content: "{\"nodes\":[]}".into(),
+        })
+    }
     async fn global_auto_approve_enabled(
         &self,
         _caller: WebUiAuthenticatedCaller,
@@ -1908,6 +1922,22 @@ async fn get_timeline_threads_path_into_request() {
     let calls = services.get_timeline_calls.lock().expect("lock").clone();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].thread_id, "thread-x");
+}
+
+#[tokio::test]
+async fn get_tool_result_forwards_scoped_identity_and_returns_json_content() {
+    let services = Arc::new(StubServices::default());
+    let response = router_with(services.clone()).oneshot(Request::builder()
+        .uri("/api/webchat/v2/threads/thread-x/runs/run-y/results?result_ref=result%3Ademo&project_id=project-z")
+        .body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["content"], "{\"nodes\":[]}");
+    let calls = services.tool_result_calls.lock().unwrap();
+    assert_eq!(calls[0].thread_id, "thread-x");
+    assert_eq!(calls[0].run_id, "run-y");
+    assert_eq!(calls[0].result_ref, "result:demo");
+    assert_eq!(calls[0].project_id.as_deref(), Some("project-z"));
 }
 
 // The attachment-bytes route carries three path segments and returns raw

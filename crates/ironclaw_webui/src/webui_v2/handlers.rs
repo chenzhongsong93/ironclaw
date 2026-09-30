@@ -447,6 +447,33 @@ pub struct TimelineQuery {
     pub project_id: Option<ironclaw_host_api::ProjectId>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ToolResultQuery {
+    pub result_ref: String,
+    pub project_id: Option<String>,
+}
+
+pub async fn get_tool_result(
+    State(state): State<WebUiV2State>,
+    Extension(caller): Extension<WebUiAuthenticatedCaller>,
+    Path((thread_id, run_id)): Path<(String, String)>,
+    Query(query): Query<ToolResultQuery>,
+) -> Result<Json<ironclaw_product_workflow::RebornToolResultResponse>, WebUiV2HttpError> {
+    let response = state
+        .services()
+        .get_tool_result(
+            caller,
+            ironclaw_product_workflow::RebornToolResultRequest {
+                thread_id,
+                run_id,
+                result_ref: query.result_ref,
+                project_id: query.project_id,
+            },
+        )
+        .await?;
+    Ok(Json(response))
+}
+
 /// Default workspace root listed when a `list_project_files` request omits
 /// `?path=`. The facade confines all paths to this alias regardless.
 const PROJECT_FS_ROOT: &str = "/workspace";

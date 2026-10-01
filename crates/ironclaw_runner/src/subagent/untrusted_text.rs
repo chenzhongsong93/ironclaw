@@ -20,6 +20,12 @@ pub(crate) fn wrap_untrusted_subagent_text(value: String) -> String {
     format!("|||{}|||", value)
 }
 
+/// 仅用于父scope拥有的可读结果体；保留格式与全文，不作为安全摘要。
+/// 凭据标记过滤沿用模型可见文本策略，数据仍封装为不可信子输出。
+pub(crate) fn complete_untrusted_subagent_result(value: &str) -> String {
+    wrap_untrusted_subagent_text(sanitize_model_visible_text(value.to_owned()))
+}
+
 pub(crate) fn sanitize_untrusted_terminal_reason(value: &str) -> String {
     let mut safe = sanitize_untrusted_text_body(value);
     if safe.len() > 512 {
@@ -73,6 +79,17 @@ fn truncate_to_char_boundary(value: &mut String, max_bytes: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_result_retains_json_and_line_breaks_but_filters_credentials() {
+        let text = "{\"refs\":[\"urn:one\"]}\n正文\nraw_provider_secret";
+        let result = complete_untrusted_subagent_result(text);
+        assert!(result.starts_with("|||"));
+        assert!(result.ends_with("|||"));
+        assert!(result.contains("{\"refs\":[\"urn:one\"]}\n正文\n"));
+        assert!(!result.contains("raw_provider_secret"));
+        assert!(result.contains("[redacted]"));
+    }
 
     #[test]
     fn wraps_in_pipe_delimiters() {

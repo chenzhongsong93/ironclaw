@@ -34,7 +34,8 @@ use crate::subagent::spawn_result::{
     SubagentTerminalEventPayload,
 };
 use crate::subagent::untrusted_text::{
-    sanitize_tool_result_summary, sanitize_untrusted_terminal_reason, wrap_untrusted_subagent_text,
+    complete_untrusted_subagent_result, sanitize_tool_result_summary,
+    sanitize_untrusted_terminal_reason, wrap_untrusted_subagent_text,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1042,6 +1043,64 @@ fn is_parent_not_blocked_yet(error: &TurnError) -> bool {
 mod tests {
     use super::*;
 
+    // AE-L1-165：可读结果体不是512字节摘要，JSON和尾部数据必须仍可取回。
+    #[test]
+    fn completion_reference_preserves_full_unicode_json_while_summary_stays_bounded() {
+        let thread = ironclaw_host_api::ThreadId::new("full-child-thread").unwrap();
+        let scope = TurnScope {
+            tenant_id: ironclaw_host_api::TenantId::new("full-result-tenant").unwrap(),
+            agent_id: Some(ironclaw_host_api::AgentId::new("full-result-agent").unwrap()),
+            project_id: None,
+            thread_id: thread.clone(),
+            thread_owner: Default::default(),
+        };
+        let edge = AwaitEdge {
+            child_scope: scope.clone(),
+            child_thread_id: thread,
+            parent_thread_id: ironclaw_host_api::ThreadId::new("full-parent-thread").unwrap(),
+            parent_run_context: ironclaw_agent_loop::test_support::test_run_context("full-result"),
+            tree_root_run_id: TurnRunId::new(),
+            gate_ref: GateRef::new("gate:full-result").unwrap(),
+            source_binding_ref: ironclaw_turns::SourceBindingRef::new("source:full-result")
+                .unwrap(),
+            reply_target_binding_ref: ironclaw_turns::ReplyTargetBindingRef::new(
+                "reply:full-result",
+            )
+            .unwrap(),
+            subagent_kind: ironclaw_loop_host::SubagentKindId::new("general").unwrap(),
+            spawn_capability_id: CapabilityId::new(DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID).unwrap(),
+            result_ref: ironclaw_turns::LoopResultRef::new("result:full-result").unwrap(),
+            mode: ironclaw_loop_host::SpawnSubagentMode::Blocking,
+            state: AwaitEdgeState::Open,
+            terminal_kind: None,
+            terminal_byte_len: None,
+            terminal_reason: None,
+            reservation_release: crate::subagent::await_edge::ReservationReleaseState::Unclaimed,
+            created_at: chrono::Utc::now(),
+            deadline: None,
+            settled_at: None,
+        };
+        let event = recon_event(
+            TurnRunId::new(),
+            scope,
+            UserId::new("full-result-owner").unwrap(),
+        );
+        let text = serde_json::json!({"body":"河港钥匙".repeat(600),"zTail":["urn:tail-marker"]})
+            .to_string();
+        let output = ChildTerminalOutput {
+            final_text: Some(text.clone()),
+            failure_summary: None,
+        };
+        let payload = background_completion_payload(&event, &edge, &output).unwrap();
+        let stored = payload["final_text"].as_str().unwrap();
+        assert!(stored.contains("urn:tail-marker"));
+        assert!(
+            stored.contains(&text),
+            "result reference must preserve JSON and complete child data"
+        );
+        assert!(crate::subagent::untrusted_text::sanitize_tool_result_summary(text).len() <= 512);
+    }
+
     #[test]
     fn terminal_parent_set_closes_edges_without_resume() {
         for from in [
@@ -1826,7 +1885,7 @@ fn background_completion_payload(
     let final_text = child_output
         .final_text
         .as_deref()
-        .map(|text| wrap_untrusted_subagent_text(sanitize_tool_result_summary(text.to_string())));
+        .map(complete_untrusted_subagent_result);
     let failure_summary = child_output
         .failure_summary
         .as_deref()

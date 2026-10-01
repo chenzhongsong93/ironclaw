@@ -15,6 +15,7 @@ use ironclaw_mcp::{
 
 pub(crate) const MCP_RESPONSE_BODY_LIMIT: u64 = 2 * 1024 * 1024;
 const MCP_NETWORK_EGRESS_LIMIT: u64 = 2 * 1024 * 1024;
+#[cfg(test)]
 const MCP_TIMEOUT_MS: u32 = 60_000;
 
 pub(crate) fn hosted_http_mcp_runtime(
@@ -39,6 +40,12 @@ pub(crate) fn hosted_http_mcp_runtime(
     McpRuntime::new(McpRuntimeConfig::default(), client)
 }
 
+fn configured_mcp_timeout() -> Option<u32> {
+    ironclaw_reborn_config::HostHttpTimeouts::from_process_env()
+        .ok()
+        .map(|config| config.mcp_timeout_ms)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RegistryMcpEgressPlanner {
     registry: Arc<SharedExtensionRegistry>,
@@ -46,6 +53,7 @@ pub(crate) struct RegistryMcpEgressPlanner {
     /// http scheme, and private/loopback egress targets. Production builds
     /// must keep this false (fail-closed against internal metadata services).
     allow_local_mcp: bool,
+    timeout_ms: Option<u32>,
 }
 
 impl RegistryMcpEgressPlanner {
@@ -53,6 +61,7 @@ impl RegistryMcpEgressPlanner {
         Self {
             registry,
             allow_local_mcp: false,
+            timeout_ms: configured_mcp_timeout(),
         }
     }
 
@@ -63,6 +72,7 @@ impl RegistryMcpEgressPlanner {
         Self {
             registry,
             allow_local_mcp: true,
+            timeout_ms: configured_mcp_timeout(),
         }
     }
 
@@ -110,6 +120,9 @@ impl McpHostHttpEgressPlanner for RegistryMcpEgressPlanner {
         if !hosted_mcp_url_allowed(request.url, &endpoint) {
             return McpHostHttpEgressPlan::default();
         }
+        if self.timeout_ms.is_none() {
+            return McpHostHttpEgressPlan::default();
+        }
         let credential_injections =
             self.credential_injections(request.provider, request.capability_id, &endpoint);
         McpHostHttpEgressPlan {
@@ -126,7 +139,7 @@ impl McpHostHttpEgressPlanner for RegistryMcpEgressPlanner {
             network_policy: hosted_mcp_network_policy(&endpoint, self.allow_local_mcp),
             credential_injections,
             response_body_limit: Some(MCP_RESPONSE_BODY_LIMIT),
-            timeout_ms: Some(MCP_TIMEOUT_MS),
+            timeout_ms: self.timeout_ms,
         }
     }
 }
@@ -541,6 +554,26 @@ mod tests {
         );
         assert_eq!(plan.response_body_limit, Some(MCP_RESPONSE_BODY_LIMIT));
         assert_eq!(plan.timeout_ms, Some(MCP_TIMEOUT_MS));
+        // 覆盖:AE-L2-109的planner部分；实际延迟网络caller仍需另验。
+        let mut configured = planner;
+        configured.timeout_ms = Some(300_000);
+        let long_plan = configured.plan(sample_plan_request(
+            &provider,
+            &cap,
+            "https://mcp.notion.com/mcp",
+            &scope,
+        ));
+        assert_eq!(long_plan.timeout_ms, Some(300_000));
+        assert!(long_plan.network_policy.deny_private_ip_ranges);
+        assert_eq!(long_plan.response_body_limit, Some(MCP_RESPONSE_BODY_LIMIT));
+        configured.timeout_ms = None;
+        let denied = configured.plan(sample_plan_request(
+            &provider,
+            &cap,
+            "https://mcp.notion.com/mcp",
+            &scope,
+        ));
+        assert!(denied.network_policy.allowed_targets.is_empty());
     }
 
     // ── URL allowlist unit tests ───────────────────────────────────────────

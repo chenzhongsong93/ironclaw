@@ -93,6 +93,63 @@ async fn http_egress_forwards_timeout_to_transport() {
     assert_eq!(requests[0].timeout_ms, Some(250));
 }
 
+// 覆盖:AE-L2-109网络caller部分；真实localhost延迟，不修改默认transport或SSRF边界。
+#[tokio::test]
+async fn explicitly_bounded_transport_can_finish_after_default_thirty_seconds() {
+    for (host_limit, requested, delay, succeeds) in [
+        (
+            Duration::from_secs(60),
+            60_000,
+            Duration::from_secs(31),
+            true,
+        ),
+        (
+            Duration::from_millis(50),
+            60_000,
+            Duration::from_millis(200),
+            false,
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1];
+            stream.read_exact(&mut request).unwrap();
+            std::thread::sleep(delay);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        });
+        let egress = PolicyNetworkHttpEgress::new_with_resolver(
+            ReqwestNetworkTransport::new(host_limit),
+            StaticResolver::new(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+        );
+        let start = Instant::now();
+        let result = egress
+            .execute(NetworkHttpRequest {
+                scope: sample_scope(),
+                method: NetworkMethod::Get,
+                url: format!("http://slow.example.test:{port}/test"),
+                headers: vec![],
+                body: vec![],
+                policy: policy("slow.example.test", Some(port), false, None),
+                response_body_limit: Some(1024),
+                timeout_ms: Some(requested),
+            })
+            .await;
+        let elapsed = start.elapsed();
+        assert_eq!(result.is_ok(), succeeds);
+        if let Ok(response) = result {
+            assert_eq!(response.status, 200);
+            assert_eq!(response.body, b"ok");
+            assert!(elapsed >= Duration::from_secs(30));
+        } else {
+            assert!(elapsed < Duration::from_secs(2));
+        }
+        server.join().unwrap();
+    }
+}
+
 #[tokio::test]
 async fn http_egress_forwards_sensitive_headers_in_zeroizing_transport_carrier() {
     let transport = RecordingTransport::ok(NetworkHttpResponse {

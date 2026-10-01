@@ -1806,7 +1806,13 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
     } else {
         services.try_with_host_http_egress_with_body_store(
             ironclaw_network::PolicyNetworkHttpEgress::new(
-                ironclaw_network::ReqwestNetworkTransport::default(),
+                ironclaw_network::ReqwestNetworkTransport::new(
+                    ironclaw_reborn_config::HostHttpTimeouts::from_process_env()
+                        .map_err(|error| RebornBuildError::InvalidConfig {
+                            reason: error.to_string(),
+                        })?
+                        .host_timeout(),
+                ),
             ),
             http_body_filesystem,
         )?
@@ -1814,7 +1820,13 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
     #[cfg(not(any(test, feature = "test-support")))]
     let services = services.try_with_host_http_egress_with_body_store(
         ironclaw_network::PolicyNetworkHttpEgress::new(
-            ironclaw_network::ReqwestNetworkTransport::default(),
+            ironclaw_network::ReqwestNetworkTransport::new(
+                ironclaw_reborn_config::HostHttpTimeouts::from_process_env()
+                    .map_err(|error| RebornBuildError::InvalidConfig {
+                        reason: error.to_string(),
+                    })?
+                    .host_timeout(),
+            ),
         ),
         http_body_filesystem,
     )?;
@@ -5058,7 +5070,13 @@ where
     let services = services
         .try_with_host_http_egress_with_body_store(
             ironclaw_network::PolicyNetworkHttpEgress::new(
-                ironclaw_network::ReqwestNetworkTransport::default(),
+                ironclaw_network::ReqwestNetworkTransport::new(
+                    ironclaw_reborn_config::HostHttpTimeouts::from_process_env()
+                        .map_err(|error| crate::RebornCompositionError::InvalidConfig {
+                            reason: error.to_string(),
+                        })?
+                        .host_timeout(),
+                ),
             ),
             Arc::clone(&scoped_filesystem),
         )
@@ -5360,7 +5378,13 @@ where
     .with_security_audit_sink(Arc::new(ironclaw_events::TracingSecurityAuditSink))
     .try_with_host_http_egress_with_body_store(
         ironclaw_network::PolicyNetworkHttpEgress::new(
-            ironclaw_network::ReqwestNetworkTransport::default(),
+            ironclaw_network::ReqwestNetworkTransport::new(
+                ironclaw_reborn_config::HostHttpTimeouts::from_process_env()
+                    .map_err(|error| crate::RebornCompositionError::InvalidConfig {
+                        reason: error.to_string(),
+                    })?
+                    .host_timeout(),
+            ),
         ),
         Arc::clone(&stores.scoped_filesystem),
     )?

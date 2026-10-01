@@ -4731,6 +4731,7 @@ async fn build_placeholder_llm_gateway(
 /// Single-provider wrapper (no mission slot): used by the placeholder boot
 /// path and tests that drive a lone swappable. See
 /// [`wrap_swappable_gateway_with_mission`] for the dual-model variant.
+#[cfg(test)]
 fn wrap_swappable_gateway(
     raw: Arc<dyn ironclaw_llm::LlmProvider>,
     session: Arc<ironclaw_llm::SessionManager>,

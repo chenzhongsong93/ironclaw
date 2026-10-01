@@ -56,16 +56,17 @@ pub(crate) fn filter_tianquan_grants(tenant_id: &TenantId, grants: &mut Capabili
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironclaw_host_api::{CapabilityGrant, CapabilityGrantId, Principal};
 
     #[test]
     fn tianquan_coding_capabilities_are_fixed_in_code() {
         for capability in CODING_CAPABILITIES {
             assert!(is_tianquan_coding_capability(capability));
-            assert!(tianquan_surface_policy()
-                .denied_capabilities
-                .iter()
-                .any(|denied| denied.as_str() == *capability));
+            assert!(
+                tianquan_surface_policy()
+                    .denied_capabilities
+                    .iter()
+                    .any(|denied| denied.as_str() == *capability)
+            );
         }
         assert!(!is_tianquan_coding_capability("tianquan-graph.tools"));
     }
@@ -74,7 +75,11 @@ mod tests {
     fn grant_filter_removes_coding_only_for_tianquan_tenant() {
         // The production grant path is covered through local_dev composition;
         // this module-level test only locks the deny set and tenant predicate.
-        assert!(is_tianquan_tenant(&TenantId::new(TIANQUAN_TENANT_ID).expect("tenant id")));
-        assert!(!is_tianquan_tenant(&TenantId::new("other-tenant").expect("tenant id")));
+        assert!(is_tianquan_tenant(
+            &TenantId::new(TIANQUAN_TENANT_ID).expect("tenant id")
+        ));
+        assert!(!is_tianquan_tenant(
+            &TenantId::new("other-tenant").expect("tenant id")
+        ));
     }
 }

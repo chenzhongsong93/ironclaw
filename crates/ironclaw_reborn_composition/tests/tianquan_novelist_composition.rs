@@ -141,13 +141,14 @@ async fn production_composition_sends_pinned_novelist_soul_in_final_system_reque
     .expect("novelist composition run succeeds");
     assert_eq!(reply.status, TurnStatus::Completed, "reply: {reply:?}");
 
-    let requests = gateway.requests.lock().expect("request capture lock");
-    assert!(
-        requests.len() >= 3,
-        "parent, novelist child, and parent follow-up requests"
-    );
-    let novelist_request = &requests[1];
-    let soul_system = novelist_request
+    {
+        let requests = gateway.requests.lock().expect("request capture lock");
+        assert!(
+            requests.len() >= 3,
+            "parent, novelist child, and parent follow-up requests"
+        );
+        let novelist_request = &requests[1];
+        let soul_system = novelist_request
         .messages
         .iter()
         .filter(|message| message.role == HostManagedModelMessageRole::System)
@@ -156,17 +157,17 @@ async fn production_composition_sends_pinned_novelist_soul_in_final_system_reque
         .expect(
             "the final child provider request must contain the pinned novelist SOUL system message",
         );
-    assert!(soul_system.contains("roleSha256="));
-    assert!(soul_system.contains("小说正文创作"));
-    assert!(
-        novelist_request.messages.iter().any(|message| {
-            message.role == HostManagedModelMessageRole::User
-                && message
-                    .content
-                    .contains("Write a short scene from the locked chapter context.")
-        }),
-        "the child goal remains a user message, separate from the trusted SOUL system message"
-    );
-
+        assert!(soul_system.contains("roleSha256="));
+        assert!(soul_system.contains("小说正文创作"));
+        assert!(
+            novelist_request.messages.iter().any(|message| {
+                message.role == HostManagedModelMessageRole::User
+                    && message
+                        .content
+                        .contains("Write a short scene from the locked chapter context.")
+            }),
+            "the child goal remains a user message, separate from the trusted SOUL system message"
+        );
+    }
     runtime.shutdown().await.expect("runtime shutdown");
 }

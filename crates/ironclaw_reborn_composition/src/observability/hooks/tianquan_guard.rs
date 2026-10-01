@@ -127,7 +127,7 @@ const REASON_DUPLICATE_SPAWN: &str = "已 spawn,等 resume 不要重复 spawn";
 const REASON_SHELL_RATE_LIMITED: &str = "builtin.shell 调用过多,用 MCP 工具而非 shell";
 const REASON_TIANQUAN_FILE_WRITE_DISABLED: &str =
     "天权生产 profile 已关闭任意文件写入,请使用 Artifact API/MCP";
-const REASON_REPEAT_CALL: &str = "同工具连续调用过多,勿空转重试:conforms 稳定则 advance_stage(to=approve) 进 committer,或 L7 完成切 loop:prose spawn_subagent 进 L8;真问题请报告而非重复调用";
+const REASON_REPEAT_CALL: &str = "同工具连续调用已达上限，请核对实际错误和任务进度；不要重复相同调用，不要把调用完成当作任务成功。";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SpawnDispatchState {
@@ -493,12 +493,14 @@ mod tests {
     /// observability without reaching across the crate boundary.
     struct CapturingSink {
         outcome: CapturedOutcome,
+        reason: Option<&'static str>,
     }
 
     impl CapturingSink {
         fn new() -> Self {
             Self {
                 outcome: CapturedOutcome::Unset,
+                reason: None,
             }
         }
     }
@@ -516,8 +518,9 @@ mod tests {
         fn allow(&mut self) {
             self.outcome = CapturedOutcome::Allowed;
         }
-        fn deny(&mut self, _reason: &'static str) {
+        fn deny(&mut self, reason: &'static str) {
             self.outcome = CapturedOutcome::Denied;
+            self.reason = Some(reason);
         }
         fn pause_approval(&mut self, _reason: &'static str) {
             self.outcome = CapturedOutcome::PausedApproval;
@@ -538,10 +541,7 @@ mod tests {
         ctx_for_tenant("tianquan-test", capability_name)
     }
 
-    fn ctx_for_tenant(
-        tenant: &str,
-        capability_name: &str,
-    ) -> BeforeCapabilityHookContext {
+    fn ctx_for_tenant(tenant: &str, capability_name: &str) -> BeforeCapabilityHookContext {
         BeforeCapabilityHookContext::new_unresolved(
             TenantId::new(tenant.to_string()).expect("valid tenant"),
             capability_name.to_string(),
@@ -625,7 +625,10 @@ mod tests {
             CAPABILITY_APPLY_PATCH,
             CAPABILITY_SHELL,
         ] {
-            assert_denied(evaluate(&guard, &ctx_for_tenant(TIANQUAN_TENANT_ID, capability)));
+            assert_denied(evaluate(
+                &guard,
+                &ctx_for_tenant(TIANQUAN_TENANT_ID, capability),
+            ));
         }
     }
 
@@ -641,7 +644,10 @@ mod tests {
             CAPABILITY_APPLY_PATCH,
             CAPABILITY_SHELL,
         ] {
-            assert_passed(evaluate(&guard, &ctx_for_tenant("other-tenant", capability)));
+            assert_passed(evaluate(
+                &guard,
+                &ctx_for_tenant("other-tenant", capability),
+            ));
         }
     }
 
@@ -926,6 +932,25 @@ mod tests {
         }
         let over = evaluate(&guard, &ctx_for("tianquan-graph.run_skill_verify"));
         assert_denied(over);
+    }
+
+    // 覆盖：TianQuan TEST-SPEC AE-L1-163；通用限额不得指示领域审批。
+    #[test]
+    fn repeat_call_denial_keeps_limit_without_novel_phase_advice() {
+        let guard = TianquanBuiltinGuard::new();
+        for _ in 0..REPEAT_CALL_LIMIT - 1 {
+            assert_passed(evaluate(&guard, &ctx_for("example.review")));
+        }
+        let mut sink = CapturingSink::new();
+        futures::executor::block_on(guard.evaluate(&ctx_for("example.review"), &mut sink));
+        assert_eq!(sink.outcome, CapturedOutcome::Denied);
+        let reason = sink.reason.expect("limit denial has a reason");
+        for forbidden in ["advance_stage", "committer", "L7", "L8", "approve"] {
+            assert!(
+                !reason.contains(forbidden),
+                "domain advice leaked: {forbidden}"
+            );
+        }
     }
 
     #[test]

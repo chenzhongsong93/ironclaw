@@ -38,6 +38,17 @@ use crate::{
     CapabilitySpawnRequest, CapabilitySpawnResult,
 };
 
+fn failed_dispatch_trace_data(
+    capability: &CapabilityId,
+    error: &DispatchError,
+) -> serde_json::Value {
+    // 只导出稳定分类，不序列化错误对象、凭据句柄或后端详情。
+    serde_json::json!({
+        "capability_id": capability.as_str(),
+        "output": { "status": "error", "failure_kind": error.event_kind() },
+    })
+}
+
 pub struct CapabilityHost<'a, D>
 where
     D: CapabilityDispatcher + ?Sized,
@@ -375,6 +386,17 @@ where
                 debug!(
                     dispatch_failure_kind = %error.failure_kind(),
                     "capability dispatch failed"
+                );
+                ironclaw_common::run_trace::append_trace_event(
+                    "tool_response",
+                    &request
+                        .context
+                        .run_id
+                        .map(|r| r.to_string())
+                        .unwrap_or_else(|| "non-loop".to_string()),
+                    scope.thread_id.as_ref().map(|t| t.to_string()).as_deref(),
+                    None,
+                    failed_dispatch_trace_data(&request.capability_id, &error),
                 );
                 self.abort_obligations(
                     CapabilityObligationPhase::Invoke,
@@ -2772,6 +2794,91 @@ fn enrich_dispatch_error_credential_requirements(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 覆盖：TianQuan TEST-SPEC AE-L2-110，独立进程避免修改全局 env。
+    #[tokio::test]
+    async fn failed_invoke_trace_pairs_response_and_preserves_error() {
+        const CHILD_MODE: &str = "IRONCLAW_TRACE_CONTRACT_CHILD_MODE";
+        if let Ok(mode) = std::env::var(CHILD_MODE) {
+            let registry = echo_registry();
+            let dispatcher = UnusedDispatcher;
+            let authorizer = AllowAuthorizer;
+            let host = CapabilityHost::new(&registry, &dispatcher, &authorizer);
+            assert!(host.invoke_json(allow_request()).await.is_err());
+            if mode == "writable" {
+                let root = std::env::var("TIANQUAN_TRACE_DIR").unwrap();
+                let content =
+                    std::fs::read_to_string(std::path::Path::new(&root).join("non-loop.jsonl"))
+                        .unwrap();
+                let events: Vec<serde_json::Value> = content
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(events.len(), 2);
+                assert_eq!(events[0]["kind"], "tool_request");
+                assert_eq!(events[1]["kind"], "tool_response");
+                assert_eq!(events[1]["data"]["output"]["status"], "error");
+                assert_eq!(
+                    events[1]["data"]["output"]["failure_kind"],
+                    "unknown_capability"
+                );
+            }
+            return;
+        }
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ironclaw-trace-contract-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        for mode in ["writable", "blocked"] {
+            let target = root.join(mode);
+            if mode == "blocked" {
+                std::fs::write(&target, b"not a directory").unwrap();
+            }
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "host::tests::failed_invoke_trace_pairs_response_and_preserves_error",
+                    "--nocapture",
+                ])
+                .env(CHILD_MODE, mode)
+                .env("TIANQUAN_TRACE_DIR", &target)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::fs::remove_file(root.join("writable/non-loop.jsonl")).unwrap();
+        std::fs::remove_dir(root.join("writable")).unwrap();
+        std::fs::remove_file(root.join("blocked")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+    // 覆盖：TianQuan TEST-SPEC AE-L1-157。
+    #[test]
+    fn failed_dispatch_trace_excludes_credential_handles_and_backend_summary() {
+        let capability = CapabilityId::new("echo.say").unwrap();
+        let error = auth_required_with_secrets("echo.say");
+        let data = failed_dispatch_trace_data(&capability, &error);
+        assert_eq!(data["capability_id"], "echo.say");
+        assert_eq!(data["output"]["status"], "error");
+        assert_eq!(data["output"]["failure_kind"], "auth_required");
+        assert!(!data.to_string().contains("raw_secret"));
+        let error = DispatchError::Mcp {
+            kind: ironclaw_host_api::RuntimeDispatchErrorKind::Backend,
+            safe_summary: None,
+        };
+        assert_eq!(
+            failed_dispatch_trace_data(&capability, &error)["output"]["failure_kind"],
+            "backend"
+        );
+    }
     use ironclaw_host_api::{
         CapabilityId, ExtensionId, Obligation, RuntimeCredentialAccountProviderId,
         RuntimeCredentialAccountSetup, SecretHandle,

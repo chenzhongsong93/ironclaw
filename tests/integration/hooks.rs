@@ -27,6 +27,200 @@ use serde_json::json;
 
 const HTTP_TOOL_URL: &str = "https://api.example.test/v1/items";
 
+// 覆盖：TianQuan TEST-SPEC §ISSUE023 AE-L2-121；真实包装caller，非guard helper。
+#[tokio::test]
+async fn tianquan_repeat_guard_counts_activities_not_backend_replays() {
+    let server = support::mock_mcp_server::start_mock_mcp_server(vec![
+        support::mock_mcp_server::MockToolResponse {
+            name: "search".to_string(),
+            content: json!({"results": []}),
+        },
+    ])
+    .await;
+    server.force_http_status(500);
+    let evaluations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let h = RebornIntegrationHarness::test_default()
+        .with_mock_mcp(server.mcp_url())
+        .with_hook_factory(tianquan_counting_factory(evaluations.clone()).await)
+        .script([
+            RebornScriptedReply::tool_call("mock-mcp.search", json!({"query": "same"})),
+            RebornScriptedReply::tool_call("mock-mcp.search", json!({"query": "same"})),
+            RebornScriptedReply::text("done"),
+        ])
+        .build()
+        .await
+        .expect("harness builds");
+    h.submit_turn("review then bounded retry")
+        .await
+        .expect("turn completes");
+    let seen = evaluations.lock().expect("evaluation log").clone();
+    assert_eq!(
+        seen.len(),
+        6,
+        "initial batch and two recovery retries per model call"
+    );
+    assert_eq!(seen[0], seen[1]);
+    assert_eq!(seen[1], seen[2]);
+    assert_eq!(seen[3], seen[4]);
+    assert_eq!(seen[4], seen[5]);
+    assert_ne!(seen[0], seen[3], "new model call must mint a new activity");
+    assert_eq!(
+        server
+            .recorded_requests()
+            .iter()
+            .filter(|r| r.method == "tools/call")
+            .count(),
+        2
+    );
+    h.assert_tool_error(ToolErrorClass::Failed, "backend")
+        .await
+        .expect("backend visible");
+    h.assert_no_tool_error(ToolErrorClass::Denied, "policy_denied")
+        .await
+        .expect("two activities must not exhaust the six-activity guard");
+    let requests = h.scripted_llm.captured_requests();
+    let tool_results: Vec<_> = requests
+        .last()
+        .expect("final model request")
+        .iter()
+        .filter(|message| message.role == ironclaw_llm::Role::Tool)
+        .collect();
+    assert_eq!(tool_results.len(), 2, "both activities reach the model");
+    for result in tool_results {
+        assert!(result.content.contains("backend"));
+        assert!(!result.content.contains("policy_denied"));
+    }
+    server.shutdown().await;
+}
+
+// 覆盖：AE-L2-121 IC23-LIMIT/SCOPE；同factory跨真实run创建fresh guard。
+#[tokio::test]
+async fn tianquan_repeat_guard_keeps_six_limit_and_resets_between_runs() {
+    let server = support::mock_mcp_server::start_mock_mcp_server(vec![
+        support::mock_mcp_server::MockToolResponse {
+            name: "search".to_string(),
+            content: json!({"results": ["ok"]}),
+        },
+    ])
+    .await;
+    let evaluations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut script: Vec<_> = (0..6)
+        .map(|i| {
+            RebornScriptedReply::tool_call(
+                "mock-mcp.search",
+                json!({"query": format!("query-{i}")}),
+            )
+        })
+        .collect();
+    script.extend([
+        RebornScriptedReply::text("bounded done"),
+        RebornScriptedReply::tool_call("mock-mcp.search", json!({"query": "new-run"})),
+        RebornScriptedReply::text("fresh done"),
+    ]);
+    let h = RebornIntegrationHarness::test_default()
+        .with_mock_mcp(server.mcp_url())
+        .with_hook_factory(tianquan_counting_factory(evaluations.clone()).await)
+        .script(script)
+        .build()
+        .await
+        .expect("harness builds");
+    h.submit_turn("six distinct calls")
+        .await
+        .expect("first run");
+    h.assert_tool_error(ToolErrorClass::Denied, "policy_denied")
+        .await
+        .expect("sixth denied");
+    assert_eq!(
+        server
+            .recorded_requests()
+            .iter()
+            .filter(|r| r.method == "tools/call")
+            .count(),
+        5
+    );
+    let baseline = h.history_len().await.expect("first run history");
+    h.submit_turn("fresh run").await.expect("second run");
+    h.assert_no_tool_error_since(baseline, ToolErrorClass::Denied, "policy_denied")
+        .await
+        .expect("next run has no stale denial");
+    assert_eq!(
+        server
+            .recorded_requests()
+            .iter()
+            .filter(|r| r.method == "tools/call")
+            .count(),
+        6
+    );
+    let seen = evaluations.lock().expect("evaluation log").clone();
+    assert_eq!(seen.len(), 7);
+    assert_eq!(
+        seen.into_iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        7,
+        "six first-run activities and the next-run activity are distinct"
+    );
+    server.shutdown().await;
+}
+
+async fn tianquan_counting_factory(
+    evaluations: std::sync::Arc<std::sync::Mutex<Vec<ironclaw_turns::CapabilityActivityId>>>,
+) -> ironclaw_runner::loop_driver_host::HookDispatcherBuilderFactory {
+    use ironclaw_reborn_composition::{
+        HooksActivationConfig, build_hook_dispatcher_builder_factory,
+        build_hook_projection_registry,
+    };
+    let config = HooksActivationConfig::enabled();
+    let projection = build_hook_projection_registry::<ironclaw_filesystem::InMemoryBackend>(
+        ironclaw_extensions::ExtensionRegistry::new(),
+        None,
+        config,
+    )
+    .await
+    .expect("projection");
+    let factory = build_hook_dispatcher_builder_factory(config, &projection)
+        .expect("production factory")
+        .expect("hooks enabled");
+    std::sync::Arc::new(move || {
+        factory()?
+            .install_builtin_before_capability(
+                ironclaw_hooks::identity::HookId::for_builtin(
+                    "test::activity-recorder",
+                    ironclaw_hooks::identity::HookVersion::ONE,
+                ),
+                ironclaw_hooks::ordering::HookPhase::Validation,
+                Box::new(ActivityRecorder(evaluations.clone())),
+            )
+            .map_err(|error| {
+                ironclaw_runner::loop_driver_host::RebornLoopDriverHostError::InvalidRequest {
+                    reason: error.to_string(),
+                }
+            })
+    })
+}
+
+struct ActivityRecorder(
+    std::sync::Arc<std::sync::Mutex<Vec<ironclaw_turns::CapabilityActivityId>>>,
+);
+
+#[async_trait::async_trait]
+impl ironclaw_hooks::sink::PrivilegedBeforeCapabilityHook for ActivityRecorder {
+    async fn evaluate(
+        &self,
+        ctx: &ironclaw_hooks::points::BeforeCapabilityHookContext,
+        sink: &mut dyn ironclaw_hooks::sink::PrivilegedGateSink,
+    ) {
+        self.0
+            .lock()
+            .expect("evaluation log")
+            .push(ctx.activity_id.expect("caller activity"));
+        sink.pass();
+    }
+    fn needs_input(&self) -> bool {
+        false
+    }
+}
+
 /// The BeforeCapability gate hook fires before the dispatched capability, and
 /// the AfterModel observer fires once for the turn — both recorded through
 /// the real turn wire. The passing gate hook does not block the capability,

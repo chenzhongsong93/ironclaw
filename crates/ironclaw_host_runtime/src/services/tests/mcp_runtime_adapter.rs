@@ -118,7 +118,7 @@ async fn mcp_adapter_forwards_host_identity_outside_model_arguments() {
     );
     assert_eq!(
         capture.model_inputs.lock().unwrap().as_slice(),
-        &[model_input.clone()]
+        std::slice::from_ref(&model_input)
     );
 
     let non_loop_input = json!({"query":"non-loop call"});

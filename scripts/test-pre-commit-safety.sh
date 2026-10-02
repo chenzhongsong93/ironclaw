@@ -519,6 +519,224 @@ assert_precommit_allows "ARCH-SPRAWL: annotated repeated dispatcher calls in sep
     "fn existing() {}\n\n\n\n\n\n\n\n\n" \
     "fn existing() {}\n// arch-exempt: parallel_dispatch, temporary split while gateway lands, plan #2800\nfn execute_one(dispatcher: &Dispatcher, request: Request) {\n    dispatcher.dispatch(request);\n}\n\n\n\n\n\n\n\n\nfn execute_two(dispatcher: &Dispatcher, request: Request) {\n    dispatcher.dispatch(request);\n}\n"
 
+# 覆盖:TQ TEST-SPEC-novel-studio-atomic-evolution §通用pre-commit §4 AE-L2-123/AE-L3-34
+# Exercise the complete caller with real Git history/index and production gates.
+# All writes (including synthetic refs and the hook) stay in a disposable repo.
+assert_precommit_scope() {
+    local scenario="$1" mode="$2" expected="$3"
+    local tmp output status fixture_status base ancestor i lang
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/precommit-scope.XXXXXX")
+    set +e
+    (
+        set -e
+        cd "$tmp"
+        git init -q -b main --template=
+        export GIT_AUTHOR_NAME="Safety Test" GIT_COMMITTER_NAME="Safety Test"
+        export GIT_AUTHOR_EMAIL="test@example.com" GIT_COMMITTER_EMAIL="test@example.com"
+        mkdir -p .git/hooks scripts/ci src/channels/web/handlers src/cli \
+            crates/ironclaw_gateway/static/i18n \
+            crates/ironclaw_reborn_composition/src crates/other/src
+        cp "$ROOT_DIR/scripts/pre-commit-safety.sh" scripts/
+        cp "$ROOT_DIR/scripts/check-i18n-parity.sh" scripts/
+        cp "$ROOT_DIR/scripts/ci/check-composition-budget.sh" scripts/ci/
+        printf '%s\n' '[gate]' 'enforce = true' 'ceiling_bp = 1000' \
+            'tolerance_bp = 0' 'arc_dyn_ceiling = 0' 'arc_dyn_tolerance = 0' \
+            > scripts/ci/composition-budget.toml
+        printf 'fn existing() {}\n' > src/runtime.rs
+        printf 'fn handler() {}\n' > src/channels/web/handlers/demo.rs
+        printf 'fn cli() {}\n' > src/cli/demo.rs
+        printf 'fn existing() {}\n' > crates/ironclaw_reborn_composition/src/lib.rs
+        for i in $(seq 1 20); do printf '// base %s\n' "$i"; done > crates/other/src/lib.rs
+        for lang in en zh-CN ko; do
+            printf "  'base': 'value',\n" > "crates/ironclaw_gateway/static/i18n/$lang.js"
+        done
+        git add .
+        base=$(git -c commit.gpgSign=false commit-tree "$(git write-tree)" -m base)
+        git update-ref refs/heads/main "$base"
+        git checkout -qb feature
+        git -c branch.feature.remote=. -c branch.feature.merge=refs/heads/main \
+            rev-parse --verify '@{upstream}' >/dev/null
+
+        case "$scenario" in
+            dispatch-ancestor|credential-ancestor)
+                if [ "$scenario" = dispatch-ancestor ]; then
+                    printf 'fn handler() { state.store.create(); }\n' > src/channels/web/handlers/demo.rs
+                else
+                    printf 'fn handler() { let name: CredentialName; }\n' > src/channels/web/handlers/demo.rs
+                fi
+                git add src
+                ancestor=$(git -c commit.gpgSign=false commit-tree "$(git write-tree)" -p "$base" -m ancestor)
+                git update-ref refs/heads/feature "$ancestor"
+                printf 'fn existing() {}\nfn changed() {}\n' > src/runtime.rs
+                ;;
+            dispatch-unstaged)
+                printf 'fn handler() { state.store.create(); }\n' > src/channels/web/handlers/demo.rs
+                printf 'fn existing() {}\nfn changed() {}\n' > src/runtime.rs
+                ;;
+            dispatch-staged|credential-staged)
+                if [ "$scenario" = dispatch-staged ]; then
+                    printf 'fn handler() { state.store.create(); }\n' > src/channels/web/handlers/demo.rs
+                else
+                    printf 'fn handler() { let name: CredentialName; }\n' > src/channels/web/handlers/demo.rs
+                fi
+                git add src/channels/web/handlers/demo.rs
+                printf 'fn handler() {}\n' > src/channels/web/handlers/demo.rs
+                ;;
+            tx-standalone|tx-staged|tx-unstaged)
+                printf 'fn existing() {\n    db.execute("one");\n    db.execute("two");\n}\n' > src/runtime.rs
+                if [ "$scenario" = tx-staged ]; then
+                    git add src/runtime.rs
+                    printf 'fn existing() {}\n' > src/runtime.rs
+                elif [ "$scenario" = tx-unstaged ]; then
+                    printf '// staged comment\n' >> src/cli/demo.rs
+                    git add src/cli/demo.rs
+                fi
+                ;;
+            js-safe|js-breach)
+                mkdir -p crates/ironclaw_gateway/static/js
+                if [ "$scenario" = js-safe ]; then
+                    printf 'const value = 1;\n' > crates/ironclaw_gateway/static/js/demo.js
+                else
+                    printf 'const value = ;\n' > crates/ironclaw_gateway/static/js/demo.js
+                fi
+                git add crates/ironclaw_gateway/static/js/demo.js
+                if [ "$scenario" = js-safe ]; then
+                    printf 'const value = ;\n' > crates/ironclaw_gateway/static/js/demo.js
+                else
+                    printf 'const value = 1;\n' > crates/ironclaw_gateway/static/js/demo.js
+                fi
+                ;;
+            test-boundary)
+                printf '// staged production\n\nfn existing() {\n    value.unwrap();\n}\n' > src/runtime.rs
+                git add src/runtime.rs
+                printf '#[cfg(test)]\nmod tests {\nfn existing() { value.unwrap(); }\n}\n' > src/runtime.rs
+                ;;
+            test-safe)
+                printf '#[cfg(test)]\nmod tests {\nfn test_helper() { value.unwrap(); }\n}\n' > src/runtime.rs
+                git add src/runtime.rs
+                printf '// unstaged production\n\nfn existing() {\n    value.unwrap();\n}\n' > src/runtime.rs
+                ;;
+            pub-caller)
+                printf 'fn existing() {}\npub fn unused() {}\n' > src/runtime.rs
+                git add src/runtime.rs
+                printf 'fn existing() { unused(); }\npub fn unused() {}\n' > src/runtime.rs
+                ;;
+            i18n-safe|i18n-breach)
+                if [ "$scenario" = i18n-safe ]; then
+                    printf '// staged comment\n' >> crates/ironclaw_gateway/static/i18n/en.js
+                else
+                    printf "  'extra': 'value',\n" >> crates/ironclaw_gateway/static/i18n/en.js
+                fi
+                git add crates/ironclaw_gateway/static/i18n/en.js
+                if [ "$scenario" = i18n-safe ]; then
+                    printf "  'extra': 'value',\n" >> crates/ironclaw_gateway/static/i18n/en.js
+                else
+                    printf "  'base': 'value',\n" > crates/ironclaw_gateway/static/i18n/en.js
+                fi
+                ;;
+            composition-safe|composition-breach)
+                if [ "$scenario" = composition-safe ]; then
+                    printf '// staged comment\n' >> crates/other/src/lib.rs
+                    git add crates/other/src/lib.rs
+                else
+                    for i in $(seq 1 4); do printf '// staged growth %s\n' "$i"; done > crates/ironclaw_reborn_composition/src/lib.rs
+                    git add crates/ironclaw_reborn_composition/src/lib.rs
+                fi
+                if [ "$scenario" = composition-safe ]; then
+                    for i in $(seq 1 4); do printf '// unstaged growth %s\n' "$i"; done > crates/ironclaw_reborn_composition/src/lib.rs
+                else
+                    printf 'fn existing() {}\n' > crates/ironclaw_reborn_composition/src/lib.rs
+                fi
+                ;;
+            git-error)
+                printf 'corrupted fixture index\n' > .git/index
+                ;;
+            non-rust)
+                printf 'fn handler() { state.store.create(); }\n' > src/channels/web/handlers/demo.rs
+                printf 'fn cli() { let name: CredentialName; }\n' > src/cli/demo.rs
+                printf 'safe staged text\n' > change.txt
+                git add change.txt
+                ;;
+            *) exit 2 ;;
+        esac
+        case "$scenario" in
+            dispatch-ancestor|credential-ancestor|dispatch-unstaged)
+                if [ "$mode" != standalone ]; then git add src/runtime.rs; fi ;;
+        esac
+        if [ "$mode" = hook ]; then
+            cp scripts/pre-commit-safety.sh .git/hooks/pre-commit
+            chmod +x .git/hooks/pre-commit
+            if output=$(git -c core.hooksPath=.git/hooks \
+                -c branch.feature.remote=. -c branch.feature.merge=refs/heads/main \
+                hook run pre-commit 2>&1); then status=0; else status=$?; fi
+        else
+            if output=$(git -c branch.feature.remote=. -c branch.feature.merge=refs/heads/main \
+                -c core.hooksPath=.git/hooks -c alias.safety='!bash scripts/pre-commit-safety.sh' \
+                safety 2>&1); then status=0; else status=$?; fi
+        fi
+        if { [ "$expected" = allow ] && [ "$status" -eq 0 ]; } || \
+            { [ "$expected" != allow ] && [ "$status" -ne 0 ] && \
+                printf '%s\n' "$output" | grep -Fq "$expected"; }; then
+            printf 'OK: scope %s / %s (status %s)\n' "$scenario" "$mode" "$status"
+            exit 0
+        fi
+        printf 'FAIL: scope %s / %s expected %s, got status %s\n%s\n' \
+            "$scenario" "$mode" "$expected" "$status" "$output"
+        exit 1
+    )
+    fixture_status=$?
+    set -e
+    rm -rf "$tmp"
+    if [ "$fixture_status" -eq 0 ]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); fi
+}
+
+assert_precommit_scope dispatch-ancestor staged allow
+assert_precommit_scope credential-ancestor staged allow
+assert_precommit_scope dispatch-unstaged staged allow
+assert_precommit_scope non-rust staged allow
+assert_precommit_scope dispatch-staged staged DISPATCH
+assert_precommit_scope credential-staged staged CREDNAME
+assert_precommit_scope dispatch-ancestor standalone DISPATCH
+assert_precommit_scope credential-ancestor standalone CREDNAME
+assert_precommit_scope tx-standalone standalone TX
+assert_precommit_scope tx-staged staged TX
+assert_precommit_scope tx-unstaged staged allow
+assert_precommit_scope js-safe staged allow
+assert_precommit_scope js-breach staged 'syntax error'
+assert_precommit_scope test-boundary staged PANIC
+assert_precommit_scope test-safe staged allow
+assert_precommit_scope pub-caller staged PUBAPI
+assert_precommit_scope i18n-safe staged allow
+assert_precommit_scope i18n-breach staged 'i18n parity check failed'
+assert_precommit_scope composition-safe staged allow
+assert_precommit_scope composition-breach staged 'composition mass budget exceeded'
+assert_precommit_scope dispatch-ancestor hook allow
+assert_precommit_scope dispatch-staged hook DISPATCH
+assert_precommit_scope git-error staged fatal
+
+# 覆盖:同SSOT PCS-TEST-CFG/PCS-PROD-CFG，真实命名测试模块形态与生产可达反例。
+assert_precommit_allows "PANIC: actual mount_view_tests all(test, any(features)) is test-only" \
+    "src/runtime.rs" "fn existing() {}\n" \
+    'fn existing() {}\n#[cfg(all(test, any(feature = "libsql", feature = "postgres")))]\nmod mount_view_tests {\n    fn mount_view() { value.unwrap(); assert!(true); }\n}\n'
+assert_precommit_allows "PANIC: named cfg(test) module is test-only" \
+    "src/runtime.rs" "fn existing() {}\n" \
+    'fn existing() {}\n#[cfg(test)]\nmod mount_view_tests {\n    fn mount_view() { value.unwrap(); }\n}\n'
+assert_precommit_allows "PANIC: multiline all(test, features) is test-only" \
+    "src/runtime.rs" "fn existing() {}\n" \
+    'fn existing() {}\n#[cfg(all(\n    test,\n    any(feature = "libsql", feature = "postgres")\n))]\nmod mount_view_tests {\n    fn mount_view() { value.unwrap(); }\n}\n'
+assert_precommit_blocks "PANIC: same named module without cfg remains production" \
+    "src/runtime.rs" "fn existing() {}\n" \
+    'fn existing() {}\nmod mount_view_tests {\n    fn mount_view() { value.unwrap(); }\n}\n' PANIC
+assert_precommit_blocks "PANIC: any(test, feature) can compile in production" \
+    "src/runtime.rs" "fn existing() {}\n" \
+    'fn existing() {}\n#[cfg(any(test, feature = "libsql"))]\nmod mount_view_tests {\n    fn mount_view() { value.unwrap(); }\n}\n' PANIC
+assert_precommit_blocks "PANIC: production after closed test module still blocks" \
+    "src/runtime.rs" "fn existing() {}\n" \
+    'fn existing() {}\n#[cfg(test)]\nmod tests {\n    fn helper() {}\n}\nfn production() { value.unwrap(); }\n' PANIC
+assert_precommit_blocks "PANIC: production mod tests hunk context cannot exempt" \
+    "src/runtime.rs" 'mod tests {\n    fn existing() {}\n}\n' \
+    'mod tests {\n    fn existing() {}\n    fn production() { value.unwrap(); }\n}\n' PANIC
+
 echo ""
 echo "Passed: $PASS, Failed: $FAIL"
 [ "$FAIL" -eq 0 ]

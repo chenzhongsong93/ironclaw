@@ -3,6 +3,8 @@ mod tests {
     #![allow(clippy::module_inception)]
 
     mod display_preview;
+    #[path = "../child_result.rs"]
+    mod child_result;
 
     use super::super::*;
 

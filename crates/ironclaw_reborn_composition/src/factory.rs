@@ -1,4 +1,4 @@
-// arch-exempt: large_file, needs Reborn composition helper extraction, plan #4469
+// arch-exempt: large_file, project repository private mount stays at existing assembly seam; helper extraction remains tracked, plan #4469
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
@@ -1660,7 +1660,10 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
     #[cfg(any(feature = "libsql", feature = "postgres"))]
     let project_repository: Arc<dyn ProjectRepository> =
         Arc::new(ironclaw_projects::FilesystemProjectRepository::new(
-            crate::wrap_scoped(Arc::clone(&filesystem)),
+            Arc::new(ScopedFilesystem::new(
+                Arc::clone(&filesystem),
+                crate::project_repository_mount_view,
+            )),
             owner_user_id.clone(),
             project_agent_id,
         ));

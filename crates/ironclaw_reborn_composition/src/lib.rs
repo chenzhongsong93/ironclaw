@@ -700,10 +700,10 @@ fn invocation_mount_view_for_segments(
     grants.push(MountGrant::new(
         MountAlias::new("/tenant-shared")?,
         VirtualPath::new(format!("/tenants/{tenant_id}/shared"))?,
-        // Broad tenant-shared storage gets read + write + list, but NOT delete:
-        // no tenant-shared consumer other than the identity store needs to
-        // remove records, so withholding delete here keeps the blast radius of
-        // a compromised writer from spanning every tenant-shared subtree.
+        // Broad tenant-shared storage gets read + write + list, but NOT delete.
+        // Host-only stores such as the project repository use private subtree
+        // views for deletion, so a compromised general writer cannot delete
+        // records across every tenant-shared subtree.
         MountPermissions::read_write(),
     ));
     grants.push(MountGrant::new(
@@ -730,6 +730,20 @@ fn invocation_mount_view_for_segments(
         ));
     }
     MountView::new(grants)
+}
+
+/// Project repository control-plane authority; never use for agent filesystem IO.
+/// Keep delete on this private subtree rather than the broad tenant-shared grant.
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
+pub(crate) fn project_repository_mount_view(
+    scope: &ResourceScope,
+) -> Result<MountView, ironclaw_host_api::HostApiError> {
+    let tenant_id = resource_scope_path_segment(scope.tenant_id.as_str());
+    MountView::new(vec![MountGrant::new(
+        MountAlias::new("/tenant-shared/reborn-projects")?,
+        VirtualPath::new(format!("/tenants/{tenant_id}/shared/reborn-projects"))?,
+        MountPermissions::read_write_list_delete(),
+    )])
 }
 
 pub(crate) fn slack_host_state_mount_view(
@@ -1037,6 +1051,52 @@ mod mount_view_tests {
             resolved.as_str(),
             &format!("/tenants/{}/shared/foo", scope.tenant_id.as_str())
         );
+    }
+
+    // 覆盖:TianQuan TEST-SPEC-novel-studio-atomic-evolution §4 AE-L1-167。
+    #[test]
+    fn project_repository_mount_view_grants_delete_only_to_project_records() {
+        for scope in [
+            sample_scope(),
+            other_tenant_scope(),
+            ResourceScope::system(),
+        ] {
+            let view = project_repository_mount_view(&scope).unwrap();
+            let tenant = resource_scope_path_segment(scope.tenant_id.as_str());
+            for suffix in ["records/project.json", "members/project/user.json"] {
+                let path =
+                    ScopedPath::new(format!("/tenant-shared/reborn-projects/{suffix}")).unwrap();
+                let (resolved, grant) = view.resolve_with_grant(&path).unwrap();
+                assert_eq!(grant.alias.as_str(), "/tenant-shared/reborn-projects");
+                assert_eq!(
+                    grant.permissions,
+                    MountPermissions::read_write_list_delete()
+                );
+                assert_eq!(
+                    resolved.as_str(),
+                    format!("/tenants/{tenant}/shared/reborn-projects/{suffix}")
+                );
+                let general = invocation_mount_view(&scope).unwrap();
+                assert!(
+                    !general
+                        .resolve_with_grant(&path)
+                        .unwrap()
+                        .1
+                        .permissions
+                        .delete
+                );
+            }
+            for path in [
+                "/tenant-shared/other.json",
+                "/tenant-shared/reborn-projects-other/record.json",
+                "/tenant-shared/reborn-identity/user.json",
+                "/tenant-shared/slack-channel-routes/team.json",
+                "/engine/threads/thread.json",
+                "/workspace/file.txt",
+            ] {
+                assert!(view.resolve(&ScopedPath::new(path).unwrap()).is_err());
+            }
+        }
     }
 
     #[test]

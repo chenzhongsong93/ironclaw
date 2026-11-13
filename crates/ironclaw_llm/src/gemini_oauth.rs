@@ -936,13 +936,12 @@ impl GeminiOauthProvider {
         let cred_manager = CredentialManager::new(&config.credentials_path)?;
         // 2026-08-24 天权补丁:超时随链配置(LLM_REQUEST_TIMEOUT_SECS)而非硬编码默认 180s
         // ——同构于 anthropic_oauth 776b6248e 补丁;gemini_oauth 后端此前漏改,900s env 不生效。
-        let http_client =
-            crate::config::hardened_client_builder(request_timeout_secs)
-                .build()
-                .map_err(|e| LlmError::RequestFailed {
-                    provider: "gemini_oauth".to_string(),
-                    reason: format!("Failed to create HTTP client for GeminiOauthProvider: {e}"),
-                })?;
+        let http_client = crate::config::hardened_client_builder(request_timeout_secs)
+            .build()
+            .map_err(|e| LlmError::RequestFailed {
+                provider: "gemini_oauth".to_string(),
+                reason: format!("Failed to create HTTP client for GeminiOauthProvider: {e}"),
+            })?;
 
         Ok(Self {
             config,
@@ -2056,6 +2055,9 @@ impl GeminiOauthProvider {
 
         Ok((
             CompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: text_content,
                 finish_reason: stop_reason,
                 input_tokens,
@@ -2172,6 +2174,9 @@ impl LlmProvider for GeminiOauthProvider {
         }
 
         Ok(crate::provider::ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: if response.content.is_empty() {
                 None
             } else {

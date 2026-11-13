@@ -118,8 +118,13 @@ fn validate_network_host_pattern(pattern: &str) -> Result<(), crate::HostApiErro
     Ok(())
 }
 
+fn network_redirects_not_denied(value: &bool) -> bool { !*value }
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkPolicy {
+    /// Deny-only redirect constraint; false serializes as the prior wire shape.
+    #[serde(default, skip_serializing_if = "network_redirects_not_denied")]
+    pub deny_redirects: bool,
     pub allowed_targets: Vec<NetworkTargetPattern>,
     pub deny_private_ip_ranges: bool,
     pub max_egress_bytes: Option<u64>,
@@ -193,4 +198,15 @@ pub enum Action {
     EmitExternalEffect {
         effect: EffectKind,
     },
+}
+
+#[cfg(test)] mod redirect_policy_wire_tests {
+    #[test] fn old_network_policy_bytes_roundtrip_without_false_field() {
+        let old=r#"{"allowed_targets":[],"deny_private_ip_ranges":true,"max_egress_bytes":5}"#;
+        let mut p:super::NetworkPolicy=serde_json::from_str(old).unwrap();
+        assert!(!p.deny_redirects);assert_eq!(serde_json::to_string(&p).unwrap(),old);
+        p.deny_redirects=true;let new=serde_json::to_string(&p).unwrap();
+        assert!(new.contains("\"deny_redirects\":true"));
+        assert!(serde_json::from_str::<super::NetworkPolicy>(&new).unwrap().deny_redirects);
+    }
 }

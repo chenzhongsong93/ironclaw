@@ -215,6 +215,7 @@ fn first_party_and_mcp_trust_policy(mcp_provider_id: &str) -> HarnessResult<Host
 /// runtime's network obligation, which is what previously blocked the MCP egress.
 pub(super) fn mcp_loopback_network_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Http),
             host_pattern: "127.0.0.1".to_string(),

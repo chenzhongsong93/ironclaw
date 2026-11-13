@@ -456,3 +456,28 @@ failed/retry
 The extension registry/package source of truth is typed extension state with optional `/system/extensions/...` file projections. Extension config/state projections must validate through the typed repository and must not bypass lifecycle authorization.
 
 WASM, Script, and MCP are all first-class v2 runtime lanes; extension manifests and lifecycle state must be able to describe each lane without making dispatcher depend on concrete runtime crates.
+
+## 已验证Root loopback目录的纯元数据转换
+
+普通`is_hosted_http_mcp_package`和`package_with_discovered_hosted_mcp_tools`继续只接受原HTTPS
+hosted声明。新增明确的`is_host_bundled_loopback_http_mcp_package`及
+`package_with_discovered_loopback_http_mcp_tools`只检查/转换HostBundled、精确expected URL、
+canonical127.0.0.1 HTTP元数据；它们不持网络、secret、budget或运行authority。
+Composition须先核同runtime的实际operator binding/package digest/tenant/signer，再选此分支。
+
+Root转换对已知id完整clone原CapabilityManifest和CapabilityDescriptor，只有inline参数schema
+取本次实际目录；原permission/effects/implements/visibility/trust ceiling/hostports/credentials/
+networkTargets/resource profile等字段不被手工子集重建。未知工具继续原通用模板Ask；同origin
+网络目标有界，提供者已有write语义不被readOnly hint抹除；不一致模板/坏schema/重复工具拒绝。
+这不是新的permission/authority工厂。普通HTTPS转换行为不变。
+
+定向测试：`hosted_mcp_discovery::tests::loopback_projection_keeps_known_security_metadata_and_actual_parameters`、
+`loopback_projection_unknown_ask_and_generic_https_stays_strict`、
+`loopback_projection_rejects_foreign_source_url_and_bad_catalog`。
+命令`cargo test -p ironclaw_extensions loopback_projection`；调用层另见mcp.md §7.1的actual
+composition discovery/lifecycle测试。无实际模型/外部网络要求。
+
+Root专用转换还要求实际catalog覆盖原declared known id全集合；非空subset不足同样拒绝，
+不得保留未报告的假tool来凑功能。unknown新增仍Ask。新增回归
+`loopback_projection_rejects_nonempty_catalog_missing_a_declared_tool`；unknown正例必须同时
+包含完整known目录。普通HTTPS入口不增加这个Root专用覆盖要求。

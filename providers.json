@@ -83,6 +83,7 @@
     "api_key_required": true,
     "base_url_env": "ANTHROPIC_BASE_URL",
     "model_env": "ANTHROPIC_MODEL",
+    "extra_headers_env": "ANTHROPIC_EXTRA_HEADERS",
     "default_model": "claude-sonnet-4-20250514",
     "description": "Anthropic Claude models (direct API)",
     "setup": {

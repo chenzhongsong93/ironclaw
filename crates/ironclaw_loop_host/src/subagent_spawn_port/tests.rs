@@ -209,6 +209,7 @@ enum PostPlaceholderFailureStage {
 struct FailingSpawnThreadService {
     inner: InMemorySessionThreadService,
     failure_point: SpawnThreadFailurePoint,
+    fault_hits: Arc<Mutex<usize>>,
 }
 
 impl FailingSpawnThreadService {
@@ -216,13 +217,25 @@ impl FailingSpawnThreadService {
         Self {
             inner: InMemorySessionThreadService::default(),
             failure_point,
+            fault_hits: Arc::new(Mutex::new(0)),
         }
+    }
+
+    fn with_fault_hits(mut self, fault_hits: Arc<Mutex<usize>>) -> Self {
+        self.fault_hits = fault_hits;
+        self
     }
 }
 
-struct FailingGoalStore;
-struct FailingAwaitEdgeWriter;
-struct FailingChildRuns;
+struct FailingGoalStore {
+    fault_hits: Arc<Mutex<usize>>,
+}
+struct FailingAwaitEdgeWriter {
+    fault_hits: Arc<Mutex<usize>>,
+}
+struct FailingChildRuns {
+    fault_hits: Arc<Mutex<usize>>,
+}
 
 impl StaticTurnStateStore {
     fn new(record: Option<TurnRunRecord>) -> Self {
@@ -804,6 +817,7 @@ impl SubagentSpawnGoalStore for FailingGoalStore {
         _run_id: TurnRunId,
         _goal: SubagentGoalRecord,
     ) -> Result<(), AgentLoopHostError> {
+        *self.fault_hits.lock().unwrap() += 1;
         Err(AgentLoopHostError::new(
             AgentLoopHostErrorKind::Unavailable,
             "forced put_goal failure",
@@ -825,6 +839,7 @@ impl crate::AwaitEdgeWriter for FailingAwaitEdgeWriter {
         &self,
         _record: AwaitedChildSetRecord,
     ) -> Result<(), AgentLoopHostError> {
+        *self.fault_hits.lock().unwrap() += 1;
         Err(AgentLoopHostError::new(
             AgentLoopHostErrorKind::Unavailable,
             "forced record_awaited_child failure",
@@ -932,6 +947,7 @@ impl TurnSpawnTreePort for FailingChildRuns {
         &self,
         _request: SubmitChildRunRequest,
     ) -> Result<SubmitTurnResponse, TurnError> {
+        *self.fault_hits.lock().unwrap() += 1;
         Err(TurnError::Unavailable {
             reason: "forced submit_child_run failure".to_string(),
         })
@@ -945,6 +961,7 @@ impl SessionThreadService for FailingSpawnThreadService {
         request: EnsureThreadRequest,
     ) -> Result<SessionThreadRecord, SessionThreadError> {
         if matches!(self.failure_point, SpawnThreadFailurePoint::EnsureThread) {
+            *self.fault_hits.lock().unwrap() += 1;
             return Err(SessionThreadError::Backend(
                 "forced ensure_thread failure".to_string(),
             ));
@@ -960,6 +977,7 @@ impl SessionThreadService for FailingSpawnThreadService {
             self.failure_point,
             SpawnThreadFailurePoint::AcceptInboundMessage
         ) {
+            *self.fault_hits.lock().unwrap() += 1;
             return Err(SessionThreadError::Backend(
                 "forced accept_inbound_message failure".to_string(),
             ));
@@ -986,6 +1004,7 @@ impl SessionThreadService for FailingSpawnThreadService {
             self.failure_point,
             SpawnThreadFailurePoint::MarkMessageSubmitted
         ) {
+            *self.fault_hits.lock().unwrap() += 1;
             return Err(SessionThreadError::Backend(
                 "forced mark_message_submitted failure".to_string(),
             ));
@@ -2862,14 +2881,28 @@ async fn invoke_capability_batch_stops_on_first_spawn_suspension_when_requested(
         mission_id: None,
     };
     let read = thread_service
-        .read_thread(ThreadHistoryRequest {
+        .list_thread_history(ThreadHistoryRequest {
             scope: child_thread_scope,
             thread_id: child_request.child_scope.thread_id.clone(),
         })
-        .await;
-    assert!(
-        read.is_ok(),
-        "partial-success suspension must keep the child thread committed"
+        .await
+        .expect("partial-success suspension must keep the child thread committed");
+    let child_message = read
+        .messages
+        .first()
+        .expect("spawned child thread must contain the accepted command message");
+    let child_run_id = child_request
+        .requested_run_id
+        .expect("spawn request must carry the allocated child run id");
+    assert_eq!(
+        child_message.source_binding_id.as_deref(),
+        Some(format!("subagent-source:{parent_run_id}:{child_run_id}").as_str()),
+        "accepted child message must carry the canonical parent:child source binding"
+    );
+    assert_eq!(
+        child_message.reply_target_binding_id.as_deref(),
+        Some(format!("subagent-reply:{parent_run_id}:{child_run_id}").as_str()),
+        "accepted child message must carry the canonical parent:child reply binding"
     );
 }
 
@@ -2966,6 +2999,7 @@ async fn invoke_capability_batch_preserves_spawns_on_inner_batch_suspension() {
 
 #[tokio::test]
 async fn invoke_spawn_compensates_every_post_placeholder_failure_stage() {
+    // 六阶段均保留：提交前失败做补偿；提交后 marker 失败保可恢复 child。
     for stage in [
         PostPlaceholderFailureStage::EnsureThread,
         PostPlaceholderFailureStage::PutGoal,
@@ -2974,18 +3008,31 @@ async fn invoke_spawn_compensates_every_post_placeholder_failure_stage() {
         PostPlaceholderFailureStage::SubmitChildRun,
         PostPlaceholderFailureStage::MarkMessageSubmitted,
     ] {
+        let stage_name = match stage {
+            PostPlaceholderFailureStage::EnsureThread => "ensure_thread",
+            PostPlaceholderFailureStage::PutGoal => "put_goal",
+            PostPlaceholderFailureStage::RecordAwaitedChild => "record_awaited_child",
+            PostPlaceholderFailureStage::AcceptInboundMessage => "accept_inbound_message",
+            PostPlaceholderFailureStage::SubmitChildRun => "submit_child_run",
+            PostPlaceholderFailureStage::MarkMessageSubmitted => "mark_message_submitted",
+        };
+        let fault_hits = Arc::new(Mutex::new(0));
         let context = test_run_context_with_agent_actor("spawn-post-placeholder-failure").await;
+        let actor = context.actor.clone().unwrap();
         let result_writer = Arc::new(RecordingResultWriter::default());
         let turn_store = Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0))));
         let thread_service: Arc<dyn SessionThreadService> = match stage {
-            PostPlaceholderFailureStage::EnsureThread => Arc::new(FailingSpawnThreadService::new(
-                SpawnThreadFailurePoint::EnsureThread,
-            )),
+            PostPlaceholderFailureStage::EnsureThread => Arc::new(
+                FailingSpawnThreadService::new(SpawnThreadFailurePoint::EnsureThread)
+                    .with_fault_hits(fault_hits.clone()),
+            ),
             PostPlaceholderFailureStage::AcceptInboundMessage => Arc::new(
-                FailingSpawnThreadService::new(SpawnThreadFailurePoint::AcceptInboundMessage),
+                FailingSpawnThreadService::new(SpawnThreadFailurePoint::AcceptInboundMessage)
+                    .with_fault_hits(fault_hits.clone()),
             ),
             PostPlaceholderFailureStage::MarkMessageSubmitted => Arc::new(
-                FailingSpawnThreadService::new(SpawnThreadFailurePoint::MarkMessageSubmitted),
+                FailingSpawnThreadService::new(SpawnThreadFailurePoint::MarkMessageSubmitted)
+                    .with_fault_hits(fault_hits.clone()),
             ),
             PostPlaceholderFailureStage::PutGoal
             | PostPlaceholderFailureStage::RecordAwaitedChild
@@ -2993,23 +3040,33 @@ async fn invoke_spawn_compensates_every_post_placeholder_failure_stage() {
                 Arc::new(InMemorySessionThreadService::default())
             }
         };
+        let retained_goal_store = Arc::new(RecordingGoalStore::default());
         let goal_store: Arc<dyn SubagentSpawnGoalStore> = match stage {
-            PostPlaceholderFailureStage::PutGoal => Arc::new(FailingGoalStore),
+            PostPlaceholderFailureStage::PutGoal => Arc::new(FailingGoalStore {
+                fault_hits: fault_hits.clone(),
+            }),
+            PostPlaceholderFailureStage::MarkMessageSubmitted => retained_goal_store.clone(),
             _ => Arc::new(NoopGoalStore),
         };
+        let retained_edges = Arc::new(InMemoryAwaitEdgeWriter::default());
         let await_edge_writer: Arc<dyn crate::AwaitEdgeWriter> = match stage {
-            PostPlaceholderFailureStage::RecordAwaitedChild => Arc::new(FailingAwaitEdgeWriter),
-            _ => Arc::new(InMemoryAwaitEdgeWriter::default()),
+            PostPlaceholderFailureStage::RecordAwaitedChild => Arc::new(FailingAwaitEdgeWriter {
+                fault_hits: fault_hits.clone(),
+            }),
+            _ => retained_edges.clone(),
         };
+        let recorded_children = Arc::new(RecordingChildRuns::default());
         let child_runs: Arc<dyn TurnSpawnTreePort> = match stage {
-            PostPlaceholderFailureStage::SubmitChildRun => Arc::new(FailingChildRuns),
-            _ => Arc::new(RecordingChildRuns::default()),
+            PostPlaceholderFailureStage::SubmitChildRun => Arc::new(FailingChildRuns {
+                fault_hits: fault_hits.clone(),
+            }),
+            _ => recorded_children.clone(),
         };
         let deps = Arc::new(SubagentSpawnDeps {
             coordinator: Arc::new(StaticCoordinator),
             child_runs,
-            turn_state_store: turn_store,
-            thread_service,
+            turn_state_store: turn_store.clone(),
+            thread_service: thread_service.clone(),
             goal_store,
             await_edge_writer,
             definition_resolver: Arc::new(StaticDefinitionResolver {
@@ -3031,7 +3088,7 @@ async fn invoke_spawn_compensates_every_post_placeholder_failure_stage() {
         );
         let activity_id = authorize_spawn_input(&port);
 
-        let error = port
+        let outcome = port
             .invoke_capability(CapabilityInvocation {
                 activity_id,
                 surface_version: CapabilitySurfaceVersion::new("surface:test").unwrap(),
@@ -3040,11 +3097,78 @@ async fn invoke_spawn_compensates_every_post_placeholder_failure_stage() {
                 approval_resume: None,
                 auth_resume: None,
             })
-            .await
-            .expect_err("post-placeholder setup failure must reject the spawn");
+            .await;
+        assert_eq!(
+            *fault_hits.lock().unwrap(),
+            1,
+            "stage={stage_name}: injected caller must be reached once"
+        );
 
-        assert_eq!(error.kind, AgentLoopHostErrorKind::Unavailable);
-        assert_post_placeholder_failure_is_compensated(&result_writer, activity_id);
+        if matches!(stage, PostPlaceholderFailureStage::MarkMessageSubmitted) {
+            let resolution = outcome.expect("submitted child marker failure must remain awaitable");
+            assert!(matches!(
+                resolution,
+                Resolution::Suspended(Suspension::DependentRun { .. })
+            ));
+            assert_eq!(
+                recorded_children.requests().len(),
+                1,
+                "stage={stage_name}: exactly one real submit"
+            );
+            assert!(
+                turn_store.cancels().is_empty(),
+                "submitted child must not be cancelled"
+            );
+            assert_eq!(
+                retained_edges.records().len(),
+                1,
+                "submitted child's await edge must remain"
+            );
+            assert!(
+                retained_goal_store.deletes().is_empty(),
+                "submitted child's goal must not be deleted"
+            );
+            let requests = recorded_children.requests();
+            let child_request = &requests[0];
+            let child_scope = ThreadScope {
+                tenant_id: child_request.child_scope.tenant_id.clone(),
+                agent_id: child_request.child_scope.agent_id.clone().unwrap(),
+                project_id: child_request.child_scope.project_id.clone(),
+                owner_user_id: Some(actor.user_id),
+                mission_id: None,
+            };
+            assert!(
+                thread_service
+                    .read_thread(ThreadHistoryRequest {
+                        scope: child_scope,
+                        thread_id: child_request.child_scope.thread_id.clone(),
+                    })
+                    .await
+                    .is_ok(),
+                "submitted child's thread must not be cleaned up"
+            );
+            let writes = result_writer.writes();
+            assert_eq!(writes.len(), 1, "original placeholder remains auditable");
+            let (invocation_id, capability_id, payload) = &writes[0];
+            assert_eq!(
+                *invocation_id,
+                InvocationId::from_uuid(activity_id.as_uuid())
+            );
+            assert_eq!(capability_id.as_str(), DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID);
+            assert_eq!(payload["status"], "spawned");
+            assert!(
+                result_writer.updates().is_empty(),
+                "no fabricated terminal placeholder update"
+            );
+            assert!(
+                result_writer.failure_previews().is_empty(),
+                "no fabricated failure preview"
+            );
+        } else {
+            let error = outcome.expect_err("post-placeholder setup failure must reject the spawn");
+            assert_eq!(error.kind, AgentLoopHostErrorKind::Unavailable);
+            assert_post_placeholder_failure_is_compensated(&result_writer, activity_id);
+        }
     }
 }
 
@@ -4226,3 +4350,6 @@ async fn new_with_schema_propagates_schema_to_spawn_tool_definition() {
         "parameters must carry the marker schema injected via new_with_schema"
     );
 }
+
+// 泛用opaque材料真实caller控制，不替代生产TQ/provider验收。
+mod opaque_caller;

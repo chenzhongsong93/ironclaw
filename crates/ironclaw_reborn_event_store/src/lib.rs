@@ -364,7 +364,7 @@ fn classify_libsql_target(path_or_url: &str) -> LibsqlTargetClass {
         // accidentally routing through `Builder::new_local`.
         return LibsqlTargetClass::Bare;
     }
-    if path_or_url.starts_with('/') {
+    if path_or_url.starts_with('/') || std::path::Path::new(path_or_url).is_absolute() {
         return LibsqlTargetClass::LocalAbsolute;
     }
     if path_or_url.starts_with("./") || path_or_url.starts_with("../") {
@@ -2069,4 +2069,76 @@ mod tests {
             "newly created jsonl root must not be world-listable"
         );
     }
+
+    #[tokio::test]
+    async fn production_bare_filename_remains_rejected_by_actual_constructor() {
+        let actual = build_reborn_event_stores(
+            RebornProfile::Production,
+            RebornEventStoreConfig::Libsql {
+                path_or_url: "events.db".into(),
+                auth_token: None,
+            },
+        )
+        .await;
+        assert!(matches!(
+            actual,
+            Err(RebornEventStoreError::ProductionLibsqlAmbiguousTarget)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn production_windows_absolute_path_builds_actual_libsql_event_store() {
+        let root = tempfile::tempdir().expect("owned Windows event-store fixture");
+        let path = root.path().join("production-events.db");
+        assert!(path.is_absolute());
+        // 原Production constructor及真实libsql migrations，非只测classification helper。
+        let stores = build_reborn_event_stores(
+            RebornProfile::Production,
+            RebornEventStoreConfig::Libsql {
+                path_or_url: path.to_string_lossy().into_owned(),
+                auth_token: None,
+            },
+        )
+        .await
+        .expect("Production Windows absolute libSQL target must build");
+        assert!(
+            path.is_file(),
+            "normal constructor must create actual owned durable database"
+        );
+        drop(stores);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_and_unc_are_absolute_but_drive_relative_and_bare_remain_rejected() {
+        for path in [
+            r"C:\owned\events.db",
+            r"C:/owned/events.db",
+            r"\\server\share\events.db",
+        ] {
+            assert!(std::path::Path::new(path).is_absolute(), "{path}");
+            assert_eq!(
+                classify_libsql_target(path),
+                LibsqlTargetClass::LocalAbsolute,
+                "{path}"
+            );
+        }
+        for path in [r"C:events.db", "events.db", "db.example.com"] {
+            assert!(!std::path::Path::new(path).is_absolute());
+            assert!(matches!(
+                validate_production_libsql_target(path),
+                Err(RebornEventStoreError::ProductionLibsqlAmbiguousTarget)
+            ));
+        }
+        assert!(matches!(
+            validate_production_libsql_target("http://server/events"),
+            Err(RebornEventStoreError::ProductionLibsqlClearTextDisabled)
+        ));
+        assert!(matches!(
+            validate_production_libsql_target(":memory:"),
+            Err(RebornEventStoreError::ProductionInMemoryDisabled)
+        ));
+    }
+
 }

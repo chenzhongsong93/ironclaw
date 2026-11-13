@@ -3199,6 +3199,20 @@ async fn turn_runner_worker_fails_when_real_host_factory_rejects_claimed_scope()
     }
     scheduler_handle.shutdown().await;
 
+    // HFP01-R2: real factory/executor/scheduler durable path; no new API symbols.
+    let failed = turn_store
+        .get_run_state(GetRunStateRequest {
+            scope: fixture.context.scope.clone(),
+            run_id,
+        })
+        .await
+        .expect("original failed state readback");
+    let failure = failed.failure.expect("factory failure recorded by scheduler");
+    assert_eq!(failure.category(), "host_creation_failed");
+    assert_eq!(
+        failure.detail(),
+        Some("host-safe.host-create.context-scope.scope-mismatch")
+    );
     assert!(fixture.gateway.requests().is_empty());
     let history = fixture
         .thread_service
@@ -3267,6 +3281,66 @@ async fn text_only_host_factory_create_host_uses_claimed_model_route_snapshot() 
         host.run_context().resolved_model_route,
         Some(persisted_snapshot)
     );
+}
+
+#[tokio::test]
+async fn model_free_driver_host_rejects_inference_and_persisted_route() {
+    let fixture = HostFixture::new("thread-host-model-free", "deterministic run").await;
+    let mut requirements = DriverRequirements::all_optional();
+    requirements.model = RequirementLevel::Unsupported;
+    let resolver = Arc::new(
+        StaticModelRouteResolver::new(ModelRoutePolicy::new(
+            ModelSelectionMode::DeveloperAnyConfigured,
+        ))
+        .with_route(
+            ModelSlot::Default,
+            ModelRoute::new("openrouter", "anthropic/claude-sonnet-4").unwrap(),
+        ),
+    );
+    let factory = fixture
+        .factory()
+        .with_driver_requirements(driver_requirements_for(
+            &fixture.claimed.resolved_run_profile.loop_driver,
+            requirements,
+        ))
+        .with_model_route_resolver(resolver);
+
+    let host = factory.create_host(&fixture.claimed).await.unwrap();
+    assert!(host.run_context().resolved_model_route.is_none());
+    let error = host
+        .stream_model(LoopModelRequest {
+            inline_messages: Vec::new(),
+            messages: Vec::new(),
+            surface_version: None,
+            model_preference: None,
+            capability_view: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, AgentLoopHostErrorKind::PolicyDenied);
+    let error = host
+        .compact_loop_context(LoopCompactionRequest {
+            task_id: SystemInferenceTaskId::new(),
+            thread_id: fixture.thread_id.clone(),
+            last_compacted_through_seq: None,
+            drop_through_seq: 1,
+            preserve_tail_tokens: 8_000,
+            mode: LoopCompactionMode::Fresh,
+            deadline_ms: 1_000,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error, LoopCompactionError::UnsupportedMode);
+
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_model_route = Some(LoopModelRouteSnapshot::new(
+        "openrouter",
+        "anthropic/claude-sonnet-4",
+        "config:v1",
+        "auth:v1",
+    ));
+    assert!(factory.create_host(&claimed).await.is_err());
+    assert!(fixture.gateway.requests().is_empty());
 }
 
 #[tokio::test]
@@ -9980,3 +10054,6 @@ impl LoopModelBudgetAccountant for RejectingSystemInferenceBudgetAccountant {
         panic!("post_model_work must not run when pre_model_work rejects")
     }
 }
+
+#[path = "loop_driver_host/host_creation_diagnostic.rs"]
+mod host_creation_diagnostic;

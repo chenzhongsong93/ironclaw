@@ -822,6 +822,34 @@ fn config_error_to_llm_error(provider: &'static str) -> impl FnOnce(LlmConfigErr
 mod tests {
     use super::*;
 
+    // CH-CONFIG-01: the real builtin selection path must preserve explicit metadata headers.
+    #[test]
+    fn conversation_headers_from_builtin_selection() {
+        let _env_lock = ironclaw_common::env_helpers::lock_env();
+        let env = EnvGuard::clear(&[
+            "ANTHROPIC_EXTRA_HEADERS", "TEST_CONVERSATION_KEY", "ANTHROPIC_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_MODE", "ANTHROPIC_MAX_TOKENS",
+            "ANTHROPIC_CACHE_RETENTION",
+        ]);
+        env.set("TEST_CONVERSATION_KEY", "fixture-api-key");
+        env.set("ANTHROPIC_OAUTH_TOKEN", "fixture-bearer");
+        env.set("ANTHROPIC_EXTRA_HEADERS", "User-Agent:Local-Fixture/1,x-conversation-id:{metadata:conversation_id}");
+        let registry = ProviderRegistry::new(
+            serde_json::from_str(include_str!("../../../providers.json")).unwrap(),
+        );
+        let resolved = resolve_provider_config_from_selection(ProviderSelection {
+            provider_id: "anthropic".into(), api_key_env: Some("TEST_CONVERSATION_KEY".into()),
+            base_url: Some("http://127.0.0.1:1".into()), model: Some("fixture-model".into()),
+            auth_mode: Some("bearer".into()), max_tokens: Some(128),
+        }, &registry).unwrap();
+        let ResolvedProviderConfig::Registry(config) = resolved else { panic!("registry config required") };
+        assert_eq!(config.extra_headers, vec![
+            ("User-Agent".into(), "Local-Fixture/1".into()),
+            ("x-conversation-id".into(), "{metadata:conversation_id}".into()),
+        ]);
+        assert!(crate::anthropic_oauth::AnthropicOAuthProvider::new(&config, 5).is_ok());
+    }
+
     const CHAIN_ENV_VARS: &[&str] = &[
         "LLM_REQUEST_TIMEOUT_SECS",
         "LLM_CHEAP_MODEL",

@@ -236,6 +236,13 @@ pub(crate) fn build_webui_services_with_connectable_channels(
     )
     .with_approval_interactions(runtime.webui_approval_interaction_service())
     .with_auth_interactions(runtime.webui_auth_interaction_service());
+    // Same authoritative normal runtime store; no independent collector/mirror.
+    if let Some(local)=&services.local_runtime {
+        api=api.with_run_tree_usage_source(local.turn_state.clone());
+    } else {
+        #[cfg(any(feature="libsql",feature="postgres"))]
+        if let Some(production)=&services.production_runtime { api=api.with_run_tree_usage_source(production.run_tree_usage_source()); }
+    }
     // Admin user-management surface: wired only when the identity directory,
     // the admin secret provisioner, and a token minter are all available.
     // Otherwise the fail-closed RejectingAdminUserService default stands and
@@ -283,8 +290,8 @@ pub(crate) fn build_webui_services_with_connectable_channels(
             browse_filesystem,
         )));
     }
-    if let Some(skill_activation_source) = runtime.webui_skill_activation_source() {
-        let activation_recorder = Arc::clone(&skill_activation_source);
+    if let Some(skill_activation_source) = runtime.webui_skill_activation_binding() {
+        let activation_recorder = skill_activation_source.clone();
         let activation_clearer = skill_activation_source;
         api = api.with_skill_activation_hooks(
             move |scope, accepted_message_ref, message| {
@@ -372,6 +379,13 @@ pub(crate) fn build_webui_services_with_connectable_channels(
         }
         api = api.with_lifecycle_product_facade(Arc::new(lifecycle_facade));
     }
+    #[cfg(any(feature = "libsql", feature = "postgres"))]
+    if services.local_runtime.is_none()
+        && let Some(production) = &services.production_runtime
+    {
+        api = api.with_lifecycle_product_facade(production.lifecycle_facade()?);
+    }
+
     if let Some(skill_management) = &services.skill_management {
         // Share the activation selector's live master switch so a Settings
         // toggle here changes the next turn's selection. Only the local-dev
@@ -405,10 +419,14 @@ pub(crate) fn build_webui_services_with_connectable_channels(
                 .with_scheduler_enabled(services.readiness.workers.trigger_poller),
         ));
     }
-    // First-class projects + membership (ACL). The local-dev graph builds the
-    // access-controlled facade once; production wiring is a follow-up.
+    // First-class projects + membership (ACL): both graphs reuse their own access-controlled facade.
     if let Some(local_runtime) = &services.local_runtime {
         api = api.with_project_service(Arc::clone(&local_runtime.project_service));
+    } else {
+        #[cfg(any(feature = "libsql", feature = "postgres"))]
+        if let Some(production_runtime) = services.production_runtime.as_ref() {
+            api = api.with_project_service(production_runtime.project_service());
+        }
     }
     if let Some(local_runtime) = &services.local_runtime {
         api = api.with_outbound_preferences_facade(Arc::new(RebornOutboundPreferencesFacade::new(

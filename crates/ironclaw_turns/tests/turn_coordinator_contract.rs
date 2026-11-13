@@ -15,11 +15,12 @@ use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_turns::{
     AcceptedMessageRef, AdmissionRejection, AdmissionRejectionReason, AllowAllTurnAdmissionPolicy,
     BlockedReason, CancelRunRequest, CancelRunResponse, DefaultTurnCoordinator,
-    DefaultTurnLifecycleEventBus, FilesystemTurnStateRowStore, GateRef, GetRunStateRequest,
-    IdempotencyKey, InMemoryRunProfileResolver, InMemoryTurnEventSink,
+    DefaultTurnLifecycleEventBus, FilesystemTurnStateRowStore, GateRef, GetLoopCheckpointRequest,
+    GetRunStateRequest, IdempotencyKey, PutLoopCheckpointRequest, InMemoryRunProfileResolver, InMemoryTurnEventSink,
     LifecyclePublicationErrorPort, LifecyclePublishingTurnStateStore, LoopBlockedKind,
-    LoopCheckpointStateRef, LoopExitMapping, LoopGateRef, ProductTurnContext,
-    ReplyTargetBindingRef, ResolvedRunProfile, ResumeTurnRequest, RetryTurnRequest,
+    LoopCheckpointStateRef, LoopCheckpointStore, LoopExitMapping, LoopGateRef, ProductTurnContext,
+    RecoverTurnRequest, ReplyTargetBindingRef, ResolvedRunProfile, ResumeTurnPrecondition,
+    ResumeTurnRequest, RetryTurnRequest,
     RetryTurnResponse, RunOriginAdapter, RunProfileId, RunProfileRequest,
     RunProfileResolutionError, RunProfileResolutionRequest, RunProfileResolver, RunProfileVersion,
     SanitizedCancelReason, SanitizedFailure, SourceBindingRef, StaticTurnAdmissionLimitProvider,
@@ -36,7 +37,9 @@ use ironclaw_turns::{
     TurnSpawnTreePort, TurnSpawnTreeStateStore, TurnStateStore, TurnStateStoreLimits, TurnStatus,
     TurnSurfaceType,
     events::EventCursor,
-    run_profile::{LoopGateKind, LoopModelRouteSnapshot, LoopModelUsage},
+    run_profile::{
+        CheckpointSchemaId, LoopCheckpointKind, LoopGateKind, LoopModelRouteSnapshot, LoopModelUsage,
+    },
     runner::{
         ApplyValidatedLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest,
         ClaimRunRequest, ClaimedTurnRun, CompleteRunRequest, FailRunRequest, HeartbeatRequest,
@@ -921,6 +924,23 @@ async fn blocked_dependent_run_can_resume_and_cancel_directly() {
         .await
         .unwrap();
     assert_eq!(resumed.status, TurnStatus::Queued);
+    let resumed_state = coordinator
+        .get_run_state(GetRunStateRequest {
+            scope: scope("thread-dependent"),
+            run_id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed_state.source_binding_ref,
+        SourceBindingRef::new("source-web").unwrap(),
+        "dependent-run resume must preserve the parent source binding",
+    );
+    assert_eq!(
+        resumed_state.reply_target_binding_ref,
+        ReplyTargetBindingRef::new("reply-web").unwrap(),
+        "dependent-run resume must preserve the parent reply binding",
+    );
 
     let cancel_run_id = accepted_run_id(
         &coordinator
@@ -963,6 +983,192 @@ async fn blocked_dependent_run_can_resume_and_cancel_directly() {
         .unwrap();
     assert_eq!(cancelled.status, TurnStatus::Cancelled);
     assert!(!cancelled.already_terminal);
+}
+
+#[tokio::test]
+async fn exact_failed_special_driver_root_recovers_in_place_without_rebinding() {
+    let (coordinator, store) = coordinator();
+    let profile = RunProfileId::new("long_running_mission").unwrap();
+    let version = RunProfileVersion::new(1);
+    let base_scope = scope("thread-exact-recover");
+    let owned_scope = TurnScope::new_with_owner(
+        base_scope.tenant_id.clone(),
+        base_scope.agent_id.clone(),
+        base_scope.project_id.clone(),
+        base_scope.thread_id.clone(),
+        Some(actor().user_id),
+    );
+    let run_id = TurnRunId::new();
+    let source = SourceBindingRef::new("webui-src:recover-contract").unwrap();
+    let reply = ReplyTargetBindingRef::new("webui-reply:recover-contract").unwrap();
+    let mut submit = submit_request("thread-exact-recover", "idem-exact-recover");
+    submit.scope = owned_scope.clone();
+    submit.requested_run_id = Some(run_id);
+    submit.requested_run_profile = Some(RunProfileRequest::new(profile.as_str()).unwrap());
+    submit.source_binding_ref = source.clone();
+    submit.reply_target_binding_ref = reply.clone();
+    coordinator
+        .submit_product_profile_turn(submit, profile.clone(), version)
+        .await
+        .unwrap();
+
+    let first_runner = TurnRunnerId::new();
+    let first_lease = TurnLeaseToken::new();
+    let first_claim = store
+        .claim_next_run(ClaimRunRequest {
+            runner_id: first_runner,
+            lease_token: first_lease,
+            scope_filter: Some(owned_scope.clone()),
+        })
+        .await
+        .unwrap()
+        .expect("recovery test run claimed");
+    let gate = LoopGateRef::new("gate:subagent-recovery-contract").unwrap();
+    let loop_checkpoint = store
+        .put_loop_checkpoint(PutLoopCheckpointRequest {
+            scope: owned_scope.clone(),
+            turn_id: first_claim.state.turn_id,
+            run_id,
+            state_ref: block_state_ref(),
+            schema_id: CheckpointSchemaId::new("recovery-contract").unwrap(),
+            schema_version: RunProfileVersion::new(1),
+            kind: LoopCheckpointKind::BeforeBlock,
+            gate_ref: Some(gate.clone()),
+        })
+        .await
+        .unwrap();
+    let checkpoint_id = loop_checkpoint.checkpoint_id;
+    apply_test_loop_exit(
+        store.as_ref(),
+        run_id,
+        first_runner,
+        first_lease,
+        dependent_blocked_mapping(checkpoint_id, block_state_ref(), &gate),
+    )
+    .await
+    .unwrap();
+
+    let child_run_id = TurnRunId::new();
+    coordinator
+        .resume_turn(ResumeTurnRequest {
+            scope: owned_scope.clone(),
+            actor: actor(),
+            run_id,
+            gate_resolution_ref: GateRef::new(gate.as_str()).unwrap(),
+            source_binding_ref: SourceBindingRef::new(format!(
+                "subagent-source:{run_id}:{child_run_id}"
+            ))
+            .unwrap(),
+            reply_target_binding_ref: ReplyTargetBindingRef::new(format!(
+                "subagent-reply:{run_id}:{child_run_id}"
+            ))
+            .unwrap(),
+            idempotency_key: IdempotencyKey::new("idem-recover-parent-resume").unwrap(),
+            precondition: ResumeTurnPrecondition::BlockedDependentRunGate,
+            resume_disposition: None,
+        })
+        .await
+        .unwrap();
+    let resumed_state = coordinator
+        .get_run_state(GetRunStateRequest {
+            scope: owned_scope.clone(),
+            run_id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(resumed_state.source_binding_ref, source);
+    assert_eq!(resumed_state.reply_target_binding_ref, reply);
+
+    let second_runner = TurnRunnerId::new();
+    let second_lease = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id: second_runner,
+            lease_token: second_lease,
+            scope_filter: Some(owned_scope.clone()),
+        })
+        .await
+        .unwrap()
+        .expect("resumed run claimed");
+    store
+        .fail_run(FailRunRequest {
+            run_id,
+            runner_id: second_runner,
+            lease_token: second_lease,
+            failure: SanitizedFailure::new("host_creation_failed").unwrap(),
+        })
+        .await
+        .unwrap();
+    let failed_record = store
+        .get_run_record(&owned_scope, run_id)
+        .await
+        .unwrap()
+        .expect("failed root record");
+    assert_eq!(failed_record.status, TurnStatus::Failed);
+    assert_eq!(failed_record.checkpoint_id, Some(checkpoint_id));
+    assert_eq!(
+        failed_record.failure.as_ref().map(SanitizedFailure::category),
+        Some("host_creation_failed")
+    );
+    assert_eq!(failed_record.source_binding_ref, source);
+    assert_eq!(failed_record.reply_target_binding_ref, reply);
+    let loop_checkpoint = store
+        .get_loop_checkpoint(GetLoopCheckpointRequest {
+            scope: owned_scope.clone(),
+            turn_id: failed_record.turn_id,
+            run_id,
+            checkpoint_id,
+        })
+        .await
+        .unwrap()
+        .expect("failed root loop checkpoint");
+    assert_eq!(loop_checkpoint.kind, LoopCheckpointKind::BeforeBlock);
+
+    let coordinator: Arc<dyn TurnCoordinator> = Arc::new(coordinator);
+    let recovered = coordinator
+        .recover_turn(RecoverTurnRequest {
+            scope: owned_scope.clone(),
+            actor: actor(),
+            run_id,
+            expected_checkpoint_id: checkpoint_id,
+            expected_failure_category: "host_creation_failed".to_string(),
+            expected_binding_child_run_id: None,
+            source_binding_ref: source.clone(),
+            reply_target_binding_ref: reply.clone(),
+            idempotency_key: IdempotencyKey::new("idem-exact-recover-1").unwrap(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(recovered.run_id, run_id, "recovery must keep the exact root id");
+    assert_eq!(recovered.status, TurnStatus::Queued);
+    let state = coordinator
+        .get_run_state(GetRunStateRequest {
+            scope: owned_scope.clone(),
+            run_id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(state.status, TurnStatus::Queued);
+    assert_eq!(state.checkpoint_id, Some(checkpoint_id));
+    assert_eq!(state.source_binding_ref, source);
+    assert_eq!(state.reply_target_binding_ref, reply);
+    assert!(state.failure.is_none());
+    assert!(matches!(
+        coordinator
+            .recover_turn(RecoverTurnRequest {
+                scope: owned_scope,
+                actor: actor(),
+                run_id,
+                expected_checkpoint_id: checkpoint_id,
+                expected_failure_category: "host_creation_failed".to_string(),
+                expected_binding_child_run_id: None,
+                source_binding_ref: source,
+                reply_target_binding_ref: reply,
+                idempotency_key: IdempotencyKey::new("idem-exact-recover-2").unwrap(),
+            })
+            .await,
+        Err(TurnError::RunNotRetryable { run_id: rejected }) if rejected == run_id
+    ));
 }
 
 /// The row turn-state authority persists durably, and a turn parked on a human
@@ -1175,6 +1381,9 @@ async fn block_resume_complete_reports_cumulative_usage_without_double_counting(
     // The loop reports its cumulative-so-far (leg 1).
     let gate_ref = LoopGateRef::new("gate:usage").unwrap();
     let leg1 = LoopModelUsage {
+        normalization_version: None,
+        normalized_input_tokens: None,
+        cache_details_observed: None,
         input_tokens: 100,
         output_tokens: 50,
         cache_read_input_tokens: 0,
@@ -1227,6 +1436,9 @@ async fn block_resume_complete_reports_cumulative_usage_without_double_counting(
     // leg 1 forward across the resume, the completing exit reports the *run
     // cumulative* (leg1 + leg2), not just the delta.
     let cumulative = LoopModelUsage {
+        normalization_version: None,
+        normalized_input_tokens: None,
+        cache_details_observed: None,
         input_tokens: 140,
         output_tokens: 70,
         cache_read_input_tokens: 0,
@@ -7239,6 +7451,100 @@ async fn llm_subject_survives_run_state_and_persistence_restore() {
     assert_eq!(restored_state.llm_subject.as_deref(), Some("tq-user-42"));
 }
 
+#[tokio::test]
+async fn product_profile_submit_checks_durable_run_and_replay_identity() {
+    let (coordinator, _) = coordinator();
+    let id = RunProfileId::new("long_running_mission").unwrap();
+    let version = RunProfileVersion::new(1);
+    let mut request = submit_request("thread-product-profile", "product-profile-key");
+    request.requested_run_id = Some(TurnRunId::new());
+    request.requested_run_profile = Some(RunProfileRequest::new(id.as_str()).unwrap());
+
+    let accepted = coordinator
+        .submit_product_profile_turn(request.clone(), id.clone(), version)
+        .await
+        .unwrap();
+    let replay = coordinator
+        .submit_product_profile_turn(request.clone(), id.clone(), version)
+        .await
+        .unwrap();
+    assert_eq!(accepted, replay);
+    let state = coordinator
+        .get_run_state(GetRunStateRequest {
+            scope: request.scope.clone(),
+            run_id: request.requested_run_id.unwrap(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(state.resolved_run_profile_id, id);
+    assert_eq!(state.resolved_run_profile_version, version);
+    assert_eq!(state.source_binding_ref, request.source_binding_ref);
+
+    let mut drifted = request;
+    drifted.source_binding_ref = SourceBindingRef::new("different-source").unwrap();
+    assert!(matches!(
+        coordinator
+            .submit_product_profile_turn(drifted, id, version)
+            .await,
+        Err(TurnError::Conflict { .. })
+    ));
+}
+
+#[tokio::test]
+async fn public_submit_cannot_choose_privileged_product_profile() {
+    let (coordinator, _) = coordinator();
+    let mut request = submit_request("thread-public-profile", "public-profile-key");
+    request.requested_run_profile =
+        Some(RunProfileRequest::new("long_running_mission").unwrap());
+    assert!(coordinator.submit_turn(request).await.is_err());
+}
+
+#[tokio::test]
+async fn protected_child_requires_running_owner_parent_and_cannot_use_plain_spawn() {
+    let (coordinator, store) = coordinator();
+    let profile = RunProfileId::new("long_running_mission").unwrap();
+    let version = RunProfileVersion::new(1);
+    let owned = |thread: &str| {
+        let scope = scope(thread);
+        TurnScope::new_with_owner(
+            scope.tenant_id, scope.agent_id, scope.project_id, scope.thread_id,
+            Some(actor().user_id),
+        )
+    };
+    let parent_id = TurnRunId::new();
+    let mut parent = submit_request("protected-parent", "protected-parent");
+    parent.scope = owned("protected-parent");
+    parent.requested_run_id = Some(parent_id);
+    parent.requested_run_profile = Some(RunProfileRequest::new(profile.as_str()).unwrap());
+    coordinator.submit_product_profile_turn(parent.clone(), profile.clone(), version)
+        .await.unwrap();
+    let child = |thread: &str, key: &str| {
+        let mut child = child_run_request(
+            parent.scope.clone(), parent_id, thread, TurnRunId::new(), key, 10,
+        );
+        child.child_scope = owned(thread);
+        child.requested_run_profile = Some(RunProfileRequest::new(profile.as_str()).unwrap());
+        child
+    };
+    assert!(matches!(
+        coordinator.submit_product_profile_child(child("early-child","early"), profile.clone(), version).await,
+        Err(TurnError::Unauthorized)
+    ));
+    store.claim_next_run(ClaimRunRequest {
+        runner_id: TurnRunnerId::new(), lease_token: TurnLeaseToken::new(),
+        scope_filter: Some(parent.scope.clone()),
+    }).await.unwrap().expect("parent claimed");
+    assert!(coordinator.submit_child_run(child("plain-child","plain")).await.is_err());
+    let protected = child("protected-child","protected-child");
+    let accepted = coordinator.submit_product_profile_child(protected.clone(), profile.clone(), version)
+        .await.unwrap();
+    let SubmitTurnResponse::Accepted { run_id, resolved_run_profile_id, .. } = accepted;
+    assert_eq!(Some(run_id), protected.requested_run_id);
+    assert_eq!(resolved_run_profile_id, profile);
+    assert!(coordinator.submit_product_profile_child(child("extra-child","extra"), profile, version)
+        .await.is_err());
+}
+
 fn submit_request(thread: &str, idempotency_key: &str) -> SubmitTurnRequest {
     SubmitTurnRequest {
         requested_model: None,
@@ -8556,5 +8862,19 @@ async fn record_runner_failure_produces_terminal_failed_with_sanitized_category(
     assert!(
         next_claim.is_none(),
         "terminal Failed run must not be claimable"
+    );
+}
+
+#[path = "common/usage_sidecar_durable.rs"]
+mod usage_sidecar_durable;
+
+#[tokio::test]
+async fn product_profile_ready_accepts_special_driver_profile() {
+    let (coordinator, _) = coordinator();
+    let profile = RunProfileId::new("long_running_mission").unwrap();
+    assert!(
+        coordinator
+            .product_profile_ready(&profile, RunProfileVersion::new(1))
+            .await
     );
 }

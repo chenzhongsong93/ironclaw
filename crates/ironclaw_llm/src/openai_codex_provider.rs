@@ -274,6 +274,9 @@ impl LlmProvider for OpenAiCodexProvider {
         let parsed = self.send_request(body).await?;
 
         Ok(CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: parsed.text_content,
             input_tokens: parsed.input_tokens,
             output_tokens: parsed.output_tokens,
@@ -336,6 +339,9 @@ impl LlmProvider for OpenAiCodexProvider {
         };
 
         Ok(ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: if parsed.text_content.is_empty() {
                 None
             } else {

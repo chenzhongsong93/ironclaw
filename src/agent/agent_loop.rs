@@ -2474,6 +2474,9 @@ mod tests {
             _request: CompletionRequest,
         ) -> Result<CompletionResponse, crate::error::LlmError> {
             Ok(CompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: "ok".to_string(),
                 input_tokens: 0,
                 output_tokens: 0,
@@ -2489,6 +2492,9 @@ mod tests {
             _request: ToolCompletionRequest,
         ) -> Result<ToolCompletionResponse, crate::error::LlmError> {
             Ok(ToolCompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: Some("ok".to_string()),
                 tool_calls: Vec::new(),
                 input_tokens: 0,

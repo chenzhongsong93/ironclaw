@@ -11,8 +11,8 @@ use ironclaw_host_api::{
     CapabilityId, EffectKind, ExecutionContext, ExtensionId, InvocationId, MountView,
     ResourceScope, RuntimeKind, TrustClass, UserId,
 };
-use ironclaw_host_runtime::{HostRuntime, SurfaceKind,
-    VisibleCapabilityRequest as HostVisibleCapabilityRequest,
+use ironclaw_host_runtime::{
+    HostRuntime, SurfaceKind, VisibleCapabilityRequest as HostVisibleCapabilityRequest,
 };
 use ironclaw_loop_host::{
     CapabilityResultWrite, CapabilityWriteResult, DurablePersistence, HostManagedModelGateway,
@@ -40,24 +40,25 @@ use ironclaw_turns::{
 };
 
 use crate::builtin_capability_policy::BuiltinCapabilityPolicy;
-use crate::tianquan_capability_policy::{filter_tianquan_grants, tianquan_surface_policy};
 use crate::local_dev_authorization::{
     StoreApprovalSettingsProvider, local_dev_effects_require_approval,
 };
 use crate::local_dev_mounts::scoped_skill_management_mount_view;
 use crate::profile_approval_authorization::ApprovalSettingsProvider;
+use crate::tianquan_capability_policy::{filter_tianquan_grants, tianquan_surface_policy};
 use crate::{
     RebornServices,
     projection::{CapabilityDisplayPreviewResult, CapabilityDisplayPreviewStore},
     runtime::ComposedSelectableSkillContextSource,
 };
 
-pub(super) mod extension_surface;
+pub(crate) mod extension_surface;
 mod external_tool_capability;
 mod outbound_delivery;
 mod project_create;
-mod refreshing_capability_port;
+pub(in crate::runtime) mod refreshing_capability_port;
 mod result_read;
+pub(super) use result_read::RESULT_READ_CAPABILITY_ID;
 #[cfg(test)]
 mod shell_tests;
 mod skill_activation;
@@ -76,7 +77,7 @@ use refreshing_capability_port::{
 };
 #[cfg(feature = "test-support")]
 pub(crate) use result_read::RESULT_READ_CAPABILITY_ID_FOR_TEST;
-#[cfg(any(test, feature = "test-support"))]
+// Shared by normal Production surface admission and the existing activation port.
 pub(crate) use skill_activation::SKILL_ACTIVATE_CAPABILITY_ID;
 
 /// Test-only bridge (result_read seam, issue #5838), co-located with the
@@ -259,6 +260,7 @@ impl LoopCapabilityPortFactory for RefreshingLoopCapabilityPortFactory {
             run_context: run_context.clone(),
             provider_input_store: std::sync::Arc::clone(&self.provider_input_store),
             fallback_user_id: self.fallback_user_id.clone(),
+            production_bound: false,
             policy: Arc::clone(&self.policy),
             workspace_mounts: self.workspace_mounts.clone(),
             skill_mounts,
@@ -268,7 +270,10 @@ impl LoopCapabilityPortFactory for RefreshingLoopCapabilityPortFactory {
             input_resolver: Arc::clone(&self.input_resolver),
             result_writer: Arc::clone(&self.result_writer),
             milestone_sink: Arc::clone(&self.milestone_sink),
-            skill_activation_source: self.skill_activation_source.clone(),
+            skill_activation_source: self
+                .skill_activation_source
+                .clone()
+                .map(super::shared_skill_binding::RuntimeSkillSelector::Local),
             project_service: Arc::clone(&self.project_service),
             thread_service: Arc::clone(&self.thread_service),
             // Same observer drives both the input hook (on the capability port the
@@ -554,6 +559,22 @@ impl StagedCapabilityIo {
         };
         Some(message.message_id)
     }
+}
+
+// 正常Production装配同既有Staged IO；具体state不跨composition边界。
+pub(super) fn production_staged_capability_io(
+    thread_service: Arc<dyn SessionThreadService>,
+    fallback_user_id: UserId,
+) -> (
+    Arc<dyn LoopCapabilityInputResolver>,
+    Arc<dyn LoopCapabilityResultWriter>,
+) {
+    let io = Arc::new(StagedCapabilityIo::new_with_durable_previews(
+        Arc::new(CapabilityDisplayPreviewStore::default()),
+        thread_service,
+        fallback_user_id,
+    ));
+    (io.clone(), io)
 }
 
 /// Test-support constructor wired exactly like production's
@@ -1095,16 +1116,16 @@ fn local_dev_thread_scope_for_run(
     ))
 }
 
-struct VisibleCapabilityInputs<'a> {
-    workspace_mounts: &'a MountView,
-    skill_mounts: &'a MountView,
-    memory_mounts: &'a MountView,
-    system_extensions_lifecycle_mounts: &'a MountView,
-    policy: &'a BuiltinCapabilityPolicy,
-    extension_surface: &'a ExtensionCapabilitySurface,
+pub(super) struct VisibleCapabilityInputs<'a> {
+    pub(super) workspace_mounts: &'a MountView,
+    pub(super) skill_mounts: &'a MountView,
+    pub(super) memory_mounts: &'a MountView,
+    pub(super) system_extensions_lifecycle_mounts: &'a MountView,
+    pub(super) policy: &'a BuiltinCapabilityPolicy,
+    pub(super) extension_surface: &'a ExtensionCapabilitySurface,
 }
 
-fn visible_capability_request(
+pub(super) fn visible_capability_request(
     run_context: &LoopRunContext,
     fallback_user_id: &UserId,
     inputs: VisibleCapabilityInputs<'_>,

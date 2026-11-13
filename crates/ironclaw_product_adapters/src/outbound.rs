@@ -12,7 +12,9 @@ use crate::error::ProductAdapterError;
 use crate::external::{ExternalActorRef, ExternalConversationRef};
 use crate::identity::{AdapterInstallationId, ProductAdapterId};
 
-const PROJECTION_CURSOR_MAX_BYTES: usize = 1024;
+// WebUI combines runtime, live and turn scopes with partial-delivery offsets.
+// Keep a finite byte limit while allowing that ordinary composite shape.
+const PROJECTION_CURSOR_MAX_BYTES: usize = 4096;
 const PROJECTION_THREAD_ID_MAX_BYTES: usize = 512;
 const PROJECTION_ITEM_ID_MAX_BYTES: usize = 512;
 pub const PROJECTION_TEXT_MAX_BYTES: usize = 128 * 1024;
@@ -1747,6 +1749,46 @@ mod tests {
     #[test]
     fn cursor_rejects_oversize() {
         assert!(ProjectionCursor::new("a".repeat(PROJECTION_CURSOR_MAX_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn cursor_accepts_composite_partial_delivery_and_roundtrips() {
+        // The production WebUI cursor embeds runtime/live scopes plus a turn
+        // scope. Long, valid scoped identifiers make it exceed 1 KiB even
+        // before all partial-delivery fields are present.
+        let scope = serde_json::json!({
+            "tenant_id": "t".repeat(64), "user_id": "u".repeat(36),
+            "agent_id": "a".repeat(40), "project_id": "p".repeat(64),
+            "thread_id": "h".repeat(36)
+        });
+        let runtime = serde_json::json!({"scope": scope, "runtime": 42});
+        let encoded = serde_json::to_string(&serde_json::json!({
+            "runtime": runtime, "live": runtime,
+            "turn": {"scope": scope, "event": 43},
+            "runtime_item": 42, "runtime_payloads_delivered": 1
+        }))
+        .unwrap();
+        assert!(encoded.len() > 1024 && encoded.len() < 4096);
+        let cursor = ProjectionCursor::new(encoded.clone())
+            .expect("supported composite cursor must fit the product boundary");
+        let wire = serde_json::to_string(&cursor).unwrap();
+        let decoded: ProjectionCursor = serde_json::from_str(&wire).unwrap();
+        assert_eq!(decoded.as_str(), encoded);
+    }
+
+    #[test]
+    fn cursor_four_kib_limit_counts_utf8_bytes_on_both_entry_paths() {
+        let boundary = "界".repeat(1365) + "a";
+        assert_eq!(boundary.len(), 4096);
+        let wire = serde_json::to_string(&boundary).unwrap();
+        assert!(ProjectionCursor::new(boundary.clone()).is_ok());
+        assert!(serde_json::from_str::<ProjectionCursor>(&wire).is_ok());
+        let oversize = boundary + "a";
+        let wire = serde_json::to_string(&oversize).unwrap();
+        assert!(ProjectionCursor::new(oversize).is_err());
+        assert!(serde_json::from_str::<ProjectionCursor>(&wire).is_err());
+        assert!(ProjectionCursor::new("").is_err());
+        assert!(ProjectionCursor::new("cursor\0private").is_err());
     }
 
     #[test]

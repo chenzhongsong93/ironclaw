@@ -244,6 +244,7 @@ fn validate_bearer_token(
 
 fn slack_network_policy(host: &str) -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: host.to_string(),

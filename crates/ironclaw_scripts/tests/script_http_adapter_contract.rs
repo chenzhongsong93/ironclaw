@@ -228,6 +228,7 @@ fn sample_scope() -> ResourceScope {
 
 fn sample_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "script-api.example.test".to_string(),

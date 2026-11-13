@@ -38,9 +38,10 @@ use ironclaw_threads::{
     ThreadMessageId, ThreadScope,
 };
 use ironclaw_turns::{
-    AcceptedMessageRef, GateRef, GetRunStateRequest, IdempotencyKey, ResumeTurnPrecondition,
-    ResumeTurnRequest, RetryTurnRequest, SanitizedCancelReason, SubmitTurnRequest,
-    SubmitTurnResponse, TurnActor, TurnCoordinator, TurnError, TurnRunId, TurnScope, TurnStatus,
+    AcceptedMessageRef, GateRef, GetRunStateRequest, IdempotencyKey, RecoverTurnRequest,
+    ResumeTurnPrecondition, ResumeTurnRequest, RetryTurnRequest, SanitizedCancelReason,
+    SubmitTurnRequest, SubmitTurnResponse, RunProfileId, RunProfileRequest, RunProfileVersion,
+    TurnActor, TurnCoordinator, TurnError, TurnRunId, TurnScope, TurnStatus,
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, mpsc};
@@ -56,8 +57,8 @@ use crate::{
     UnsupportedLifecycleProductFacade, WebUiAuthenticatedCaller, WebUiCancelRunRequest,
     WebUiCreateThreadRequest, WebUiGateResolution, WebUiInboundCommand, WebUiInboundValidationCode,
     WebUiInboundValidationError, WebUiListAutomationsRequest, WebUiListThreadsRequest,
-    WebUiRenameAutomationRequest, WebUiResolveGateRequest, WebUiRetryRunRequest,
-    WebUiSendMessageRequest, WebUiSetupExtensionRequest,
+    WebUiRecoverRunRequest, WebUiRenameAutomationRequest, WebUiResolveGateRequest,
+    WebUiRetryRunRequest, WebUiSendMessageRequest, WebUiSetupExtensionRequest,
     approval_interaction::RejectingApprovalInteractionService,
     auth_interaction::RejectingAuthInteractionService,
     binding_ref::{
@@ -74,6 +75,7 @@ mod extension_onboarding;
 mod extension_setup_credentials;
 mod extensions;
 mod fs_browse;
+mod host_product_submit;
 mod lifecycle_setup;
 mod llm_config;
 mod project_fs;
@@ -81,6 +83,8 @@ mod projects;
 mod thread_plan;
 mod trace_credits;
 mod types;
+mod run_tree_usage;
+pub use run_tree_usage::OwnerRunTreeUsageSession;
 
 use admin_users::{
     ADMIN_USER_LIST_DEFAULT_LIMIT, ADMIN_USER_LIST_MAX_LIMIT, RejectingAdminUserService,
@@ -159,8 +163,9 @@ pub use types::{
     RebornOutboundDeliveryTargetId, RebornOutboundDeliveryTargetListResponse,
     RebornOutboundDeliveryTargetOption, RebornOutboundDeliveryTargetStatus,
     RebornOutboundDeliveryTargetSummary, RebornOutboundPreferencesResponse,
-    RebornResolveGateResponse, RebornResumeGateResponse, RebornRetryRunResponse,
-    RebornServiceLifecycleAction, RebornServiceLifecycleRequest, RebornServiceLifecycleResponse,
+    RebornRecoverRunResponse, RebornResolveGateResponse, RebornResumeGateResponse,
+    RebornRetryRunResponse, RebornServiceLifecycleAction, RebornServiceLifecycleRequest,
+    RebornServiceLifecycleResponse,
     RebornServiceLifecycleState, RebornSetOutboundPreferencesRequest, RebornSetupExtensionResponse,
     RebornSkillActionResponse, RebornSkillContentResponse, RebornSkillInfo,
     RebornSkillListResponse, RebornSkillSearchResponse, RebornSkillSourceKind,
@@ -1752,6 +1757,11 @@ fn operator_diagnostics_surface_status(
 
 #[async_trait]
 pub trait RebornServicesApi: Send + Sync {
+    async fn open_run_tree_usage(&self, _caller: WebUiAuthenticatedCaller, _request: RebornGetRunStateRequest)
+        -> Result<OwnerRunTreeUsageSession,RebornServicesError> {Err(RebornServicesError::service_unavailable(false))}
+    async fn read_run_tree_usage_page(&self, _caller: WebUiAuthenticatedCaller, _session: &mut OwnerRunTreeUsageSession,
+        _cursor: Option<&str>, _limit: usize) -> Result<ironclaw_turns::RunTreeUsagePage,RebornServicesError> {Err(RebornServicesError::service_unavailable(false))}
+
     async fn create_thread(
         &self,
         caller: WebUiAuthenticatedCaller,
@@ -1763,6 +1773,21 @@ pub trait RebornServicesApi: Send + Sync {
         caller: WebUiAuthenticatedCaller,
         request: WebUiSendMessageRequest,
     ) -> Result<RebornSubmitTurnResponse, RebornServicesError>;
+
+    /// In-process submission for a host-authorized product command.
+    async fn submit_host_product_turn(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        _request: WebUiSendMessageRequest,
+        _profile: RunProfileId,
+        _version: RunProfileVersion,
+    ) -> Result<RebornSubmitTurnResponse, RebornServicesError> {
+        Err(map_turn_error(TurnError::Unauthorized))
+    }
+
+    async fn host_product_profile_ready(&self, _profile: &RunProfileId, _version: RunProfileVersion) -> bool {
+        false
+    }
 
     async fn delete_thread(
         &self,
@@ -1857,6 +1882,14 @@ pub trait RebornServicesApi: Send + Sync {
         caller: WebUiAuthenticatedCaller,
         request: WebUiRetryRunRequest,
     ) -> Result<RebornRetryRunResponse, RebornServicesError>;
+
+    async fn recover_run(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        _request: WebUiRecoverRunRequest,
+    ) -> Result<RebornRecoverRunResponse, RebornServicesError> {
+        Err(map_turn_error(TurnError::Unauthorized))
+    }
 
     async fn get_run_state(
         &self,
@@ -2739,6 +2772,7 @@ pub struct RebornServices {
     thread_service: Arc<dyn SessionThreadService>,
     thread_plan_reader: Option<Arc<dyn ThreadPlanReader>>,
     turn_coordinator: Arc<dyn TurnCoordinator>,
+    run_tree_usage_source: Option<Arc<dyn ironclaw_turns::RunTreeUsagePrefixSource>>,
     inbound_attachments: Option<Arc<dyn InboundAttachmentLander>>,
     project_filesystem: Option<Arc<dyn ProjectFilesystemReader>>,
     filesystem_browser: Option<Arc<dyn FilesystemBrowseReader>>,
@@ -2776,6 +2810,7 @@ impl RebornServices {
             thread_service,
             thread_plan_reader: None,
             turn_coordinator,
+            run_tree_usage_source: None,
             inbound_attachments: None,
             project_filesystem: None,
             filesystem_browser: None,
@@ -3168,8 +3203,370 @@ fn last_admin_error() -> RebornServicesError {
     }
 }
 
+impl RebornServices {
+    async fn submit_webui_message(
+        &self,
+        caller: WebUiAuthenticatedCaller,
+        request: WebUiSendMessageRequest,
+        host_profile: Option<(RunProfileId, RunProfileVersion)>,
+    ) -> Result<RebornSubmitTurnResponse, RebornServicesError> {
+        let requested_run_id = request.requested_run_id;
+        // Decode + budget inline attachment bytes before the request is
+        // consumed into the (bytes-free, serializable) command.
+        let attachments = request.decode_attachments()?;
+        let command = request.into_command(caller)?;
+        let WebUiInboundCommand::SendMessage {
+            scope,
+            actor,
+            client_action_id,
+            content,
+            requested_model,
+            llm_subject,
+        } = command
+        else {
+            return Err(RebornServicesError::internal_invariant());
+        };
+
+        let (scope, thread_scope) = self
+            .resolve_webui_thread_metadata(scope, &actor)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    target: "tianquan::novel_reviewer",
+                    stage = "resolve-thread",
+                    code = ?error.code,
+                    kind = ?error.kind,
+                    status_code = error.status_code,
+                    "ReviewerHostThreadResolveFailed"
+                );
+                error
+            })?;
+        let _thread_operation_guard = self.lock_thread_operation(&scope).await;
+        let source_binding_id = webui_source_binding_id(&scope, &actor);
+        let external_event_id = client_action_id.as_str().to_string();
+
+        let mut prepared_run_id_reserved = false;
+        let replay_result = replay_webui_send_message(
+            &*self.thread_service,
+            &thread_scope,
+            &scope,
+            &actor,
+            &external_event_id,
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                target: "tianquan::novel_reviewer",
+                stage = "replay-inbound-message",
+                code = ?error.code,
+                kind = ?error.kind,
+                status_code = error.status_code,
+                "ReviewerHostMessageReplayFailed"
+            );
+            error
+        })?;
+        let handoff = if let Some((replay, replay_source_binding_id)) = replay_result {
+            if replay.thread_id != scope.thread_id {
+                return Err(RebornServicesError::from_status_kind(
+                    RebornServicesErrorCode::Conflict,
+                    RebornServicesErrorKind::Duplicate,
+                    409,
+                    false,
+                ));
+            }
+            match replay.status {
+                MessageStatus::Submitted => {
+                    let run_id = parse_replay_run_id(replay.turn_run_id)?;
+                    let state = self
+                        .turn_coordinator
+                        .get_run_state(GetRunStateRequest {
+                            scope: scope.clone(),
+                            run_id,
+                        })
+                        .await
+                        .map_err(map_turn_error)?;
+                    if let Some((profile, version)) = &host_profile {
+                        let accepted = accepted_message_ref(replay.message_id.to_string())?;
+                        let source = replay.source_binding_id.as_deref()
+                            .unwrap_or(&replay_source_binding_id);
+                        let reply = replay.reply_target_binding_id.as_deref()
+                            .unwrap_or(&replay_source_binding_id);
+                        if Some(run_id) != requested_run_id
+                            || state.scope != scope
+                            || state.run_id != run_id
+                            || &state.resolved_run_profile_id != profile
+                            || state.resolved_run_profile_version != *version
+                            || state.accepted_message_ref != accepted
+                            || state.source_binding_ref != webui_source_binding_ref_from_raw("webui-src", source)?
+                            || state.reply_target_binding_ref != webui_reply_target_binding_ref_from_raw("webui-reply", reply)?
+                        {
+                            return Err(map_turn_error(TurnError::Conflict {
+                                reason: "stored host product message does not match its run binding".into(),
+                            }));
+                        }
+                    }
+                    return Ok(RebornSubmitTurnResponse::AlreadySubmitted {
+                        thread_id: replay.thread_id,
+                        accepted_message_ref: accepted_message_ref(replay.message_id.to_string())?,
+                        run_id,
+                        status: state.status,
+                        event_cursor: state.event_cursor,
+                    });
+                }
+                MessageStatus::RejectedBusy => {
+                    // Idempotent re-rejection: the original busy rejection was
+                    // lost before it reached the client.  The blocking run may
+                    // already be finished, so we cannot recover its run-id or
+                    // cursor.  Return a RejectedBusy with None run metadata so
+                    // the client knows to resend rather than treating this as
+                    // a new submission.  Fabricating a run-id or status here
+                    // would give the client a reference it cannot query.
+                    return Ok(RebornSubmitTurnResponse::RejectedBusy {
+                        thread_id: replay.thread_id,
+                        accepted_message_ref: accepted_message_ref(replay.message_id.to_string())?,
+                        active_run_id: None,
+                        status: None,
+                        event_cursor: None,
+                        notice: NOTICE_BUSY_GENERIC.to_string(),
+                    });
+                }
+                MessageStatus::Accepted | MessageStatus::DeferredBusy => AcceptedWebUiMessage {
+                    thread_id: replay.thread_id,
+                    message_id: replay.message_id,
+                    actor_id: actor.user_id.as_str().to_string(),
+                    source_binding_id: replay
+                        .source_binding_id
+                        .unwrap_or_else(|| replay_source_binding_id.clone()),
+                    reply_target_binding_id: replay
+                        .reply_target_binding_id
+                        .unwrap_or(replay_source_binding_id),
+                },
+                _ => {
+                    return Err(RebornServicesError::from_status(
+                        RebornServicesErrorCode::Conflict,
+                        409,
+                        false,
+                    ));
+                }
+            }
+        } else {
+            // Land attachment bytes (if any) into project storage before the
+            // message is accepted, recording each as a transcript reference.
+            // The stable per-message external_event_id is the path's message
+            // segment, so a same-day retry re-lands at the same path; the lander
+            // also partitions by UTC day, so a retry that crosses midnight UTC
+            // lands under the new day's directory (the earlier bytes are left
+            // addressable but unreferenced). Idempotency is enforced at message
+            // acceptance, not by the storage path.
+            let message_content = if attachments.is_empty() {
+                MessageContent::text(content.clone())
+            } else {
+                let lander = self
+                    .inbound_attachments
+                    .as_ref()
+                    .ok_or_else(|| RebornServicesError::service_unavailable(false))?;
+                let refs = lander
+                    .land(&thread_scope, &external_event_id, attachments)
+                    .await?;
+                MessageContent::with_attachments(content.clone(), refs)
+            };
+            if let Some(run_id) = requested_run_id {
+                self.turn_coordinator
+                    .reserve_prepared_turn_id(scope.clone(), run_id)
+                    .await
+                    .map_err(map_turn_error)?;
+                prepared_run_id_reserved = true;
+            }
+            let accepted = match self
+                .thread_service
+                .accept_inbound_message(AcceptInboundMessageRequest {
+                    scope: thread_scope.clone(),
+                    thread_id: scope.thread_id.clone(),
+                    actor_id: actor.user_id.as_str().to_string(),
+                    source_binding_id: Some(source_binding_id.clone()),
+                    reply_target_binding_id: Some(source_binding_id.clone()),
+                    external_event_id: Some(external_event_id),
+                    content: message_content,
+                })
+                .await
+            {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "tianquan::novel_reviewer",
+                        stage = "accept-inbound-message",
+                        error = %error,
+                        "ReviewerHostMessageAcceptFailed"
+                    );
+                    if let Some(run_id) = requested_run_id {
+                        let _ = self.turn_coordinator.abort_prepared_turn(run_id).await;
+                    }
+                    return Err(map_thread_error(error));
+                }
+            };
+            AcceptedWebUiMessage {
+                thread_id: accepted.thread_id,
+                message_id: accepted.message_id,
+                actor_id: actor.user_id.as_str().to_string(),
+                source_binding_id: source_binding_id.clone(),
+                reply_target_binding_id: source_binding_id.clone(),
+            }
+        };
+
+        let accepted_message_ref = accepted_message_ref(handoff.message_id.to_string())?;
+        let source_binding_ref =
+            webui_source_binding_ref_from_raw("webui-src", &handoff.source_binding_id)?;
+        let reply_target_binding_ref = webui_reply_target_binding_ref_from_raw(
+            "webui-reply",
+            &handoff.reply_target_binding_id,
+        )?;
+        let product_context = ironclaw_product_context::resolve_web_ui(scope.product_owner(&actor));
+        if let Some(run_id) = requested_run_id
+            && !prepared_run_id_reserved
+        {
+            self.turn_coordinator
+                .reserve_prepared_turn_id(scope.clone(), run_id)
+                .await
+                .map_err(map_turn_error)?;
+        }
+        let requested_run_profile = host_profile.as_ref().map(|(profile, _)| {
+            RunProfileRequest::new(profile.as_str()).map_err(|_| RebornServicesError::internal_invariant())
+        }).transpose()?;
+        let submit = SubmitTurnRequest {
+            requested_model,
+            llm_subject,
+            scope: scope.clone(),
+            actor,
+            accepted_message_ref: accepted_message_ref.clone(),
+            source_binding_ref,
+            reply_target_binding_ref,
+            requested_run_profile,
+            idempotency_key: client_action_id.clone(),
+            received_at: Utc::now(),
+            requested_run_id,
+            parent_run_id: None,
+            subagent_depth: 0,
+            spawn_tree_root_run_id: None,
+            product_context: Some(product_context),
+        };
+
+        if host_profile.is_none()
+            && let Err(error) =
+                self.record_skill_activation_message(&scope, &accepted_message_ref, &content)
+        {
+            if let Some(run_id) = requested_run_id {
+                let _ = self.turn_coordinator.abort_prepared_turn(run_id).await;
+            }
+            return Err(error);
+        }
+        let host_submission = host_profile.is_some();
+        let response = match host_profile {
+            Some((profile, version)) => {
+                self.turn_coordinator.submit_product_profile_turn(submit, profile, version).await
+            }
+            None => self.turn_coordinator.submit_turn(submit).await,
+        };
+        match response {
+            Ok(SubmitTurnResponse::Accepted {
+                turn_id,
+                run_id,
+                status,
+                resolved_run_profile_id,
+                resolved_run_profile_version,
+                event_cursor,
+                ..
+            }) => {
+                tracing::debug!(
+                    thread_id = ?scope.thread_id,
+                    run_id = %run_id,
+                    "webui submit_turn accepted: turn run enqueued"
+                );
+                mark_message_submitted_or_replay(
+                    &*self.thread_service,
+                    &thread_scope,
+                    &handoff,
+                    &client_action_id,
+                    turn_id.to_string(),
+                    run_id.to_string(),
+                )
+                .await
+                .map_err(|error| {
+                    tracing::warn!(
+                        target: "tianquan::novel_reviewer",
+                        stage = "mark-message-submitted",
+                        code = ?error.code,
+                        kind = ?error.kind,
+                        status_code = error.status_code,
+                        "ReviewerHostMarkSubmittedFailed"
+                    );
+                    error
+                })?;
+
+                Ok(RebornSubmitTurnResponse::Submitted {
+                    thread_id: handoff.thread_id,
+                    accepted_message_ref,
+                    turn_id: turn_id.to_string(),
+                    run_id,
+                    status,
+                    resolved_run_profile_id: resolved_run_profile_id.as_str().to_string(),
+                    resolved_run_profile_version: resolved_run_profile_version.as_u64(),
+                    event_cursor,
+                })
+            }
+            Err(TurnError::ThreadBusy(busy)) => {
+                tracing::debug!(
+                    thread_id = ?scope.thread_id,
+                    active_run_id = ?busy.active_run_id,
+                    "webui submit_turn deferred: thread busy with an active run"
+                );
+                if !host_submission {
+                    self.clear_skill_activation_message(&scope, &accepted_message_ref)?;
+                }
+                if let Some(run_id) = requested_run_id {
+                    let _ = self.turn_coordinator.abort_prepared_turn(run_id).await;
+                }
+                mark_message_rejected_busy_or_replay(
+                    &*self.thread_service,
+                    &thread_scope,
+                    &handoff,
+                    &client_action_id,
+                )
+                .await?;
+                let notice = rejected_busy_notice(busy.status);
+                Ok(RebornSubmitTurnResponse::RejectedBusy {
+                    thread_id: handoff.thread_id,
+                    accepted_message_ref,
+                    active_run_id: Some(busy.active_run_id),
+                    status: Some(busy.status),
+                    event_cursor: Some(busy.event_cursor),
+                    notice,
+                })
+            }
+            Err(error) => {
+                tracing::debug!(
+                    thread_id = ?scope.thread_id,
+                    error = ?error,
+                    "webui submit_turn rejected by coordinator; no run enqueued"
+                );
+                if !host_submission {
+                    self.clear_skill_activation_message(&scope, &accepted_message_ref)?;
+                }
+                if let Some(run_id) = requested_run_id {
+                    let _ = self.turn_coordinator.abort_prepared_turn(run_id).await;
+                }
+                Err(map_turn_error(error))
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl RebornServicesApi for RebornServices {
+    async fn open_run_tree_usage(&self, caller:WebUiAuthenticatedCaller, request:RebornGetRunStateRequest)
+        -> Result<OwnerRunTreeUsageSession,RebornServicesError> {RebornServices::open_run_tree_usage(self,caller,request).await}
+    async fn read_run_tree_usage_page(&self,caller:WebUiAuthenticatedCaller,session:&mut OwnerRunTreeUsageSession,
+        cursor:Option<&str>,limit:usize)->Result<ironclaw_turns::RunTreeUsagePage,RebornServicesError> {RebornServices::read_run_tree_usage_page(self,caller,session,cursor,limit).await}
+
     async fn list_admin_users(
         &self,
         caller: WebUiAuthenticatedCaller,
@@ -3682,277 +4079,30 @@ impl RebornServicesApi for RebornServices {
         caller: WebUiAuthenticatedCaller,
         request: WebUiSendMessageRequest,
     ) -> Result<RebornSubmitTurnResponse, RebornServicesError> {
-        let requested_run_id = request.requested_run_id;
-        // Decode + budget inline attachment bytes before the request is
-        // consumed into the (bytes-free, serializable) command.
-        let attachments = request.decode_attachments()?;
-        let command = request.into_command(caller)?;
-        let WebUiInboundCommand::SendMessage {
-            scope,
-            actor,
-            client_action_id,
-            content,
-            requested_model,
-            llm_subject,
-        } = command
-        else {
-            return Err(RebornServicesError::internal_invariant());
-        };
-
-        let (scope, thread_scope) = self.resolve_webui_thread_metadata(scope, &actor).await?;
-        let _thread_operation_guard = self.lock_thread_operation(&scope).await;
-        let source_binding_id = webui_source_binding_id(&scope, &actor);
-        let external_event_id = client_action_id.as_str().to_string();
-
-        let mut prepared_run_id_reserved = false;
-        let handoff = if let Some((replay, replay_source_binding_id)) = replay_webui_send_message(
-            &*self.thread_service,
-            &thread_scope,
-            &scope,
-            &actor,
-            &external_event_id,
-        )
-        .await?
-        {
-            if replay.thread_id != scope.thread_id {
-                return Err(RebornServicesError::from_status_kind(
-                    RebornServicesErrorCode::Conflict,
-                    RebornServicesErrorKind::Duplicate,
-                    409,
-                    false,
-                ));
-            }
-            match replay.status {
-                MessageStatus::Submitted => {
-                    let run_id = parse_replay_run_id(replay.turn_run_id)?;
-                    let state = self
-                        .turn_coordinator
-                        .get_run_state(GetRunStateRequest {
-                            scope: scope.clone(),
-                            run_id,
-                        })
-                        .await
-                        .map_err(map_turn_error)?;
-                    return Ok(RebornSubmitTurnResponse::AlreadySubmitted {
-                        thread_id: replay.thread_id,
-                        accepted_message_ref: accepted_message_ref(replay.message_id.to_string())?,
-                        run_id,
-                        status: state.status,
-                        event_cursor: state.event_cursor,
-                    });
-                }
-                MessageStatus::RejectedBusy => {
-                    // Idempotent re-rejection: the original busy rejection was
-                    // lost before it reached the client.  The blocking run may
-                    // already be finished, so we cannot recover its run-id or
-                    // cursor.  Return a RejectedBusy with None run metadata so
-                    // the client knows to resend rather than treating this as
-                    // a new submission.  Fabricating a run-id or status here
-                    // would give the client a reference it cannot query.
-                    return Ok(RebornSubmitTurnResponse::RejectedBusy {
-                        thread_id: replay.thread_id,
-                        accepted_message_ref: accepted_message_ref(replay.message_id.to_string())?,
-                        active_run_id: None,
-                        status: None,
-                        event_cursor: None,
-                        notice: NOTICE_BUSY_GENERIC.to_string(),
-                    });
-                }
-                MessageStatus::Accepted | MessageStatus::DeferredBusy => AcceptedWebUiMessage {
-                    thread_id: replay.thread_id,
-                    message_id: replay.message_id,
-                    actor_id: actor.user_id.as_str().to_string(),
-                    source_binding_id: replay
-                        .source_binding_id
-                        .unwrap_or_else(|| replay_source_binding_id.clone()),
-                    reply_target_binding_id: replay
-                        .reply_target_binding_id
-                        .unwrap_or(replay_source_binding_id),
-                },
-                _ => {
-                    return Err(RebornServicesError::from_status(
-                        RebornServicesErrorCode::Conflict,
-                        409,
-                        false,
-                    ));
-                }
-            }
-        } else {
-            // Land attachment bytes (if any) into project storage before the
-            // message is accepted, recording each as a transcript reference.
-            // The stable per-message external_event_id is the path's message
-            // segment, so a same-day retry re-lands at the same path; the lander
-            // also partitions by UTC day, so a retry that crosses midnight UTC
-            // lands under the new day's directory (the earlier bytes are left
-            // addressable but unreferenced). Idempotency is enforced at message
-            // acceptance, not by the storage path.
-            let message_content = if attachments.is_empty() {
-                MessageContent::text(content.clone())
-            } else {
-                let lander = self
-                    .inbound_attachments
-                    .as_ref()
-                    .ok_or_else(|| RebornServicesError::service_unavailable(false))?;
-                let refs = lander
-                    .land(&thread_scope, &external_event_id, attachments)
-                    .await?;
-                MessageContent::with_attachments(content.clone(), refs)
-            };
-            if let Some(run_id) = requested_run_id {
-                self.turn_coordinator
-                    .reserve_prepared_turn_id(scope.clone(), run_id)
-                    .await
-                    .map_err(map_turn_error)?;
-                prepared_run_id_reserved = true;
-            }
-            let accepted = match self
-                .thread_service
-                .accept_inbound_message(AcceptInboundMessageRequest {
-                    scope: thread_scope.clone(),
-                    thread_id: scope.thread_id.clone(),
-                    actor_id: actor.user_id.as_str().to_string(),
-                    source_binding_id: Some(source_binding_id.clone()),
-                    reply_target_binding_id: Some(source_binding_id.clone()),
-                    external_event_id: Some(external_event_id),
-                    content: message_content,
-                })
-                .await
-            {
-                Ok(accepted) => accepted,
-                Err(error) => {
-                    if let Some(run_id) = requested_run_id {
-                        let _ = self.turn_coordinator.abort_prepared_turn(run_id).await;
-                    }
-                    return Err(map_thread_error(error));
-                }
-            };
-            AcceptedWebUiMessage {
-                thread_id: accepted.thread_id,
-                message_id: accepted.message_id,
-                actor_id: actor.user_id.as_str().to_string(),
-                source_binding_id: source_binding_id.clone(),
-                reply_target_binding_id: source_binding_id.clone(),
-            }
-        };
-
-        let accepted_message_ref = accepted_message_ref(handoff.message_id.to_string())?;
-        let source_binding_ref =
-            webui_source_binding_ref_from_raw("webui-src", &handoff.source_binding_id)?;
-        let reply_target_binding_ref = webui_reply_target_binding_ref_from_raw(
-            "webui-reply",
-            &handoff.reply_target_binding_id,
-        )?;
-        let product_context = ironclaw_product_context::resolve_web_ui(scope.product_owner(&actor));
-        if let Some(run_id) = requested_run_id
-            && !prepared_run_id_reserved
-        {
-            self.turn_coordinator
-                .reserve_prepared_turn_id(scope.clone(), run_id)
-                .await
-                .map_err(map_turn_error)?;
+        if request.client_action_id.as_deref().is_some_and(host_product_submit::is_host_product_action) {
+            return Err(map_turn_error(TurnError::Unauthorized));
         }
-        let submit = SubmitTurnRequest {
-            requested_model,
-            llm_subject,
-            scope: scope.clone(),
-            actor,
-            accepted_message_ref: accepted_message_ref.clone(),
-            source_binding_ref,
-            reply_target_binding_ref,
-            requested_run_profile: None,
-            idempotency_key: client_action_id.clone(),
-            received_at: Utc::now(),
-            requested_run_id,
-            parent_run_id: None,
-            subagent_depth: 0,
-            spawn_tree_root_run_id: None,
-            product_context: Some(product_context),
-        };
+        self.submit_webui_message(caller, request, None).await
+    }
 
-        if let Err(error) =
-            self.record_skill_activation_message(&scope, &accepted_message_ref, &content)
-        {
-            if let Some(run_id) = requested_run_id {
-                let _ = self.turn_coordinator.abort_prepared_turn(run_id).await;
-            }
-            return Err(error);
+    async fn submit_host_product_turn(
+        &self,
+        caller: WebUiAuthenticatedCaller,
+        mut request: WebUiSendMessageRequest,
+        profile: RunProfileId,
+        version: RunProfileVersion,
+    ) -> Result<RebornSubmitTurnResponse, RebornServicesError> {
+        if !self.host_product_profile_ready(&profile, version).await {
+            return Err(RebornServicesError::service_unavailable(false));
         }
-        match self.turn_coordinator.submit_turn(submit).await {
-            Ok(SubmitTurnResponse::Accepted {
-                turn_id,
-                run_id,
-                status,
-                resolved_run_profile_id,
-                resolved_run_profile_version,
-                event_cursor,
-                ..
-            }) => {
-                tracing::debug!(
-                    thread_id = ?scope.thread_id,
-                    run_id = %run_id,
-                    "webui submit_turn accepted: turn run enqueued"
-                );
-                mark_message_submitted_or_replay(
-                    &*self.thread_service,
-                    &thread_scope,
-                    &handoff,
-                    &client_action_id,
-                    turn_id.to_string(),
-                    run_id.to_string(),
-                )
-                .await?;
+        request.client_action_id = Some(host_product_submit::host_product_action_id(
+            &caller, &request, &profile, version,
+        )?);
+        self.submit_webui_message(caller, request, Some((profile, version))).await
+    }
 
-                Ok(RebornSubmitTurnResponse::Submitted {
-                    thread_id: handoff.thread_id,
-                    accepted_message_ref,
-                    turn_id: turn_id.to_string(),
-                    run_id,
-                    status,
-                    resolved_run_profile_id: resolved_run_profile_id.as_str().to_string(),
-                    resolved_run_profile_version: resolved_run_profile_version.as_u64(),
-                    event_cursor,
-                })
-            }
-            Err(TurnError::ThreadBusy(busy)) => {
-                tracing::debug!(
-                    thread_id = ?scope.thread_id,
-                    active_run_id = ?busy.active_run_id,
-                    "webui submit_turn deferred: thread busy with an active run"
-                );
-                self.clear_skill_activation_message(&scope, &accepted_message_ref)?;
-                if let Some(run_id) = requested_run_id {
-                    let _ = self.turn_coordinator.abort_prepared_turn(run_id).await;
-                }
-                mark_message_rejected_busy_or_replay(
-                    &*self.thread_service,
-                    &thread_scope,
-                    &handoff,
-                    &client_action_id,
-                )
-                .await?;
-                let notice = rejected_busy_notice(busy.status);
-                Ok(RebornSubmitTurnResponse::RejectedBusy {
-                    thread_id: handoff.thread_id,
-                    accepted_message_ref,
-                    active_run_id: Some(busy.active_run_id),
-                    status: Some(busy.status),
-                    event_cursor: Some(busy.event_cursor),
-                    notice,
-                })
-            }
-            Err(error) => {
-                tracing::debug!(
-                    thread_id = ?scope.thread_id,
-                    error = ?error,
-                    "webui submit_turn rejected by coordinator; no run enqueued"
-                );
-                self.clear_skill_activation_message(&scope, &accepted_message_ref)?;
-                if let Some(run_id) = requested_run_id {
-                    let _ = self.turn_coordinator.abort_prepared_turn(run_id).await;
-                }
-                Err(map_turn_error(error))
-            }
-        }
+    async fn host_product_profile_ready(&self, profile: &RunProfileId, version: RunProfileVersion) -> bool {
+        self.turn_coordinator.product_profile_ready(profile, version).await
     }
 
     async fn delete_thread(
@@ -4627,6 +4777,91 @@ impl RebornServicesApi for RebornServices {
                     "webui-retry-reply",
                     &binding_id,
                 )?,
+                idempotency_key: client_action_id,
+            })
+            .await
+            .map_err(map_turn_error)?;
+        Ok(response.into())
+    }
+
+    async fn recover_run(
+        &self,
+        caller: WebUiAuthenticatedCaller,
+        request: WebUiRecoverRunRequest,
+    ) -> Result<RebornRecoverRunResponse, RebornServicesError> {
+        let caller_for_fallback = caller.clone();
+        let command = request.into_command(caller)?;
+        let WebUiInboundCommand::RecoverRun {
+            scope,
+            actor,
+            run_id,
+            expected_checkpoint_id,
+            expected_failure_category,
+            client_action_id,
+        } = command
+        else {
+            return Err(RebornServicesError::internal_invariant());
+        };
+        let access = self
+            .resolve_thread_access_for_caller(caller_for_fallback, scope, &actor)
+            .await?;
+        let _thread_operation_guard = self.lock_thread_operation(&access.scope).await;
+        let state = self
+            .turn_coordinator
+            .get_run_state(GetRunStateRequest {
+                scope: access.scope.clone(),
+                run_id,
+            })
+            .await
+            .map_err(map_turn_error)?;
+        let binding_id = webui_source_binding_id(&access.scope, &access.run_actor);
+        let canonical_source =
+            webui_source_binding_ref_from_raw("webui-src", &binding_id)?;
+        let canonical_reply =
+            webui_reply_target_binding_ref_from_raw("webui-reply", &binding_id)?;
+        let expected_binding_child_run_id =
+            if state.source_binding_ref == canonical_source
+                && state.reply_target_binding_ref == canonical_reply
+            {
+                None
+            } else {
+                let source_prefix = format!("subagent-source:{run_id}:");
+                let reply_prefix = format!("subagent-reply:{run_id}:");
+                let child_raw = state
+                    .source_binding_ref
+                    .as_str()
+                    .strip_prefix(&source_prefix)
+                    .ok_or_else(|| {
+                        map_turn_error(TurnError::Conflict {
+                            reason: "recover source binding is not a self-await binding"
+                                .to_string(),
+                        })
+                    })?;
+                let child_run_id = TurnRunId::parse(child_raw).map_err(|_| {
+                    map_turn_error(TurnError::Conflict {
+                        reason: "recover source binding child id is invalid".to_string(),
+                    })
+                })?;
+                if state.reply_target_binding_ref.as_str()
+                    != format!("{reply_prefix}{child_run_id}")
+                {
+                    return Err(map_turn_error(TurnError::Conflict {
+                        reason: "recover source and reply child bindings differ".to_string(),
+                    }));
+                }
+                Some(child_run_id)
+            };
+        let response = self
+            .turn_coordinator
+            .recover_turn(RecoverTurnRequest {
+                scope: access.scope,
+                actor: access.run_actor,
+                run_id,
+                expected_checkpoint_id,
+                expected_failure_category,
+                expected_binding_child_run_id,
+                source_binding_ref: canonical_source,
+                reply_target_binding_ref: canonical_reply,
                 idempotency_key: client_action_id,
             })
             .await

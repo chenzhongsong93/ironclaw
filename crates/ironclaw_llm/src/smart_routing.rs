@@ -1582,6 +1582,9 @@ mod tests {
     #[test]
     fn detects_uncertain_short_response() {
         let response = CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: "I'm not sure.".to_string(),
             input_tokens: 10,
             output_tokens: 5,
@@ -1596,6 +1599,9 @@ mod tests {
     #[test]
     fn detects_empty_response_as_uncertain() {
         let response = CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: "".to_string(),
             input_tokens: 10,
             output_tokens: 0,
@@ -1610,6 +1616,9 @@ mod tests {
     #[test]
     fn short_confident_response_is_not_uncertain() {
         let response = CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: "Yes.".to_string(),
             input_tokens: 10,
             output_tokens: 1,
@@ -1624,6 +1633,9 @@ mod tests {
     #[test]
     fn confident_response_is_not_uncertain() {
         let response = CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: "The answer is 42. This is a well-known constant from the Hitchhiker's Guide."
                 .to_string(),
             input_tokens: 10,

@@ -118,9 +118,24 @@ pub(super) fn capability_host_error(error: AgentLoopHostError) -> AgentLoopExecu
     if error.kind == AgentLoopHostErrorKind::Cancelled {
         return AgentLoopExecutorError::Cancelled;
     }
+    if let Some(diagnostic) = error
+        .diagnostic_ref
+        .as_ref()
+        .and_then(ironclaw_turns::run_profile::HostSafeDiagnostic::from_diagnostic_ref)
+        && let Ok(safe_summary) =
+            ironclaw_turns::run_profile::LoopSafeSummary::new("capability host unavailable")
+    {
+        return AgentLoopExecutorError::HostUnavailableWithDiagnostics {
+            stage: HostStage::Capability,
+            kind: error.kind,
+            safe_summary,
+            reason_kind: None,
+            diagnostic_ref: Some(diagnostic.diagnostic_ref()),
+            detail: None,
+        };
+    }
     tracing::warn!(
         kind = error.kind.as_str(),
-        safe_summary = error.safe_summary.as_str(),
         "capability host error mapped to HostUnavailable"
     );
     AgentLoopExecutorError::HostUnavailable {
@@ -374,5 +389,120 @@ mod tests {
             model_error_class(&error),
             Some(ModelErrorClass::InvalidOutput)
         );
+    }
+
+    #[test]
+    fn capability_host_safe_diagnostic_preserves_canonical_code_without_private_text() {
+        for code in [
+            "context-state.read-failed",
+            "context-record.read-failed",
+            "context-record.missing",
+            "context-match.mismatch",
+            "signing.failed",
+            "http.send-failed",
+            "response.too-large",
+            "response.invalid-json",
+            "response.unexpected-outcome",
+            "response.invalid-record",
+            "http.status-100",
+            "http.status-199",
+            "http.status-300",
+            "http.status-399",
+            "http.status-400",
+            "http.status-403",
+            "http.status-499",
+            "http.status-500",
+            "http.status-503",
+            "http.status-599",
+        ] {
+            let token = format!("diag:host-safe.{code}");
+            let input = AgentLoopHostError::new(
+                AgentLoopHostErrorKind::Unavailable,
+                "SECRETsentinel summary",
+            )
+            .with_diagnostic_ref(
+                ironclaw_turns::LoopDiagnosticRef::new(token.clone())
+                    .expect("existing diagnostic ref grammar"),
+            )
+            .with_detail("SECRETsentinel raw detail");
+            match capability_host_error(input) {
+                AgentLoopExecutorError::HostUnavailableWithDiagnostics {
+                    stage: HostStage::Capability,
+                    kind,
+                    safe_summary,
+                    diagnostic_ref,
+                    detail,
+                    ..
+                } => {
+                    assert_eq!(kind, AgentLoopHostErrorKind::Unavailable);
+                    assert!(!safe_summary.as_str().contains("SECRETsentinel"));
+                    assert_eq!(
+                        diagnostic_ref.as_ref().map(|value| value.as_str()),
+                        Some(token.as_str())
+                    );
+                    assert_eq!(detail, None);
+                    assert!(
+                        !detail
+                            .as_deref()
+                            .unwrap_or_default()
+                            .contains("SECRETsentinel")
+                    );
+                }
+                other => panic!(
+                    "canonical diagnostic must survive real capability mapping, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn capability_host_safe_diagnostic_rejects_unknown_secret_and_noncanonical_codes() {
+        for code in [
+            "unknown.missing",
+            "context-state.missing",
+            "context-record.mismatch",
+            "context-match.read-failed",
+            "signing.read-failed",
+            "response.missing",
+            "http.status-99",
+            "http.status-600",
+            "http.status-200",
+            "http.status-204",
+            "http.status-299",
+            "http.status-0403",
+            "http.status-403.0",
+            "http.status-403.extra",
+            "http.status-403-SECRETsentinel",
+            "context-match.mismatch.SECRETsentinel",
+            "Context-match.mismatch",
+            "context-match.MISMATCH",
+            "context-record.missing-extra",
+        ] {
+            let input = AgentLoopHostError::new(
+                AgentLoopHostErrorKind::Unavailable,
+                "SECRETsentinel summary",
+            )
+            .with_diagnostic_ref(
+                ironclaw_turns::LoopDiagnosticRef::new(format!("diag:host-safe.{code}"))
+                    .expect("existing diagnostic ref grammar"),
+            )
+            .with_detail("SECRETsentinel raw detail");
+            match capability_host_error(input) {
+                AgentLoopExecutorError::HostUnavailable {
+                    stage: HostStage::Capability,
+                } => {}
+                other => panic!("malformed diagnostic must remain generic, got {other:?}"),
+            }
+        }
+        let cancelled =
+            AgentLoopHostError::new(AgentLoopHostErrorKind::Cancelled, "SECRETsentinel summary")
+                .with_diagnostic_ref(
+                    ironclaw_turns::LoopDiagnosticRef::new("diag:host-safe.http.status-403")
+                        .expect("diagnostic ref"),
+                );
+        assert!(matches!(
+            capability_host_error(cancelled),
+            AgentLoopExecutorError::Cancelled
+        ));
     }
 }

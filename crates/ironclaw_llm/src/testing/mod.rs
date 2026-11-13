@@ -244,6 +244,9 @@ impl LlmProvider for StubLlm {
             return Err(err);
         }
         Ok(CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: self.response.clone(),
             input_tokens: 10,
             output_tokens: 5,
@@ -263,6 +266,9 @@ impl LlmProvider for StubLlm {
             return Err(err);
         }
         Ok(ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: Some(self.response.clone()),
             tool_calls: Vec::new(),
             input_tokens: 10,

@@ -1521,9 +1521,13 @@ fn response_usage_from_model_usage(usage: &LoopModelUsage, model: &str) -> OpenA
     // already a subset of `LoopModelUsage::input_tokens`, so it must NOT be
     // added again; `cache_creation` is a separate write-side count and is
     // added on top.
-    let total_input = usage
-        .input_tokens
-        .saturating_add(usage.cache_creation_input_tokens);
+    // V1 uses the checked sidecar; historical raw pricing/projection stays on
+    // its original branch. Never add cache again to a canonical total.
+    let total_input = usage.normalized_input_total().unwrap_or_else(|| {
+        usage
+            .input_tokens
+            .saturating_add(usage.cache_creation_input_tokens)
+    });
     OpenAiResponseUsage {
         input_tokens: total_input,
         output_tokens: usage.output_tokens,
@@ -1545,9 +1549,15 @@ fn response_usage_from_model_usage(usage: &LoopModelUsage, model: &str) -> OpenA
 fn response_cost_from_model_usage(usage: &LoopModelUsage, model: &str) -> Option<OpenAiCompatCost> {
     use ironclaw_common::llm_costs::{format_usd, price_usage};
 
+    // Existing price_usage expects input including reads, excluding creation.
+    // Convert only a new checked V1 total; old raw callers remain unchanged.
+    let pricing_input = match usage.normalized_input_total() {
+        Some(total) => total.checked_sub(usage.cache_creation_input_tokens)?,
+        None => usage.input_tokens,
+    };
     let cost = price_usage(
         model,
-        usage.input_tokens,
+        pricing_input,
         usage.output_tokens,
         usage.cache_read_input_tokens,
         usage.cache_creation_input_tokens,

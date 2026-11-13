@@ -124,3 +124,60 @@ impl ApprovalInteractionService for UnavailableApprovalInteractionService {
         })
     }
 }
+
+#[cfg(test)]
+mod production_surface_behavior_red_tests {
+    use super::*;
+    use ironclaw_host_api::{CapabilityId, TenantId, ThreadId};
+    use ironclaw_turns::run_profile::{InMemoryRunProfileResolver, RunProfileResolutionRequest};
+    use ironclaw_turns::{RunProfileResolver, TurnId, TurnRunId, TurnScope};
+
+    async fn actual_typed_context_fixture() -> LoopRunContext {
+        let profile = InMemoryRunProfileResolver::default()
+            .resolve_run_profile(RunProfileResolutionRequest::interactive_default())
+            .await
+            .unwrap();
+        let scope = TurnScope::new(
+            TenantId::new("production-surface-l1-fixture").unwrap(),
+            None,
+            None,
+            ThreadId::new("surface-l1-thread").unwrap(),
+        );
+        LoopRunContext::new(scope, TurnId::new(), TurnRunId::new(), profile)
+    }
+
+    #[tokio::test]
+    async fn current_production_port_unavailability_is_observed_from_real_factory() {
+        let context = actual_typed_context_fixture().await;
+        match UnavailableCapabilityPortFactory
+            .create_capability_port(&context)
+            .await
+        {
+            Ok(_) => panic!("当前明确Unavailable factory不应返回port"),
+            Err(error) => assert!(
+                error
+                    .to_string()
+                    .contains("capability port is unavailable for production runtime launch")
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn required_production_surface_must_admit_registered_spawn_behavior_red() {
+        let context = actual_typed_context_fixture().await;
+        // 直接调用当前生产resolver；没有mock resolver/AllowAll/注入capability集合。
+        let actual = EmptyCapabilitySurfaceResolver
+            .resolve(&context)
+            .await
+            .unwrap();
+        let spawn = CapabilityId::new("builtin.spawn_subagent").unwrap();
+        println!(
+            "ACTUAL_PRODUCTION_SPAWN_PERMITTED={}",
+            actual.permits(&spawn)
+        );
+        assert!(
+            actual.permits(&spawn),
+            "Required生产世界宿主不能把注册spawn隐退为空surface"
+        );
+    }
+}

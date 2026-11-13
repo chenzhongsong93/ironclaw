@@ -2067,6 +2067,7 @@ fn slack_user_asset_root() -> std::path::PathBuf {
 
 fn slack_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "slack.com".to_string(),
@@ -2227,6 +2228,7 @@ fn google_drive_policy() -> NetworkPolicy {
 
 fn google_policy(host_pattern: &str) -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: host_pattern.to_string(),
@@ -2475,6 +2477,7 @@ fn sample_scope(invocation_id: InvocationId) -> ResourceScope {
 
 fn github_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "api.github.com".to_string(),

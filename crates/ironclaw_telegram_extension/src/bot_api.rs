@@ -262,6 +262,7 @@ fn bot_api_request(
 
 fn telegram_network_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: TELEGRAM_API_HOST.to_string(),

@@ -5,8 +5,8 @@ use tracing::Instrument;
 
 use crate::{
     CancelRunRequest, CancelRunResponse, EventCursor, GetLoopCheckpointRequest, GetRunStateRequest,
-    LoopCheckpointRecord, LoopCheckpointStore, PutLoopCheckpointRequest, ResumeTurnRequest,
-    ResumeTurnResponse, RetryTurnRequest, RetryTurnResponse, RunProfileResolver,
+    LoopCheckpointRecord, LoopCheckpointStore, PutLoopCheckpointRequest, RecoverTurnRequest,
+    ResumeTurnRequest, ResumeTurnResponse, RetryTurnRequest, RetryTurnResponse, RunProfileResolver,
     SpawnTreeReservation, SubmitChildRunRequest, SubmitTurnRequest, SubmitTurnResponse,
     TurnAdmissionPolicy, TurnError, TurnEventPage, TurnEventProjectionSource, TurnRunId,
     TurnRunRecord, TurnRunState, TurnScope, TurnSpawnTreeStateStore, TurnStateStore, TurnStatus,
@@ -142,6 +142,30 @@ where
             Some(&run_id),
         ))
         .await
+    }
+
+    async fn recover_turn(
+        &self,
+        request: RecoverTurnRequest,
+    ) -> Result<ResumeTurnResponse, TurnError> {
+        let scope = request.scope.clone();
+        let run_id = request.run_id;
+        self.apply_with_targeted_delta(
+            RunnerLeaseOverlay::None,
+            |store| {
+                let request = request.clone();
+                async move { Ok(store.recover_turn(request).await) }
+            },
+            |snapshot, _latest_event_cursor, store, _response| {
+                full_snapshot_delta(snapshot, store)
+            },
+        )
+        .instrument(turn_state_write_span(
+            "recover_turn",
+            Some(&scope),
+            Some(&run_id),
+        ))
+        .await?
     }
 
     async fn retry_turn(&self, request: RetryTurnRequest) -> Result<RetryTurnResponse, TurnError> {

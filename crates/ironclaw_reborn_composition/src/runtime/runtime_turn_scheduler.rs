@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 /// "stopped-first, then contention=alive" check now delegates to
 /// `is_stopped()`.
 pub(super) struct RuntimeTurnScheduler {
-    handle: Mutex<Option<TurnRunSchedulerHandle>>,
+    handle: Arc<Mutex<Option<TurnRunSchedulerHandle>>>,
     pub(super) stopped: Arc<AtomicBool>,
     notifier: Arc<SchedulerTurnRunWakeNotifier>,
 }
@@ -20,7 +20,7 @@ impl RuntimeTurnScheduler {
         notifier: Arc<SchedulerTurnRunWakeNotifier>,
     ) -> Self {
         Self {
-            handle: Mutex::new(Some(handle)),
+            handle: Arc::new(Mutex::new(Some(handle))),
             stopped: Arc::new(AtomicBool::new(false)),
             notifier,
         }
@@ -45,6 +45,29 @@ impl RuntimeTurnScheduler {
             return true;
         }
         false
+    }
+
+    /// Resident proof inspection is stricter than submit liveness: contention is unknown.
+    /// Does not change is_stopped()'s established contention=alive application semantics.
+    pub(super) fn resident_state(&self)->super::RebornResidentWorkerState {
+        use super::RebornResidentWorkerState as S;
+        if self.stopped.load(Ordering::Acquire){return S::Cancelled;}
+        let Ok(guard)=self.handle.try_lock() else{return S::Unknown;};
+        match guard.as_ref() {
+            None=>S::Missing,
+            Some(h) if h.cancellation_requested()=>S::Cancelled,
+            Some(h) if h.is_stopped()=>S::Finished,
+            Some(_)=>S::Running,
+        }
+    }
+
+    pub(super) fn resident_observer(&self)->Arc<dyn Fn()->super::RebornResidentWorkerState+Send+Sync> {
+        let stopped=self.stopped.clone();let handle=self.handle.clone();Arc::new(move|| {
+            use super::RebornResidentWorkerState as S;
+            if stopped.load(Ordering::Acquire){return S::Cancelled;}
+            let Ok(guard)=handle.try_lock() else{return S::Unknown;};
+            match guard.as_ref(){None=>S::Missing,Some(h) if h.cancellation_requested()=>S::Cancelled,Some(h) if h.is_stopped()=>S::Finished,Some(_)=>S::Running}
+        })
     }
 
     /// Fire-and-forget wake nudge to the scheduler.

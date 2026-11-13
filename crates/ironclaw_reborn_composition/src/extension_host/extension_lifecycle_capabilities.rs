@@ -1949,6 +1949,7 @@ credential_handle = "channel_ext_token"
                 allowed_effects: allowed_effects(),
                 mounts: MountView::default(),
                 network: NetworkPolicy {
+                    deny_redirects: false,
                     allowed_targets: vec![NetworkTargetPattern {
                         scheme: None,
                         host_pattern: "*".to_string(),

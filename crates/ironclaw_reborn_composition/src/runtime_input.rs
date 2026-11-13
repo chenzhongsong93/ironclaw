@@ -427,6 +427,10 @@ pub struct RebornRuntimeInput {
     pub default_project_id: Option<ProjectId>,
     pub regex_skill_activation_enabled: bool,
     pub skill_context_source: Option<Arc<dyn HostSkillContextSource>>,
+    /// Complete Production activation/execution bundle; never a context-only bypass.
+    pub runtime_skill_bundle: Option<crate::RebornRuntimeSkillBundle>,
+    /// 受信启动composition注入；同Production services建真实surface，不从model/HTTP映射。
+    pub production_execution_surface_factory: Option<Arc<dyn crate::RebornProductionExecutionSurfaceFactory>>,
     /// Hook-framework activation knobs. Default OFF. Callers resolve
     /// environment or config into this typed value once at the edge.
     pub hooks: HooksActivationConfig,
@@ -473,6 +477,12 @@ pub struct RebornRuntimeInput {
 }
 
 impl RebornRuntimeInput {
+    /// Delegates only through an already explicit substrate profile; never defaults to Production.
+    pub fn with_host_extension_bundles(mut self,bundles:Vec<crate::RebornHostExtensionBundle>)->Result<Self,crate::RebornBuildError> {
+        let services=self.services.take().ok_or_else(||crate::RebornBuildError::InvalidConfig{reason:"HostBundle runtime input requires explicit services profile".into()})?;
+        self.services=Some(services.with_host_extension_bundles(bundles)?);Ok(self)
+    }
+
     /// Start from a substrate build input. The substrate input must be
     /// provided — there is no in-memory-only fallback at this layer because
     /// the substrate decisions (local-dev root, libsql handle, etc.) belong
@@ -492,6 +502,8 @@ impl RebornRuntimeInput {
             default_project_id: None,
             regex_skill_activation_enabled: true,
             skill_context_source: None,
+            runtime_skill_bundle: None,
+            production_execution_surface_factory: None,
             hooks: HooksActivationConfig::from_env(),
             budget_defaults: None,
             budget_event_observer: None,
@@ -656,6 +668,10 @@ impl RebornRuntimeInput {
     /// disclosure gate) has been built. The WebChat v2 serve path uses this to
     /// align the runtime owner with the authenticated WebUI user. No-op when
     /// the services input is absent.
+    pub fn with_private_startup_admission_hold(mut self)->Result<Self,crate::RebornBuildError> {
+        let services=self.services.take().ok_or_else(||crate::RebornBuildError::InvalidConfig {reason:"startupAdmissionRequiresServices".into()})?;
+        self.services=Some(services.with_private_startup_admission_hold()?);Ok(self)
+    }
     pub fn with_owner_id(mut self, owner_id: impl Into<String>) -> Self {
         self.services = self
             .services
@@ -681,6 +697,16 @@ impl RebornRuntimeInput {
             .services
             .map(|services| services.with_slack_personal_oauth_redirect_uri_configured(configured));
         self
+    }
+
+    pub fn with_production_execution_surface_factory(
+        mut self,factory:Arc<dyn crate::RebornProductionExecutionSurfaceFactory>,
+    )->Self {
+        self.production_execution_surface_factory=Some(factory);self
+    }
+
+    pub fn with_runtime_skill_bundle(mut self, bundle:crate::RebornRuntimeSkillBundle)->Self {
+        self.runtime_skill_bundle=Some(bundle);self
     }
 
     pub fn with_skill_context_source(mut self, source: Arc<dyn HostSkillContextSource>) -> Self {
@@ -738,5 +764,13 @@ impl RebornRuntimeInput {
     ) -> Self {
         self.model_cost_table_override = Some(cost_table);
         self
+    }
+}
+
+#[cfg(test)] mod host_bundle_delegate_tests {
+    #[test] fn unspecified_runtime_profile_does_not_sneak_bundle_defaults() {
+        assert!(super::RebornRuntimeInput::default().with_host_extension_bundles(Vec::new()).is_err());
+        let old=super::RebornRuntimeInput::from_services(crate::RebornBuildInput::disabled("owner"));
+        assert!(old.with_host_extension_bundles(Vec::new()).is_ok());
     }
 }

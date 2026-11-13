@@ -56,6 +56,12 @@ mod readiness;
 mod root;
 mod runtime;
 mod runtime_input;
+mod production_execution_surface;
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+mod production_lifecycle;
+pub use production_execution_surface::{RebornProductionBoundPorts,RebornProductionSurfaceContext,
+    RebornProductionContextSources,RebornProductionExecutionSurface,
+    RebornProductionExecutionSurfaceFactory};
 mod runtime_profile_approval_policy;
 mod support;
 #[cfg(feature = "test-support")]
@@ -109,6 +115,11 @@ pub use ironclaw_product_workflow::{
     LifecycleProductResponse, LifecycleSearchExtensionSummary,
 };
 pub use ironclaw_runner::runtime::DEFAULT_TURN_RUNNER_WORKER_COUNT;
+/// In-process driver configuration for the TianQuan required Gateway.
+pub use ironclaw_runner::{
+    driver_registry::{DriverRequirements, RequirementLevel},
+    runtime::ProductRunDriver,
+};
 // Re-exported for `ironclaw_reborn_cli` (`runtime/mod.rs` turn-failure display):
 // the CLI consumes composition as its facade and must not grow a direct
 // `ironclaw_runner` edge for one summary helper. All other run-failure
@@ -208,9 +219,11 @@ pub use root::profile::{RebornCompositionProfile, RebornCompositionProfileParseE
 #[cfg(any(test, feature = "test-support"))]
 pub use runtime::RebornTurnDriveOutcome;
 pub use runtime::{
+    RebornRequesterRuntimeProtocolSnapshot, RebornResidentWorkerState,
     AssistantReply, ConversationId, RebornRuntime, RebornRuntimeError, RebornSkillActivation,
     RebornSkillActivationMode, RebornSkillAsset, RebornSkillBundle, RebornSkillExecutionPlan,
     RebornSkillExecutionResult, RebornSkillSourceKind, build_reborn_runtime,
+    build_reborn_runtime_with_opaque_input_backend, build_reborn_runtime_with_product_driver,
 };
 pub use runtime_input::{
     CredentialRefreshSettings, DEFAULT_TURN_RUNNER_HEARTBEAT_INTERVAL,
@@ -1481,3 +1494,24 @@ mod gate_record_production_mount_tests {
         assert_eq!(store.load(&scope_b, gate_ref).await.unwrap(), None);
     }
 }
+
+mod runtime_skill_bundle;
+pub use runtime_skill_bundle::RebornRuntimeSkillBundle;
+
+mod operator_host_bundle;
+pub use operator_host_bundle::RebornHostExtensionBundle;
+
+/// Read-only compiled protocol information; does not establish a live host or grant egress authority.
+pub fn reborn_requester_egress_protocol_version()->&'static str {
+    ironclaw_network::host_http_egress_protocol_version()
+}
+
+mod requester_protocol_export;
+/// Print read-only native protocol information before a host loads configuration or starts a runtime.
+/// `host_package_version` comes from the caller's compiled Cargo package constant, never model/HTTP input.
+/// This query does not claim source provenance, readiness, tenant authority, or complete qualification.
+pub fn print_reborn_requester_egress_protocol(host_package_version:&'static str)->Result<(),&'static str> {
+    requester_protocol_export::print(host_package_version)
+}
+
+mod operator_late_admission;

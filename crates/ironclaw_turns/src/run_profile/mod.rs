@@ -13,6 +13,7 @@ mod content_digest;
 mod context_budget;
 mod driver;
 mod host;
+mod host_safe_diagnostic;
 mod instruction_bundle;
 mod memory_context;
 mod milestones;
@@ -52,6 +53,7 @@ pub use host::{
     CapabilityDescriptorView, CapabilityFailure, CapabilityFailureKind, CapabilityFailureKindValue,
     CapabilityInputRef, CapabilityInvocation, CapabilityProgress, CapabilityResultMessage,
     CapabilityResumeToken, CapabilitySurfaceVersion, ConcurrencyHint, FinalizeAssistantMessage,
+    HostProductAwait,
     LOOP_CONTEXT_SNIPPET_MODEL_CONTENT_MAX_BYTES, LOOP_CONTEXT_TOTAL_MODEL_CONTENT_MAX_BYTES,
     LoadCheckpointPayloadRequest, LoadedCheckpointPayload, LoopCancelReasonKind,
     LoopCancellationPort, LoopCancellationSignal, LoopCapabilityPort, LoopCheckpointKind,
@@ -71,6 +73,7 @@ pub use host::{
     VisibleCapabilityRequest, VisibleCapabilitySurface, sanitize_model_visible_text,
     validate_model_route_component_value,
 };
+pub use host_safe_diagnostic::HostSafeDiagnostic;
 pub use instruction_bundle::{
     InMemoryInstructionMaterializationStore, InstructionBundle, InstructionBundleBuilder,
     InstructionBundleFingerprint, InstructionBundleMaterializedMessage, InstructionBundleRequest,

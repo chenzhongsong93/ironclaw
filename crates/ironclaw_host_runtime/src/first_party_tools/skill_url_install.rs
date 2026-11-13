@@ -165,6 +165,7 @@ fn validate_skill_url(url: &str) -> Result<url::Url, FirstPartyCapabilityError> 
 
 fn skill_url_network_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: ALLOWED_SKILL_URL_HOSTS
             .iter()
             .map(|host| NetworkTargetPattern {

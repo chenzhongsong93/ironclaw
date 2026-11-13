@@ -230,6 +230,7 @@ mod tests {
             headers: vec![(header.0.to_string(), header.1.to_string())],
             body: Vec::new(),
             network_policy: NetworkPolicy {
+                deny_redirects: false,
                 allowed_targets: vec![],
                 deny_private_ip_ranges: true,
                 max_egress_bytes: Some(4096),

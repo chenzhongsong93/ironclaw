@@ -124,6 +124,25 @@ The runtime computes serialized JSON output bytes and reconciles at least that a
 
 ## 5. Dispatcher
 
+### MCP tool errors (ISSUE-IRONCLAW-047)
+
+A successful JSON-RPC transport exchange does not imply a successful tool
+operation. The host runtime's existing MCP adapter interprets `result.isError`
+after the MCP runtime has reconciled actual resource usage. `true` becomes the
+existing `OperationFailed` tool error; a present non-boolean value becomes
+`InvalidResult`. Missing or `false` keeps the existing success path. Neither
+error grants automatic same-call retry. The safe summary is fixed host text;
+untrusted content and structuredContent must not enter that summary or become
+host-authored remediation. No secondary resource reservation is created.
+
+Validation: `cargo test -p ironclaw_host_runtime --lib mcp_adapter_tool_error`.
+The caller-level matrix in `src/services/tests/mcp_runtime_adapter.rs` drives
+the real MCP HTTP client, handshake, runtime and adapter through an in-memory
+HTTP substrate; it verifies one tools/call, reconciled resources, flag types,
+and exclusion of a private-content sentinel from surfaced errors. A separate
+loop-path assertion must establish model-visible failure and no same-call retry;
+this matrix alone is not full product acceptance.
+
 `RuntimeDispatcher` now supports:
 
 ```rust
@@ -211,6 +230,27 @@ network-policy store, or probe hosted MCP servers directly.
 
 ---
 
+## 7.1 同runtime Root目录安装
+
+已保留的operator package保持精确signed `/mcp/internal` endpoint、provider/digest、
+tenant、实际resident身份及signer audience。只有既有私有Root discovery构造器能够
+选择catalog-only planner，并从该绑定派生同origin公开`/mcp`URL。该实例仅允许
+HTTP POST、有界单JSON-RPC `initialize`、`notifications/initialized`和`tools/list`；
+拒绝tool call、batch、foreign package/tenant/URL及普通fallback。Discovery不伪造
+actor/run上下文，仍走既有host-mediated HTTP egress、response/time上限和deny-only
+redirect策略。正常operator工具继续精确signed internal流量，原服务端验签、scope和
+permission门不变。
+
+Crate caller回归：`extension_host::mcp::tests::root_catalog_actual_planner_only_three_public_methods`、
+`root_catalog_actual_planner_denies_tools_batch_and_foreign_without_fallback`、
+`ordinary_operator_keeps_exact_internal_and_root_rechecks_package`、
+`root_discovery_actual_caller_uses_public_catalog_without_actor_headers`。
+命令：`cargo test -p ironclaw_reborn_composition root_catalog`及
+`cargo test -p ironclaw_reborn_composition root_discovery_actual_caller`。
+这些是hermetic host-egress测试，不授真实actor/model资格。
+
+---
+
 ## 8. Non-goals
 
 This slice does not implement:
@@ -225,3 +265,20 @@ This slice does not implement:
 - conversation or agent-loop behavior
 
 Those belong to later adapter, auth, network, process, and run-state slices.
+
+## Root loopback声明与生命周期选择的补充
+
+Root HTTP声明不得被早期HTTPS-only分类默认为Static activation。实际lifecycle的
+package_requires_hosted_mcp_discovery与activate_inner共用已验证Root selector；无有效reserved
+binding、失活runtime gate或Static mode均拒绝，发现失败不回落静态包。实际discovery caller
+的早门及末元数据转换均使用owning extensions明确的loopback纯数据变体。普通无store的
+HTTP discovery仍拒；普通HTTPS路径保持原策略。
+
+新增caller回归`extension_host::extension_lifecycle::tests::root_loopback_lifecycle_requires_real_discovery_and_rejects_static_fallback`；
+既有`root_discovery_actual_caller_uses_public_catalog_without_actor_headers`同时核无Root HTTP拒
+以及Root转换保留known安全metadata。其余01已过planner/回归结果保留，不以重复执行冒新成果。
+
+Root lifecycle必须先按operator store的selected/requires_admission判断，再检查package URL、
+digest与当前binding；selected provider变形为localhost/foreign HTTP或HTTPS不能绕为普通
+Static activation。`selected_root_lifecycle_rejects_deformed_loaded_package_before_any_egress`
+驱动实际manager的requires/Static/Hosted门，断言0egress且无active发布。

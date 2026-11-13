@@ -218,6 +218,7 @@ fn tool_result_count(request: &ironclaw_loop_host::HostManagedModelRequest) -> u
 
 fn http_network_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "api.example.test".to_string(),

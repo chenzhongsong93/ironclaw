@@ -674,6 +674,29 @@ mod tests {
         record_spawn_terminal(None, &rec, None).await;
     }
 
+    #[tokio::test]
+    #[ignore = "requires explicit read-only PostgreSQL preflight DSN"]
+    async fn tokio_pg_dsn_options_preserve_role_and_search_path() {
+        let pg_url = std::env::var("TIANQUAN_PG_PREFLIGHT_URL")
+            .expect("read-only preflight URL must be explicit");
+        let expected_role =
+            std::env::var("TIANQUAN_PG_PREFLIGHT_ROLE").expect("preflight role must be explicit");
+        let expected_schema = std::env::var("TIANQUAN_PG_PREFLIGHT_SCHEMA")
+            .expect("preflight schema must be explicit");
+        let (client, connection) = tokio_postgres::connect(&pg_url, tokio_postgres::NoTls)
+            .await
+            .expect("connect read-only preflight PG");
+        let driver = tokio::spawn(async move { connection.await.expect("PG connection driver") });
+        let row = client
+            .query_one("SELECT current_user, current_schema()", &[])
+            .await
+            .expect("read role and current schema");
+        assert_eq!(row.get::<_, String>(0), expected_role);
+        assert_eq!(row.get::<_, String>(1), expected_schema);
+        drop(client);
+        driver.await.expect("join PG driver");
+    }
+
     // 覆盖:2026-08-04 落盘标准 + 2026-08-07 铁律——raw final_text 忠实落盘(通用平台不做领域判断)
     #[test]
     fn persist_final_text_uses_child_run_address_instead_of_fixed_chapter() {

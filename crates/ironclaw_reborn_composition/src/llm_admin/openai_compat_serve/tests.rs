@@ -1226,6 +1226,9 @@ fn response_usage_reports_total_input_including_cache_and_breaks_out_cached_toke
     // `cache_read_input_tokens` is a subset of `input_tokens` (here 2000 of the
     // 3000 total were cache hits), so it must NOT be added on top of the total.
     let usage = LoopModelUsage {
+        normalization_version: None,
+        normalized_input_tokens: None,
+        cache_details_observed: None,
         input_tokens: 3_000,
         output_tokens: 500,
         cache_read_input_tokens: 2_000,
@@ -1251,6 +1254,9 @@ fn response_usage_adds_cache_creation_on_top_of_input() {
     // part of `input_tokens`, so it is added on top of the total. It is not a
     // cache *read*, so it never populates `input_tokens_details`.
     let usage = LoopModelUsage {
+        normalization_version: None,
+        normalized_input_tokens: None,
+        cache_details_observed: None,
         input_tokens: 1_000,
         output_tokens: 500,
         cache_read_input_tokens: 0,
@@ -1268,6 +1274,9 @@ fn response_cost_prices_input_output_and_discounts_cached_tokens() {
     // discount is 2x (50% off). `input_tokens` is the total (3000), of which
     // 2000 were cache reads, leaving 1000 fresh at the full rate.
     let usage = LoopModelUsage {
+        normalization_version: None,
+        normalized_input_tokens: None,
+        cache_details_observed: None,
         input_tokens: 3_000,
         output_tokens: 500,
         cache_read_input_tokens: 2_000,
@@ -1292,6 +1301,9 @@ fn response_cost_bills_cache_creation_at_full_input_rate() {
     // billed at the full input rate on top of the fresh input; with no
     // cache_read there is no discounted portion.
     let usage = LoopModelUsage {
+        normalization_version: None,
+        normalized_input_tokens: None,
+        cache_details_observed: None,
         input_tokens: 1_000,
         output_tokens: 0,
         cache_read_input_tokens: 0,
@@ -1309,6 +1321,9 @@ fn response_cost_applies_claude_cache_read_discount() {
     // 10x (90% off). `input_tokens` is the total (3000), of which 2000 were
     // cache reads, leaving 1000 fresh.
     let usage = LoopModelUsage {
+        normalization_version: None,
+        normalized_input_tokens: None,
+        cache_details_observed: None,
         input_tokens: 3_000,
         output_tokens: 0,
         cache_read_input_tokens: 2_000,
@@ -1326,6 +1341,9 @@ fn response_cost_falls_back_to_default_rate_for_unknown_model() {
     // Unknown models must not price at zero — the cost table default (~GPT-4o)
     // applies so a new paid model still bills.
     let usage = LoopModelUsage {
+        normalization_version: None,
+        normalized_input_tokens: None,
+        cache_details_observed: None,
         input_tokens: 1_000,
         output_tokens: 0,
         cache_read_input_tokens: 0,
@@ -1336,4 +1354,39 @@ fn response_cost_falls_back_to_default_rate_for_unknown_model() {
     // default input rate is 0.0000025 → 1000 * 0.0000025 = 0.0025
     assert_eq!(cost.input_cost_usd, "0.0025");
     assert_eq!(cost.cached_input_cost_usd, "0");
+}
+
+#[test]
+fn v1_openai_projection_uses_sidecar_once_and_preserves_legacy_price_contract() {
+    let known = LoopModelUsage {
+        normalization_version: Some(1),
+        normalized_input_tokens: Some(109),
+        cache_details_observed: Some(true),
+        input_tokens: 2,
+        output_tokens: 3,
+        cache_read_input_tokens: 7,
+        cache_creation_input_tokens: 100,
+    };
+    let legacy = LoopModelUsage {
+        normalization_version: None,
+        normalized_input_tokens: None,
+        cache_details_observed: None,
+        input_tokens: 9,
+        output_tokens: 3,
+        cache_read_input_tokens: 7,
+        cache_creation_input_tokens: 100,
+    };
+    let displayed = response_usage_from_model_usage(&known, "claude-sonnet-4");
+    assert_eq!(
+        (
+            displayed.input_tokens,
+            displayed.output_tokens,
+            displayed.total_tokens
+        ),
+        (109, 3, 112)
+    );
+    assert_eq!(
+        serde_json::to_value(response_cost_from_model_usage(&known, "claude-sonnet-4")).unwrap(),
+        serde_json::to_value(response_cost_from_model_usage(&legacy, "claude-sonnet-4")).unwrap()
+    );
 }

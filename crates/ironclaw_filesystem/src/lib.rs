@@ -16,6 +16,8 @@
 #![warn(unreachable_pub)]
 
 mod backend;
+mod complete_event_prefix;
+pub use complete_event_prefix::CompleteEventPrefix;
 mod cas;
 mod catalog;
 mod db;

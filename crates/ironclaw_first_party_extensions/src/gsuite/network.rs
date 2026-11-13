@@ -15,6 +15,7 @@ pub fn gsuite_network_policy_for(provider: &ExtensionId) -> Option<NetworkPolicy
 
 pub fn google_api_network_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![
             https("www.googleapis.com"),
             https("gmail.googleapis.com"),

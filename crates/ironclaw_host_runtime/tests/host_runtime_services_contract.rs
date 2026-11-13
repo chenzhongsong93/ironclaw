@@ -4509,6 +4509,7 @@ async fn host_runtime_services_projects_resource_network_secret_obligation_audit
     let secret_handle = SecretHandle::new("obligation-api-token").unwrap();
     let reservation_id = ResourceReservationId::new();
     let policy = NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "NETWORK_POLICY_SENTINEL_3022.example.test".to_string(),

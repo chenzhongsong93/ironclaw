@@ -205,3 +205,53 @@ impl From<FirstPartySkillBundleAsset> for RebornSkillAsset {
 pub(super) fn skill_asset_error(error: SkillBundleAssetReadError) -> RebornRuntimeError {
     RebornRuntimeError::SkillExecution(error.to_string())
 }
+
+// Append in src/runtime/skills.rs, where the existing plan internals are visible.
+// No lower mutable Arc crosses the public facade.
+impl crate::RebornRuntimeSkillBundle {
+    pub async fn prepare_execution(
+        &self,
+        run_context: &LoopRunContext,
+        accepted_text: &str,
+    ) -> Result<RebornSkillExecutionPlan, RebornRuntimeError> {
+        self.execution_adapter()
+            .prepare(run_context, accepted_text)
+            .await
+            .map(RebornSkillExecutionPlan::from_first_party)
+            .map_err(|e| RebornRuntimeError::SkillExecution(e.to_string()))
+    }
+
+    pub async fn read_execution_asset(
+        &self,
+        plan: &RebornSkillExecutionPlan,
+        activation: &RebornSkillActivation,
+        path: impl AsRef<str>,
+    ) -> Result<RebornSkillAsset, RebornRuntimeError> {
+        self.execution_adapter()
+            .read_file_for_activation(
+                plan.run_context(),
+                plan.first_party_plan(),
+                &activation.to_first_party_request(),
+                path,
+            )
+            .await
+            .map(RebornSkillAsset::from)
+            .map_err(|e| RebornRuntimeError::SkillExecution(e.to_string()))
+    }
+
+    pub async fn available_skill_bundles(
+        &self,
+        run_context: &LoopRunContext,
+    ) -> Result<Vec<RebornSkillBundle>, RebornRuntimeError> {
+        self.source()
+            .list_skill_bundles(run_context)
+            .await
+            .map(|descriptors| {
+                descriptors
+                    .iter()
+                    .map(|descriptor| RebornSkillBundle::from(descriptor.id()))
+                    .collect()
+            })
+            .map_err(|e| RebornRuntimeError::SkillExecution(e.to_string()))
+    }
+}

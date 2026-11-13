@@ -111,7 +111,8 @@ impl FilesystemSkillBundleRoot {
 pub struct FilesystemSkillBundleSource<F> {
     filesystem: Arc<ScopedFilesystem<F>>,
     roots: Vec<FilesystemSkillBundleRoot>,
-    validated_manifests: ParkingMutex<HashSet<ScopedPath>>,
+    validated_manifests: ParkingMutex<HashSet<(TenantId, ironclaw_host_api::UserId, ironclaw_host_api::VirtualPath)>>,
+    thread_owner_scope: bool,
     system_root_descriptor_cache: AsyncMutex<HashMap<String, Vec<SkillBundleDescriptor>>>,
     max_skill_md_bytes: usize,
     max_bundle_file_bytes: usize,
@@ -160,11 +161,38 @@ where
             filesystem,
             roots,
             validated_manifests: ParkingMutex::new(HashSet::new()),
+            thread_owner_scope: false,
             system_root_descriptor_cache: AsyncMutex::new(HashMap::new()),
             max_skill_md_bytes: MAX_PROMPT_FILE_SIZE as usize,
             max_bundle_file_bytes: DEFAULT_MAX_BUNDLE_FILE_BYTES,
             max_bundles_per_root: DEFAULT_MAX_BUNDLES_PER_ROOT,
         })
+    }
+
+    /// Explicit Production resource-owner semantics. The authenticated actor
+    /// remains unchanged for profile, audit, and dispatch authorization.
+    pub fn with_thread_owner_scope(mut self) -> Self {
+        self.thread_owner_scope = true;
+        self
+    }
+
+    fn resource_scope(&self, run: &LoopRunContext) -> ResourceScope {
+        let mut scope = resource_scope_for_run(run);
+        if self.thread_owner_scope {
+            if let Some(owner) = run.scope.explicit_owner_user_id() {
+                scope.user_id = owner.clone();
+            }
+        }
+        scope
+    }
+
+    fn manifest_validation_key(
+        &self,
+        scope: &ResourceScope,
+        path: &ScopedPath,
+    ) -> Result<(TenantId, ironclaw_host_api::UserId, ironclaw_host_api::VirtualPath), SkillBundleSourceError> {
+        let resolved = self.filesystem.resolve(scope, path).map_err(map_filesystem_error)?;
+        Ok((scope.tenant_id.clone(), scope.user_id.clone(), resolved))
     }
 
     /// Overrides the maximum allowed `SKILL.md` manifest size in bytes.
@@ -283,7 +311,7 @@ where
                 }
                 Err(error) => return Err(error),
             };
-            self.validated_manifests.lock().insert(skill_md_path);
+            self.validated_manifests.lock().insert(self.manifest_validation_key(scope, &skill_md_path)?);
             let trust = self.bundle_trust(scope, root, &bundle_id).await?;
 
             descriptors.push(
@@ -378,7 +406,7 @@ where
         &self,
         run_context: &LoopRunContext,
     ) -> Result<Vec<SkillBundleDescriptor>, SkillBundleSourceError> {
-        let scope = resource_scope_for_run(run_context);
+        let scope = self.resource_scope(run_context);
         let mut descriptors = Vec::new();
         for root in &self.roots {
             if !root_visible_for_run(root, run_context) {
@@ -403,10 +431,11 @@ where
             .filter(|root| root_visible_for_run(root, run_context))
             .find(|root| root.source_kind() == bundle_id.source_kind())
             .ok_or(SkillBundleSourceError::BundleNotFound)?;
-        let scope = resource_scope_for_run(run_context);
+        let scope = self.resource_scope(run_context);
         let skill_md_path = bundle_scoped_path(root.root(), bundle_id, &SkillFilePath::skill_md())?;
+        let validation_key = self.manifest_validation_key(&scope, &skill_md_path)?;
         if path.as_str() != SkillFilePath::skill_md().as_str()
-            && !self.validated_manifests.lock().contains(&skill_md_path)
+            && !self.validated_manifests.lock().contains(&validation_key)
         {
             // Re-validates manifests before uncached reads for security defense-in-depth.
             self.validate_bundle_manifest(&scope, &skill_md_path, bundle_id)
@@ -416,9 +445,7 @@ where
                     other => other,
                 })?;
             let mut validated_manifests = self.validated_manifests.lock();
-            if !validated_manifests.contains(&skill_md_path) {
-                validated_manifests.insert(skill_md_path.clone());
-            }
+            validated_manifests.insert(validation_key);
         }
         let scoped_path = bundle_scoped_path(root.root(), bundle_id, path)?;
         self.read_bounded(&scope, &scoped_path, self.max_bundle_file_bytes)

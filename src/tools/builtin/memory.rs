@@ -1599,6 +1599,9 @@ mod tests {
             ) -> Result<CompletionResponse, LlmError> {
                 self.call_count.fetch_add(1, Ordering::SeqCst);
                 Ok(CompletionResponse {
+                    normalization_version: None,
+                    normalized_input_tokens: None,
+                    cache_details_observed: None,
                     content: self.response.clone(),
                     input_tokens: 10,
                     output_tokens: 20,

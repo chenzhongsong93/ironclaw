@@ -200,6 +200,21 @@ pub trait AwaitDependentRunEvidenceStore: Send + Sync {
         run_id: TurnRunId,
         gate_ref: &LoopGateRef,
     ) -> Result<bool, TurnError>;
+
+    async fn recover_host_product_edge(
+        &self,
+        _parent: &ironclaw_turns::run_profile::LoopRunContext,
+    ) -> Result<Option<HostProductAwaitEdge>, TurnError> {
+        Ok(None)
+    }
+}
+
+pub struct HostProductAwaitEdge {
+    pub binding: ironclaw_turns::run_profile::HostProductAwait,
+    pub child_scope: TurnScope,
+    pub child_run_id: TurnRunId,
+    pub source_binding_ref: ironclaw_turns::SourceBindingRef,
+    pub reply_target_binding_ref: ironclaw_turns::ReplyTargetBindingRef,
 }
 
 impl<S> ThreadCheckpointLoopExitEvidencePort<S>

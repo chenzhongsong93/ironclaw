@@ -257,6 +257,16 @@ where
         parent_run_id: TurnRunId,
         gate_ref: &ironclaw_turns::GateRef,
     ) -> Result<Vec<(TurnRunId, AwaitEdge)>, AwaitEdgeStoreError> {
+        Ok(self.list_parent_edges(scope, parent_run_id, None).await?
+            .into_iter().filter(|(_, edge)| edge.gate_ref == *gate_ref).collect())
+    }
+
+    async fn list_parent_edges(
+        &self,
+        scope: &TurnScope,
+        parent_run_id: TurnRunId,
+        limit: Option<usize>,
+    ) -> Result<Vec<(TurnRunId, AwaitEdge)>, AwaitEdgeStoreError> {
         let dir = edge_dir_for_parent(
             scope.agent_id.as_ref().map(|id| id.as_str()),
             scope.project_id.as_ref().map(|id| id.as_str()),
@@ -268,6 +278,11 @@ where
             Err(FilesystemError::NotFound { .. }) => return Ok(Vec::new()),
             Err(error) => return Err(backend_error(error)),
         };
+        if limit.is_some_and(|limit| entries.len() > limit) {
+            return Err(AwaitEdgeStoreError::Backend {
+                reason: "host product await-edge read exceeds budget".into(),
+            });
+        }
         let mut group = Vec::new();
         for entry in entries {
             let Some(uuid_str) = entry.name.strip_suffix(".json") else {
@@ -276,9 +291,7 @@ where
             let Ok(child_run_id) = TurnRunId::parse(uuid_str) else {
                 continue;
             };
-            if let Some((edge, _)) = self.get_edge(scope, parent_run_id, child_run_id).await?
-                && edge.gate_ref == *gate_ref
-            {
+            if let Some((edge, _)) = self.get_edge(scope, parent_run_id, child_run_id).await? {
                 group.push((child_run_id, edge));
             }
         }
@@ -791,6 +804,49 @@ where
         Ok(group
             .iter()
             .any(|(_, edge)| edge.mode == ironclaw_loop_host::SpawnSubagentMode::Blocking))
+    }
+
+    async fn recover_host_product_edge(
+        &self,
+        parent: &ironclaw_turns::run_profile::LoopRunContext,
+    ) -> Result<Option<crate::loop_exit_applier::HostProductAwaitEdge>, ironclaw_turns::TurnError> {
+        use ironclaw_turns::{LoopGateRef, TurnError, run_profile::HostProductAwait};
+        let edges = self.list_parent_edges(&parent.scope, parent.run_id, Some(16)).await
+            .map_err(|_| TurnError::Unavailable { reason: "host product await edge unavailable".into() })?;
+        let mut matching = edges.into_iter().filter(|(_, edge)| {
+            matches!(edge.state, AwaitEdgeState::Open | AwaitEdgeState::Settled)
+                && edge.mode == ironclaw_loop_host::SpawnSubagentMode::Blocking
+        });
+        let Some((child_run_id, edge)) = matching.next() else {
+            return Ok(None);
+        };
+        let original = &edge.parent_run_context;
+        if matching.next().is_some()
+            || original.scope != parent.scope || original.run_id != parent.run_id
+            || original.turn_id != parent.turn_id || original.actor != parent.actor
+            || original.resolved_run_profile != parent.resolved_run_profile
+            || edge.parent_thread_id != parent.thread_id || edge.tree_root_run_id != parent.run_id
+            || edge.subagent_kind.as_str() != "auditor"
+            || edge.spawn_capability_id.as_str() != "builtin.spawn_subagent"
+            || edge.child_scope.tenant_id != parent.scope.tenant_id
+            || edge.child_scope.agent_id != parent.scope.agent_id
+            || edge.child_scope.project_id != parent.scope.project_id
+            || edge.child_scope.explicit_owner_user_id() != parent.scope.explicit_owner_user_id()
+            || edge.child_scope.thread_id != edge.child_thread_id
+            || edge.child_thread_id.as_str() != format!("subagent-{}", child_run_id.as_uuid().simple())
+            || edge.gate_ref.as_str() != format!("gate:subagent-{child_run_id}")
+        {
+            return Err(TurnError::Conflict { reason: "host product await edge binding mismatch".into() });
+        }
+        let gate_ref = LoopGateRef::new(edge.gate_ref.as_str())
+            .map_err(|_| TurnError::Conflict { reason: "host product await gate invalid".into() })?;
+        Ok(Some(crate::loop_exit_applier::HostProductAwaitEdge {
+            binding: HostProductAwait { gate_ref, result_ref: edge.result_ref },
+            child_scope: edge.child_scope,
+            child_run_id,
+            source_binding_ref: edge.source_binding_ref,
+            reply_target_binding_ref: edge.reply_target_binding_ref,
+        }))
     }
 }
 

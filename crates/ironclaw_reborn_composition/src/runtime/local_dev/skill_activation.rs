@@ -8,11 +8,11 @@ use ironclaw_turns::run_profile::{
 };
 
 use crate::runtime::{
-    ComposedSelectableSkillContextSource,
     local_dev::synthetic_capability::{
         SyntheticCapability, SyntheticCapabilityDescriptor, SyntheticCapabilityHandler,
         SyntheticCapabilityInvocation,
     },
+    shared_skill_binding::RuntimeSkillSelector,
 };
 
 pub(crate) const SKILL_ACTIVATE_CAPABILITY_ID: &str = "builtin.skill_activate";
@@ -22,7 +22,7 @@ const SKILL_ACTIVATE_DESCRIPTION: &str =
 const MAX_SKILL_ACTIVATE_NAMES: usize = 16;
 
 pub(super) fn skill_activation_capability(
-    skill_activation_source: Arc<ComposedSelectableSkillContextSource>,
+    skill_activation_source: RuntimeSkillSelector,
 ) -> Result<SyntheticCapability, AgentLoopHostError> {
     Ok(SyntheticCapability::new(
         SyntheticCapabilityDescriptor::new(
@@ -39,7 +39,7 @@ pub(super) fn skill_activation_capability(
 }
 
 struct SkillActivationHandler {
-    skill_activation_source: Arc<ComposedSelectableSkillContextSource>,
+    skill_activation_source: RuntimeSkillSelector,
 }
 
 #[async_trait]

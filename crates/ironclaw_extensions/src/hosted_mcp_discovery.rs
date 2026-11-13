@@ -49,11 +49,97 @@ pub fn package_with_discovered_hosted_mcp_tools(
         .map(|tool| discovered_capability_manifest(package, &template, tool))
         .collect::<Result<Vec<_>, _>>()?;
 
+    finish_discovered_package(package, manifest, tools, DiscoverySafetyMetadata::Generic)
+
+}
+
+/// Pure metadata predicate for a host-bundled canonical loopback declaration.
+/// The composition Root caller must separately verify its live operator binding;
+/// this function performs no network I/O and grants no execution authority.
+pub fn is_host_bundled_loopback_http_mcp_package(package: &ExtensionPackage, expected_url: &str) -> bool {
+    if package.manifest.source != ManifestSource::HostBundled { return false; }
+    let ExtensionRuntime::Mcp { transport, command: None, args, url: Some(actual) } = &package.manifest.runtime else { return false; };
+    transport == "http" && args.is_empty() && actual == expected_url && valid_loopback_http_mcp_url(actual)
+}
+
+fn valid_loopback_http_mcp_url(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else { return false; };
+    let Some(port) = url.port() else { return false; };
+    url.scheme() == "http" && url.host_str() == Some("127.0.0.1") && port > 0
+        && url.username().is_empty() && url.password().is_none()
+        && url.query().is_none() && url.fragment().is_none() && url.path() != "/"
+        && url.as_str() == value
+        && value.strip_prefix("http://").and_then(|v| v.split('/').next()) == Some(format!("127.0.0.1:{port}").as_str())
+}
+
+/// Explicit pure-data conversion used only by composition's verified Root
+/// loopback discovery path. Known capability safety metadata is preserved;
+/// unrecognized tools remain Ask. Generic hosted HTTPS behavior is unchanged.
+pub fn package_with_discovered_loopback_http_mcp_tools(
+    package: &ExtensionPackage,
+    tools: &[HostedMcpDiscoveredTool],
+    expected_url: &str,
+) -> Result<ExtensionPackage, ExtensionError> {
+    if !is_host_bundled_loopback_http_mcp_package(package, expected_url) {
+        return Err(invalid_hosted_mcp_manifest("loopback MCP package declaration mismatch".into()));
+    }
+    // A nonempty subset must never silently retire declared functionality.
+    // Do not synthesize missing tools: the actual catalog must cover each id.
+    let supplied: std::collections::BTreeSet<String> = tools.iter().map(|tool| format!("{}.{}", package.id.as_str(), tool.name)).collect();
+    if package.manifest.capabilities.iter().any(|known| !supplied.contains(known.id.as_str())) {
+        return Err(invalid_hosted_mcp_manifest("loopback MCP catalog is missing a declared capability".into()));
+    }
+    let url = url::Url::parse(expected_url).map_err(|_| invalid_hosted_mcp_manifest("loopback MCP URL invalid".into()))?;
+    let target = ironclaw_host_api::NetworkTargetPattern {
+        scheme: Some(ironclaw_host_api::NetworkScheme::Http),
+        host_pattern: "127.0.0.1".into(), port: url.port(),
+    };
+    let mut manifest = package.manifest.clone();
+    let mut names = std::collections::BTreeSet::new();
+    manifest.capabilities = tools.iter().map(|tool| {
+        if !names.insert(tool.name.as_str()) {
+            return Err(invalid_hosted_mcp_manifest("duplicate discovered loopback MCP tool".into()));
+        }
+        if !tool.input_schema.is_object() {
+            return Err(invalid_hosted_mcp_manifest("discovered MCP parameters schema must be an object".into()));
+        }
+        let id = format!("{}.{}", package.id.as_str(), tool.name);
+        if let Some(known) = package.manifest.capabilities.iter().find(|cap| cap.id.as_str() == id) {
+            // Includes permission/effects/host ports/credentials/network targets,
+            // visibility/resource profile and original schema/prompt coordinates.
+            // Inline parameters below are still taken from the actual catalog.
+            return Ok(known.clone());
+        }
+        // Only unknown tools need a provider-wide template. Inconsistent
+        // templates fail closed instead of guessing credential/host authority.
+        let template = hosted_mcp_capability_template(package)?;
+        let mut unknown = discovered_capability_manifest(package, &template, tool)?;
+        unknown.network_targets = vec![target.clone()];
+        if template.provider_declares_external_write && !unknown.effects.contains(&EffectKind::ExternalWrite) {
+            unknown.effects.push(EffectKind::ExternalWrite);
+        }
+        Ok(unknown)
+    }).collect::<Result<Vec<_>, ExtensionError>>()?;
+    finish_discovered_package(package, manifest, tools, DiscoverySafetyMetadata::PreserveKnown)
+}
+
+#[derive(Clone, Copy)]
+enum DiscoverySafetyMetadata { Generic, PreserveKnown }
+
+fn finish_discovered_package(package: &ExtensionPackage, manifest: crate::ExtensionManifest, tools: &[HostedMcpDiscoveredTool], safety: DiscoverySafetyMetadata) -> Result<ExtensionPackage, ExtensionError> {
     let capabilities = manifest
         .capabilities
         .iter()
         .zip(tools)
-        .map(|(capability, tool)| CapabilityDescriptor {
+        .map(|(capability, tool)| {
+            if matches!(safety, DiscoverySafetyMetadata::PreserveKnown) {
+                if let Some(original) = package.capabilities.iter().find(|known| known.id == capability.id) {
+                    let mut observed = original.clone();
+                    observed.parameters_schema = tool.input_schema.clone();
+                    return observed;
+                }
+            }
+            CapabilityDescriptor {
             id: capability.id.clone(),
             provider: package.id.clone(),
             runtime: RuntimeKind::Mcp,
@@ -65,6 +151,7 @@ pub fn package_with_discovered_hosted_mcp_tools(
             runtime_credentials: capability.runtime_credentials.clone(),
             network_targets: capability.network_targets.clone(),
             resource_profile: capability.resource_profile.clone(),
+            }
         })
         .collect();
 
@@ -346,6 +433,88 @@ runtime_credentials = [
                 .contains("inconsistent capability templates"),
             "unexpected error: {error}"
         );
+    }
+
+    fn loopback_package() -> ExtensionPackage {
+        let mut manifest = notion_package().manifest;
+        manifest.runtime = ExtensionRuntime::Mcp { transport: "http".into(), command: None, args: Vec::new(), url: Some("http://127.0.0.1:3002/mcp/internal".into()) };
+        manifest.capabilities[0].default_permission = PermissionMode::Allow;
+        manifest.capabilities[0].network_targets = vec![ironclaw_host_api::NetworkTargetPattern { scheme: Some(ironclaw_host_api::NetworkScheme::Http), host_pattern: "127.0.0.1".into(), port: Some(3002) }];
+        manifest.capabilities[0].required_host_ports = vec![ironclaw_host_api::HostPortId::new("host.runtime.http_egress").unwrap()];
+        ExtensionPackage::from_manifest(manifest, VirtualPath::new("/system/extensions/notion").unwrap()).unwrap()
+    }
+
+    fn tool(name: &str) -> HostedMcpDiscoveredTool {
+        HostedMcpDiscoveredTool { name: name.into(), description: "Observed schema".into(), input_schema: serde_json::json!({"type":"object","properties":{"observed":{"type":"string"}}}), annotations: HostedMcpDiscoveredToolAnnotations { read_only_hint: true, ..Default::default() } }
+    }
+
+    #[test]
+    fn loopback_projection_keeps_known_security_metadata_and_actual_parameters() {
+        let mut package = loopback_package();
+        let mut write = package.manifest.capabilities[0].clone();
+        write.id = CapabilityId::new("notion.write").unwrap();write.default_permission = PermissionMode::Ask;write.effects.push(EffectKind::ExternalWrite);write.runtime_credentials.clear();
+        package.manifest.capabilities.push(write);
+        package = ExtensionPackage::from_manifest(package.manifest, package.root).unwrap();
+        let mut other_schema=tool("write");other_schema.input_schema=serde_json::json!({"type":"object","properties":{"other":{"type":"integer"}}});
+        let tools = vec![tool("notion-fetch"),other_schema];
+        assert_eq!(package.manifest.capabilities[0].input_schema_ref,package.manifest.capabilities[1].input_schema_ref);
+        let discovered = package_with_discovered_loopback_http_mcp_tools(&package,&tools,"http://127.0.0.1:3002/mcp/internal").unwrap();
+        assert_eq!(discovered.manifest.capabilities,package.manifest.capabilities);
+        for (cap,original) in discovered.capabilities.iter().zip(&package.capabilities) {
+            let mut normalized = cap.clone();normalized.parameters_schema=original.parameters_schema.clone();
+            assert_eq!(&normalized,original); // All present and future safety fields, not a hand-picked subset.
+        }
+        assert_eq!(discovered.capabilities[0].parameters_schema,tools[0].input_schema);
+        assert_eq!(discovered.capabilities[1].parameters_schema,tools[1].input_schema);
+        assert_ne!(discovered.capabilities[0].parameters_schema,discovered.capabilities[1].parameters_schema);
+        assert_eq!(discovered.descriptor_schema_mode,crate::CapabilityDescriptorSchemaMode::InlineDynamic);
+        let mut registry=crate::ExtensionRegistry::new();registry.insert(discovered.clone()).unwrap();
+        assert_eq!(registry.get_capability(&CapabilityId::new("notion.notion-fetch").unwrap()).unwrap().parameters_schema,tools[0].input_schema);
+        assert_eq!(registry.get_capability(&CapabilityId::new("notion.write").unwrap()).unwrap().parameters_schema,tools[1].input_schema);
+        assert!(discovered.capabilities[1].effects.contains(&EffectKind::ExternalWrite));
+        assert_eq!(discovered.manifest.capabilities[0].required_host_ports,package.manifest.capabilities[0].required_host_ports);
+    }
+
+    #[test]
+    fn loopback_projection_unknown_ask_and_generic_https_stays_strict() {
+        let package = loopback_package();let tools = vec![tool("notion-fetch"),tool("new-tool")];
+        assert!(!is_hosted_http_mcp_package(&package));
+        assert!(package_with_discovered_hosted_mcp_tools(&package,&tools).is_err());
+        let discovered = package_with_discovered_loopback_http_mcp_tools(&package,&tools,"http://127.0.0.1:3002/mcp/internal").unwrap();
+        let cap = discovered.capabilities.iter().find(|cap|cap.id.as_str()=="notion.new-tool").unwrap();assert_eq!(cap.default_permission,PermissionMode::Ask);
+        assert_eq!(cap.network_targets,package.capabilities[0].network_targets);
+        assert_eq!(discovered.manifest.capabilities[0].required_host_ports,package.manifest.capabilities[0].required_host_ports);
+        assert!(is_hosted_http_mcp_package(&notion_package()));
+        assert!(package_with_discovered_hosted_mcp_tools(&notion_package(),&tools).is_ok());
+    }
+
+    #[test]
+    fn loopback_projection_rejects_foreign_source_url_and_bad_catalog() {
+        let package=loopback_package();let endpoint="http://127.0.0.1:3002/mcp/internal";
+        for url in ["http://127.1:3002/mcp/internal","http://localhost:3002/mcp/internal","http://127.0.0.1:3003/mcp/internal","http://127.0.0.1:3002/mcp/internal?x=1"] {
+            assert!(!is_host_bundled_loopback_http_mcp_package(&package,url));
+            let mut invalid=package.clone();
+            invalid.manifest.runtime=ExtensionRuntime::Mcp {transport:"http".into(),command:None,args:Vec::new(),url:Some(url.into())};
+            if url != "http://127.0.0.1:3003/mcp/internal" {assert!(!is_host_bundled_loopback_http_mcp_package(&invalid,url));}
+        }
+        let mut foreign=package.clone();foreign.manifest.source=ManifestSource::InstalledLocal;
+        assert!(package_with_discovered_loopback_http_mcp_tools(&foreign,&[tool("new-tool")],endpoint).is_err());
+        let mut bad=tool("new-tool");bad.input_schema=serde_json::json!([]);
+        assert!(package_with_discovered_loopback_http_mcp_tools(&package,&[tool("notion-fetch"),bad],endpoint).is_err());
+        assert!(package_with_discovered_loopback_http_mcp_tools(&package,&[tool("notion-fetch"),tool("new-tool"),tool("new-tool")],endpoint).is_err());
+    }
+
+    #[test]
+    fn loopback_projection_rejects_nonempty_catalog_missing_a_declared_tool() {
+        let mut package=loopback_package();let mut second=package.manifest.capabilities[0].clone();
+        second.id=CapabilityId::new("notion.second").unwrap();package.manifest.capabilities.push(second);
+        package=ExtensionPackage::from_manifest(package.manifest,package.root).unwrap();
+        let endpoint="http://127.0.0.1:3002/mcp/internal";
+        assert!(package_with_discovered_loopback_http_mcp_tools(&package,&[tool("notion-fetch")],endpoint).is_err());
+        assert!(package_with_discovered_loopback_http_mcp_tools(&package,&[tool("new-tool")],endpoint).is_err());
+        let complete=package_with_discovered_loopback_http_mcp_tools(&package,&[tool("notion-fetch"),tool("second"),tool("new-tool")],endpoint).unwrap();
+        assert_eq!(complete.manifest.capabilities.len(),3);
+        assert_eq!(complete.capabilities.iter().find(|cap|cap.id.as_str()=="notion.new-tool").unwrap().default_permission,PermissionMode::Ask);
     }
 
     fn notion_package() -> ExtensionPackage {

@@ -975,7 +975,7 @@ fn inject_model_override(
 impl<M> LlmProvider for RigAdapter<M>
 where
     M: CompletionModel + Send + Sync + 'static,
-    M::Response: Send + Sync + Serialize + DeserializeOwned,
+    M::Response: Send + Sync + Serialize + DeserializeOwned + 'static,
 {
     fn model_name(&self) -> &str {
         &self.model_name
@@ -1045,9 +1045,21 @@ where
         let (text, _tool_calls, finish, _reasoning, _reasoning_details) =
             extract_response(&response.choice, &response.usage);
 
+        let normalized = crate::usage_normalization::from_rig_response(&response.raw_response)
+            .ok()
+            .filter(|value| {
+                let (_, output, read, create, _) = value.parts();
+                output == saturate_u32(response.usage.output_tokens)
+                    && read == saturate_u32(response.usage.cached_input_tokens)
+                    && create == extract_cache_creation(&response.raw_response)
+            });
+        let normalization_version = normalized.map(|_| 1);
         let resp = CompletionResponse {
             content: text.unwrap_or_default(),
             input_tokens: saturate_u32(response.usage.input_tokens),
+            normalization_version,
+            normalized_input_tokens: normalized.map(|value| value.parts().0),
+            cache_details_observed: normalized.map(|value| value.cache_details_observed()),
             output_tokens: saturate_u32(response.usage.output_tokens),
             finish_reason: finish,
             reasoning: None,
@@ -1140,10 +1152,22 @@ where
             crate::tool_schema::PlaceholderStrippingMode::NullOnly,
         );
 
+        let normalized = crate::usage_normalization::from_rig_response(&response.raw_response)
+            .ok()
+            .filter(|value| {
+                let (_, output, read, create, _) = value.parts();
+                output == saturate_u32(response.usage.output_tokens)
+                    && read == saturate_u32(response.usage.cached_input_tokens)
+                    && create == extract_cache_creation(&response.raw_response)
+            });
+        let normalization_version = normalized.map(|_| 1);
         let resp = ToolCompletionResponse {
             content: text,
             tool_calls,
             input_tokens: saturate_u32(response.usage.input_tokens),
+            normalization_version,
+            normalized_input_tokens: normalized.map(|value| value.parts().0),
+            cache_details_observed: normalized.map(|value| value.cache_details_observed()),
             output_tokens: saturate_u32(response.usage.output_tokens),
             finish_reason: finish,
             cache_read_input_tokens: saturate_u32(response.usage.cached_input_tokens),

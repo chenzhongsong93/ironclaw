@@ -844,6 +844,7 @@ fn sample_scope() -> ResourceScope {
 
 fn sample_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "wasm-api.example.test".to_string(),
@@ -856,6 +857,7 @@ fn sample_policy() -> NetworkPolicy {
 
 fn multi_target_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![
             NetworkTargetPattern {
                 scheme: Some(NetworkScheme::Https),

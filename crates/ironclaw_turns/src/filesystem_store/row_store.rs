@@ -34,6 +34,7 @@ mod delta;
 mod io;
 mod journal;
 mod traits;
+mod usage_prefix;
 
 use delta::{
     RowPersistError, RowSnapshotState, RowStoreMeta, SnapshotDelta, active_lock_record_key,

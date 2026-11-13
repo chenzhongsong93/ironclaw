@@ -156,6 +156,7 @@ fn capability_result_text(harness: &RebornBinaryE2EHarness) -> String {
 
 fn allow_api_example_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "api.example.test".to_string(),
@@ -168,6 +169,7 @@ fn allow_api_example_policy() -> NetworkPolicy {
 
 fn deny_all_network_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: Vec::new(),
         deny_private_ip_ranges: true,
         max_egress_bytes: Some(10_000),

@@ -84,6 +84,9 @@ impl LlmProvider for FlakeyProvider {
             });
         }
         Ok(CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: self.success_response.clone(),
             input_tokens: 10,
             output_tokens: 5,
@@ -113,6 +116,9 @@ impl LlmProvider for FlakeyProvider {
             });
         }
         Ok(ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: Some(self.success_response.clone()),
             tool_calls: vec![],
             input_tokens: 10,
@@ -195,6 +201,9 @@ impl LlmProvider for GarbageProvider {
     async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
         Ok(CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: "\x00\x01\x02\x7f garbage \u{FFFD} response".to_string(),
             input_tokens: 0,
             output_tokens: 0,
@@ -211,6 +220,9 @@ impl LlmProvider for GarbageProvider {
     ) -> Result<ToolCompletionResponse, LlmError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
         Ok(ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: Some(String::new()), // empty content
             tool_calls: vec![],
             input_tokens: 0,
@@ -258,6 +270,9 @@ impl LlmProvider for ReliableProvider {
     async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
         Ok(CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: self.response.clone(),
             input_tokens: 10,
             output_tokens: 5,
@@ -274,6 +289,9 @@ impl LlmProvider for ReliableProvider {
     ) -> Result<ToolCompletionResponse, LlmError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
         Ok(ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: Some(self.response.clone()),
             tool_calls: vec![],
             input_tokens: 10,

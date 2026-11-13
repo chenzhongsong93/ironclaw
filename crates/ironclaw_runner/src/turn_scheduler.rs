@@ -220,6 +220,7 @@ struct SchedulerLoopWiring {
     runner_id: TurnRunnerId,
     await_edge_recovery: Option<Arc<dyn AwaitEdgeWriter>>,
     await_edge_recovery_interval: Duration,
+    startup_execution: Arc<crate::startup_execution::StartupExecutionLatch>,
 }
 
 impl TurnRunScheduler {
@@ -263,11 +264,17 @@ impl TurnRunScheduler {
         notifier: Arc<SchedulerTurnRunWakeNotifier>,
         channel: TurnRunWakeChannel,
     ) -> TurnRunSchedulerHandle {
+        self.start_with_channel_and_startup_execution(notifier,channel,crate::startup_execution::StartupExecutionLatch::open())
+    }
+    pub fn start_with_channel_and_startup_execution(
+        self,notifier:Arc<SchedulerTurnRunWakeNotifier>,channel:TurnRunWakeChannel,
+        startup_execution:Arc<crate::startup_execution::StartupExecutionLatch>,
+    )->TurnRunSchedulerHandle {
         let TurnRunWakeChannel {
             command_tx,
             command_rx,
         } = channel;
-        let shutdown_token = CancellationToken::new();
+        let shutdown_token = startup_execution.stop_token();
         let supervisor = tokio::spawn(run_scheduler_loop(
             command_rx,
             command_tx.clone(),
@@ -278,6 +285,7 @@ impl TurnRunScheduler {
                 runner_id: self.runner_id,
                 await_edge_recovery: self.await_edge_recovery,
                 await_edge_recovery_interval: self.await_edge_recovery_interval,
+                startup_execution,
             },
             shutdown_token.clone(),
         ));
@@ -372,6 +380,9 @@ impl TurnRunSchedulerHandle {
         Arc::clone(&self.notifier)
     }
 
+    /// Read-only shutdown signal observation; no task handle or cancellation capability escapes.
+    pub fn cancellation_requested(&self)->bool {self.shutdown_token.is_cancelled()}
+
     pub fn is_stopped(&self) -> bool {
         self.supervisor.as_ref().is_none_or(|s| s.is_finished())
     }
@@ -429,6 +440,7 @@ struct RelinquishIdentity {
 }
 
 struct SchedulerDrainContext {
+    startup_execution:Arc<crate::startup_execution::StartupExecutionLatch>,
     transitions: Arc<dyn TurnRunTransitionPort>,
     executor: Arc<dyn TurnRunExecutor>,
     semaphore: Arc<Semaphore>,
@@ -479,6 +491,7 @@ async fn run_scheduler_loop(
         runner_id,
         await_edge_recovery,
         await_edge_recovery_interval,
+        startup_execution,
     } = wiring;
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent_runs()));
     let mut executor_tasks: JoinSet<TurnRunId> = JoinSet::new();
@@ -495,6 +508,7 @@ async fn run_scheduler_loop(
     await_edge_recovery_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut await_edge_recovery_task: Option<JoinHandle<()>> = None;
     let context = SchedulerDrainContext {
+        startup_execution:startup_execution.clone(),
         transitions,
         executor,
         semaphore,
@@ -504,10 +518,16 @@ async fn run_scheduler_loop(
     };
     let mut claim_retry_pending = false;
 
+    // Before constructing recovery or receiving queued wakes: no durable state is consumed.
+    if !startup_execution.wait(&shutdown_token).await || shutdown_token.is_cancelled() {
+        if let Some(recovery)=await_edge_recovery.as_ref(){recovery.shutdown_await_edge_recovery().await;}
+        shutdown_scheduler(&context,&mut executor_tasks,active_runs).await;return;
+    }
     if let Some(recovery) = await_edge_recovery.as_ref() {
+        if shutdown_token.is_cancelled()||!startup_execution.allows_execution(){shutdown_scheduler(&context,&mut executor_tasks,active_runs).await;return;}
         let boot_recovery = recovery.recover_all_await_edges();
         tokio::pin!(boot_recovery);
-        tokio::select! {
+        tokio::select! { biased;
             _ = shutdown_token.cancelled() => {
                 if let Some(recovery) = await_edge_recovery.as_ref() {
                     recovery.shutdown_await_edge_recovery().await;
@@ -529,7 +549,8 @@ async fn run_scheduler_loop(
     }
 
     loop {
-        tokio::select! {
+        if !startup_execution.allows_execution(){shutdown_token.cancel();}
+        tokio::select! { biased;
             // CancellationToken arm: bypasses the command queue entirely so
             // shutdown is never blocked by back-pressure or a parked await.
             _ = shutdown_token.cancelled() => {
@@ -599,6 +620,7 @@ async fn run_scheduler_loop(
                                 context.config.claim_error_backoff(),
                             );
                         }
+                        if !startup_execution.allows_execution(){continue;}
                         start_await_edge_recovery_if_idle(
                             await_edge_recovery.as_ref(),
                             &mut await_edge_recovery_task,
@@ -650,6 +672,7 @@ async fn run_scheduler_loop(
                 }
             }
             _ = recovery_tick.tick() => {
+                if !startup_execution.allows_execution(){continue;}
                 // ISSUE-IRONCLAW-009: 活动 executor 持有中的 run 不参与 lease 回收——
                 // executor 活着即 run 活着,心跳饿死不该让收割割掉整段工作。
                 let active_run_ids: Vec<ironclaw_turns::TurnRunId> =
@@ -657,6 +680,7 @@ async fn run_scheduler_loop(
                 recover_expired_leases(Arc::clone(&context.transitions), active_run_ids).await;
             }
             _ = await_edge_recovery_tick.tick(), if await_edge_recovery.is_some() => {
+                if !startup_execution.allows_execution(){continue;}
                 start_await_edge_recovery_if_idle(
                     await_edge_recovery.as_ref(),
                     &mut await_edge_recovery_task,
@@ -722,7 +746,7 @@ async fn drain_queued_runs(
         // already in progress always completes and is tracked in active_runs
         // before we exit.  This prevents a "claimed in store but not tracked"
         // leak where the shutdown drain would never relinquish the run.
-        if shutdown_token.is_cancelled() {
+        if shutdown_token.is_cancelled()||!context.startup_execution.allows_execution() {
             return false;
         }
 
@@ -758,6 +782,8 @@ async fn drain_queued_runs(
                             lease_token: claimed.lease_token,
                         },
                     );
+                    // Claimed work remains tracked for original graceful relinquish; never mark it Failed.
+                    if !context.startup_execution.allows_execution(){continue;}
                     let task_config = ExecutorTaskConfig {
                         runner_heartbeat_interval: context.config.runner_heartbeat_interval(),
                         max_consecutive_heartbeat_failures: context
@@ -772,9 +798,7 @@ async fn drain_queued_runs(
                     };
                     spawn_executor_task(
                         claimed,
-                        Arc::clone(&context.transitions),
-                        Arc::clone(&context.executor),
-                        context.command_tx.clone(),
+                        context,
                         permit,
                         task_config,
                         executor_tasks,
@@ -811,13 +835,15 @@ struct ExecutorTaskConfig {
 
 fn spawn_executor_task(
     claimed: ClaimedTurnRun,
-    transitions: Arc<dyn TurnRunTransitionPort>,
-    executor: Arc<dyn TurnRunExecutor>,
-    command_tx: mpsc::Sender<SchedulerCommand>,
+    context: &SchedulerDrainContext,
     permit: tokio::sync::OwnedSemaphorePermit,
     task_config: ExecutorTaskConfig,
     executor_tasks: &mut JoinSet<TurnRunId>,
 ) {
+    let transitions = Arc::clone(&context.transitions);
+    let executor = Arc::clone(&context.executor);
+    let command_tx = context.command_tx.clone();
+    let startup_execution = Arc::clone(&context.startup_execution);
     // Tag every tracing event emitted while this run executes with its
     // `thread_id` + `run_id` so the operator Logs panel's scoped (thread/run)
     // view is populated. `OperatorLogLayer` reads these correlation fields from
@@ -854,6 +880,12 @@ fn spawn_executor_task(
             // and prematurely terminate the executor task before the driver has a
             // chance to observe cancellation and write its reply to thread history.
             heartbeat_tick.tick().await;
+            if !startup_execution.allows_execution() {
+                if let Err(error)=transitions.relinquish_run(RelinquishRunRequest {run_id:recovery_run_id,runner_id:recovery_runner_id,lease_token:recovery_lease_token}).await {
+                    debug!(run_id=%recovery_run_id,%error,"startup deadline relinquish failed; original lease recovery remains responsible");
+                }
+                return recovery_run_id;
+            }
             let executor_result =
                 AssertUnwindSafe(executor.execute_claimed_run(claimed, Arc::clone(&transitions)))
                     .catch_unwind();

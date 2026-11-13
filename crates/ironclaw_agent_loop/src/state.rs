@@ -285,9 +285,10 @@ impl LoopExecutionState {
         usage: Option<ironclaw_turns::run_profile::LoopModelUsage>,
     ) {
         if let Some(usage) = usage {
-            self.cumulative_model_usage
-                .get_or_insert_with(Default::default)
-                .add_assign(&usage);
+            match self.cumulative_model_usage.as_mut() {
+                Some(original) => original.add_assign(&usage),
+                None => self.cumulative_model_usage = Some(usage),
+            }
         }
     }
 
@@ -843,6 +844,9 @@ mod tests {
             .push(ironclaw_turns::LoopResultRef::new("result:source-run").unwrap());
         state.iteration = 4;
         state.cumulative_model_usage = Some(ironclaw_turns::run_profile::LoopModelUsage {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             input_tokens: 100,
             output_tokens: 50,
             cache_read_input_tokens: 0,
@@ -921,6 +925,9 @@ mod tests {
         // A same-run gate resume must preserve the run's accumulated token
         // total; the full-equality assertion below locks that in.
         state.cumulative_model_usage = Some(ironclaw_turns::run_profile::LoopModelUsage {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             input_tokens: 100,
             output_tokens: 50,
             cache_read_input_tokens: 0,
@@ -1254,6 +1261,28 @@ mod tests {
         assert_eq!(
             restored.pending_approval_resume, state.pending_approval_resume,
             "entire PendingApprovalResume must round-trip without loss when disposition is Some(Denied)"
+        );
+    }
+
+    #[test]
+    fn normalized_first_none_and_legacy_some_zero_are_distinct() {
+        let mut state = LoopExecutionState::initial_for_run(&test_run_context());
+        let known = ironclaw_turns::run_profile::LoopModelUsage {
+            normalization_version: Some(1),
+            normalized_input_tokens: Some(0),
+            cache_details_observed: Some(true),
+            ..Default::default()
+        };
+        state.accumulate_model_usage(Some(known));
+        assert_eq!(
+            state.cumulative_model_usage.unwrap().normalization_version,
+            Some(1)
+        );
+        state.cumulative_model_usage = Some(Default::default());
+        state.accumulate_model_usage(Some(known));
+        assert_eq!(
+            state.cumulative_model_usage.unwrap().normalization_version,
+            None
         );
     }
 }

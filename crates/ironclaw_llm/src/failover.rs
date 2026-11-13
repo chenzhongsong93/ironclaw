@@ -408,6 +408,9 @@ mod tests {
                 input_cost: Decimal::ZERO,
                 output_cost: Decimal::ZERO,
                 complete_result: Mutex::new(Some(Ok(CompletionResponse {
+                    normalization_version: None,
+                    normalized_input_tokens: None,
+                    cache_details_observed: None,
                     content: content.to_string(),
                     input_tokens: 10,
                     output_tokens: 5,
@@ -417,6 +420,9 @@ mod tests {
                     cache_creation_input_tokens: 0,
                 }))),
                 tool_complete_result: Mutex::new(Some(Ok(ToolCompletionResponse {
+                    normalization_version: None,
+                    normalized_input_tokens: None,
+                    cache_details_observed: None,
                     content: Some(content.to_string()),
                     tool_calls: vec![],
                     input_tokens: 10,
@@ -803,6 +809,9 @@ mod tests {
                 });
             }
             Ok(CompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: format!("{} ok", self.name),
                 input_tokens: 10,
                 output_tokens: 5,
@@ -830,6 +839,9 @@ mod tests {
                 });
             }
             Ok(ToolCompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: Some(format!("{} ok", self.name)),
                 tool_calls: vec![],
                 input_tokens: 10,

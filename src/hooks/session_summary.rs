@@ -392,6 +392,9 @@ mod tests {
             _request: CompletionRequest,
         ) -> Result<CompletionResponse, LlmError> {
             Ok(CompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: self.response.clone(),
                 input_tokens: 0,
                 output_tokens: 0,

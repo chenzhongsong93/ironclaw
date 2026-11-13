@@ -35,6 +35,7 @@ pub fn secret_handles() -> GithubSupportResult<Vec<SecretHandle>> {
 
 pub fn api_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "api.github.com".to_string(),

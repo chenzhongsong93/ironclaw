@@ -3949,6 +3949,9 @@ That's my plan."#;
                 _request: ToolCompletionRequest,
             ) -> Result<ToolCompletionResponse, crate::LlmError> {
                 Ok(ToolCompletionResponse {
+                    normalization_version: None,
+                    normalized_input_tokens: None,
+                    cache_details_observed: None,
                     content: None,
                     tool_calls: Vec::new(),
                     input_tokens: 0,
@@ -4301,6 +4304,9 @@ That's my plan."#;
             _request: crate::ToolCompletionRequest,
         ) -> Result<crate::ToolCompletionResponse, crate::error::LlmError> {
             Ok(crate::ToolCompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: Some("I'll write the report.".to_string()),
                 tool_calls: vec![ToolCall {
                     id: "call_1".to_string(),

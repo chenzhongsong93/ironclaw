@@ -47,6 +47,18 @@ impl CapabilitySurfaceProfileResolver for SubagentCapabilitySurfaceResolver {
             CapabilityAllowSet::allowlist(material.allowed_capabilities),
         )
     }
+
+    async fn resolve_for_capabilities(
+        &self,
+        run_context: &LoopRunContext,
+        capabilities: &(dyn ironclaw_turns::run_profile::LoopCapabilityPort + Send + Sync),
+    ) -> Result<CapabilityAllowSet, CapabilityResolveError> {
+        let base = self.inner.resolve_for_capabilities(run_context, capabilities).await?;
+        if !is_subagent_planned_run_profile(run_context) { return Ok(base); }
+        let material = self.material_source.material_for_run(run_context).await
+            .map_err(|error| CapabilityResolveError::unavailable(error.safe_summary))?;
+        intersect_allow_sets(base, CapabilityAllowSet::allowlist(material.allowed_capabilities))
+    }
 }
 
 fn intersect_allow_sets(
@@ -240,6 +252,23 @@ mod tests {
             }
             other => panic!("unexpected resolve error: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn decorated_callback_keeps_child_material_native_denial() {
+        let resolver = SubagentCapabilitySurfaceResolver::new(
+            Arc::new(StaticResolver(allowlist(&["builtin.read_file", "builtin.spawn_subagent"]))),
+            Arc::new(SucceedingSource(SubagentPromptMaterial {
+                direction_markdown: "test".to_string(),
+                goal: ironclaw_loop_host::SubagentPromptGoal {task:"test".into(),handoff:None},
+                allowed_capabilities:BTreeSet::from([cap("builtin.read_file")]),
+            })),
+        );
+        let actual = resolver.resolve_for_capabilities(&planned_subagent_context(),
+            &ironclaw_loop_host::EmptyLoopCapabilityPort).await.unwrap();
+        assert_eq!(actual,allowlist(&["builtin.read_file"]));
+        assert!(!actual.permits(&cap("builtin.spawn_subagent")),
+            "new decorated callback must preserve final child material deny");
     }
 
     #[tokio::test]

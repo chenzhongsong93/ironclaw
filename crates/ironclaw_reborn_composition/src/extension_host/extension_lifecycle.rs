@@ -88,7 +88,7 @@ use crate::extension_host::extension_removal_cleanup::{
 };
 use crate::extension_host::lifecycle::response_with_payload;
 use crate::extension_host::mcp_discovery::{
-    HostedMcpDiscoveryError, discover_hosted_mcp_package, is_hosted_http_mcp_package,
+    HostedMcpDiscoveryError, is_hosted_http_mcp_package,
 };
 
 pub(crate) use active_publication::ActiveExtensionPublisher;
@@ -111,6 +111,7 @@ const RETIRED_SLACK_USER_EXTENSION_ID: &str = "slack_user";
 pub(crate) struct RebornLocalExtensionManagementPort {
     filesystem: Arc<dyn RootFilesystem>,
     catalog: Arc<RwLock<AvailableExtensionCatalog>>,
+    operator_admission: Option<Arc<crate::operator_late_admission::OperatorLateAdmissionStore>>,
     installation_store: Arc<dyn ExtensionInstallationStore>,
     lifecycle_service: Arc<Mutex<ExtensionLifecycleService>>,
     active_extensions: ActiveExtensionPublisher,
@@ -325,6 +326,7 @@ impl RebornLocalExtensionManagementPort {
         Self {
             filesystem,
             catalog: Arc::new(RwLock::new(catalog)),
+            operator_admission: None,
             installation_store,
             lifecycle_service,
             active_extensions,
@@ -336,6 +338,35 @@ impl RebornLocalExtensionManagementPort {
             account_setups: ExtensionAccountSetupRegistry::default(),
             provider_instance_readiness: std::collections::BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn root_bundle_is_current_active(&self,bundle:&crate::RebornHostExtensionBundle)->bool {
+        let snapshot=self.active_extensions.snapshot();bundle.bindings().iter().all(|binding|snapshot.get_extension(binding.provider()).is_some_and(|package| {
+            match &package.manifest.runtime {ironclaw_extensions::ExtensionRuntime::Mcp {url:Some(url),..}=>binding.endpoint_for(package,url).is_some(),_=>false}
+        }))
+    }
+    pub(crate) fn with_operator_admission(mut self,store:Arc<crate::operator_late_admission::OperatorLateAdmissionStore>)->Self {self.operator_admission=Some(store);self}
+    /// Trusted Root already validated full package/asset provenance; only the SAME manager catalog changes.
+    pub(crate) async fn revalidate_root_bundle(&self,bundle:&crate::RebornHostExtensionBundle)->Result<(),ProductWorkflowError> {
+        let verified={let mut catalog=self.catalog.write().await;bundle.merge_into_catalog(&mut catalog)?;
+            bundle.package_refs().iter().map(|reference|catalog.resolve(reference)).collect::<Result<Vec<_>,_>>()?};
+        let _operation=self.operation_lock.lock().await;
+        for available in verified {
+            let mut lifecycle=self.lifecycle_service.lock().await;
+            if let Some(existing)=lifecycle.registry().get_extension(&available.package.id).cloned() {
+                // Source classification may be revalidated, never digest/version/root/descriptors changed.
+                if existing.manifest_digest!=available.package.manifest_digest||existing.manifest.version!=available.package.manifest.version
+                    ||existing.root!=available.package.root||existing.capabilities!=available.package.capabilities||existing.descriptor_schema_mode!=available.package.descriptor_schema_mode {
+                    return Err(ProductWorkflowError::BindingAccessDenied);
+                }
+                if existing.manifest.source!=available.package.manifest.source {
+                    let enabled=lifecycle.is_enabled(&existing.id);
+                    lifecycle.remove(&existing.id).await.map_err(map_extension_error)?;
+                    lifecycle.install(available.package.clone()).await.map_err(map_extension_error)?;
+                    if enabled {lifecycle.enable(&existing.id).await.map_err(map_extension_error)?;}else{lifecycle.disable(&existing.id).await.map_err(map_extension_error)?;}
+                }
+            }
+        }Ok(())
     }
 
     pub(crate) fn with_account_setup_registry(
@@ -534,6 +565,13 @@ impl RebornLocalExtensionManagementPort {
             .capabilities()
             .filter_map(|descriptor| {
                 let owner = owner_by_extension.get(&descriptor.provider)?;
+                if let Some(store)=&self.operator_admission {
+                    let package=registry.get_extension(&descriptor.provider)?;
+                    if let ironclaw_extensions::ExtensionRuntime::Mcp {url:Some(url),..}=&package.manifest.runtime {
+                        if url.starts_with("http://")&&store.requires_admission(&descriptor.provider) {let binding=store.binding(&descriptor.provider)?;binding.endpoint_for(package,url)?;}
+                    }
+                }
+
                 let model_visible = registry
                     .capability_visibility(&descriptor.id)
                     .unwrap_or(CapabilityVisibility::Model)
@@ -909,6 +947,27 @@ impl RebornLocalExtensionManagementPort {
         Ok(())
     }
 
+    fn requires_hosted_mcp_discovery(&self, package: &ExtensionPackage) -> Result<bool, ProductWorkflowError> {
+        // Selection is authority-bearing state; inspect it BEFORE URL shape.
+        // A selected provider cannot deform its package into ordinary/static
+        // activation by changing URL, scheme, digest or source.
+        if let Some(store) = &self.operator_admission {
+            if store.requires_admission(&package.id) {
+                if !crate::extension_host::mcp_discovery::root_loopback_package_admitted(package, None, Some(store.as_ref())) {
+                    return Err(ProductWorkflowError::InvalidBindingRequest { reason: "sameRuntimeSelectedDiscoveryPackageRejected".into() });
+                }
+                return Ok(true);
+            }
+        }
+        if crate::extension_host::mcp_discovery::root_loopback_package_declared(package) {
+            if !crate::extension_host::mcp_discovery::root_loopback_package_admitted(package, None, self.operator_admission.as_deref()) {
+                return Err(ProductWorkflowError::InvalidBindingRequest { reason: "sameRuntimeLoopbackDiscoveryAdmissionMissing".into() });
+            }
+            return Ok(true);
+        }
+        Ok(is_hosted_http_mcp_package(package))
+    }
+
     pub(crate) async fn activate(
         &self,
         package_ref: LifecyclePackageRef,
@@ -971,15 +1030,19 @@ impl RebornLocalExtensionManagementPort {
             {
                 return activation_credentials_incomplete_response(package_ref, missing);
             }
+            let requires_discovery = self.requires_hosted_mcp_discovery(&package)?;
             match mode {
                 ExtensionActivationMode::HostedMcpDiscovery {
                     scope,
                     runtime_http_egress,
-                } if is_hosted_http_mcp_package(&package) => HostedMcpDiscoveryRequest {
+                } if requires_discovery => HostedMcpDiscoveryRequest {
                     base_package: package,
                     scope,
                     runtime_http_egress,
                 },
+                _ if crate::extension_host::mcp_discovery::root_loopback_package_declared(&package) => {
+                    return Err(ProductWorkflowError::InvalidBindingRequest { reason: "sameRuntimeLoopbackDiscoveryModeRequired".into() });
+                }
                 _ => {
                     return self
                         .commit_activation(
@@ -994,14 +1057,17 @@ impl RebornLocalExtensionManagementPort {
             }
         };
 
-        let active_package = match discover_hosted_mcp_package(
+        let qualified=self.operator_admission.as_ref().filter(|store|store.contains(&discovery.base_package.id));
+        let active_package = match crate::extension_host::mcp_discovery::discover_hosted_mcp_package_with_admission(
             &discovery.base_package,
             discovery.scope,
             discovery.runtime_http_egress,
+            qualified.cloned(),
         )
         .await
         {
             Ok(active_package) => active_package,
+            Err(HostedMcpDiscoveryError::Transient(_)) if qualified.is_some()=>return Err(ProductWorkflowError::InvalidBindingRequest {reason:"sameRuntimeQualifiedDiscoveryFailed".into()}),
             Err(HostedMcpDiscoveryError::Transient(reason)) => {
                 tracing::debug!(
                     extension_id = %extension_id.as_str(),
@@ -1166,7 +1232,7 @@ impl RebornLocalExtensionManagementPort {
         let (extension_id, _) = extension_ids_from_package_ref(package_ref)?;
         let _operation_guard = self.operation_lock.lock().await;
         let package = self.lifecycle_package(&extension_id).await?;
-        Ok(is_hosted_http_mcp_package(&package))
+        self.requires_hosted_mcp_discovery(&package)
     }
 
     /// Remove an installed extension. This is the single convergence point both
@@ -2631,7 +2697,7 @@ fn compensation_failure(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         collections::BTreeSet,
         sync::{
@@ -6575,6 +6641,140 @@ output_schema_ref = "schemas/run.output.json"
         };
         assert_eq!(count, 1);
         assert_eq!(extensions[0].summary.package_ref.id.as_str(), "fixture");
+    }
+
+    const LATE_RUNTIME_MECHANISM_MANIFEST: &str = r#"schema_version = "reborn.extension_manifest.v2"
+id = "fixture"
+name = "Fixture"
+version = "0.1.0"
+description = "Source mechanism fixture, not a qualified provider"
+trust = "third_party"
+[runtime]
+kind = "mcp"
+transport = "http"
+url = "http://127.0.0.1:39999/mcp/internal"
+[[capabilities]]
+id = "fixture.search"
+description = "Fixture search"
+effects = ["network"]
+default_permission = "allow"
+visibility = "model"
+input_schema_ref = "schemas/input.json"
+output_schema_ref = "schemas/output.json"
+network_targets = [{ scheme = "http", host_pattern = "127.0.0.1", port = 39999 }]
+"#;
+
+    #[derive(Default)]
+    struct CompleteRootCatalogEgress { calls: AtomicUsize }
+    #[async_trait]
+    impl RuntimeHttpEgress for CompleteRootCatalogEgress {
+        async fn execute(&self,request:RuntimeHttpEgressRequest)->Result<RuntimeHttpEgressResponse,RuntimeHttpEgressError> {
+            self.calls.fetch_add(1,Ordering::SeqCst);
+            hosted_mcp_response_for_request(request,serde_json::json!({"tools":[
+                {"name":"search","description":"Declared fixture tool","inputSchema":{"type":"object","properties":{}}},
+                {"name":"live-search","description":"Unknown fixture tool","inputSchema":{"type":"object","properties":{}}}
+            ]})).await
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_root_lifecycle_rejects_deformed_loaded_package_before_any_egress() {
+        for mutation in ["localhost","foreign-http","foreign-https","digest"] {
+            let store=Arc::new(crate::operator_late_admission::OperatorLateAdmissionStore::default());
+            let (_dir,port,_facade,active,available)=late_runtime_mechanism_ports(store.clone(),false);
+            let package_ref=available.package_ref.clone();let mut changed=available.package.clone();
+            let scope=ResourceScope::local_default(lifecycle_owner(),InvocationId::new()).unwrap();
+            let instance="11111111-1111-4111-8111-111111111111";
+            let bundle=Arc::new(crate::RebornHostExtensionBundle::late_mechanism_fixture(available,scope.tenant_id.clone(),instance));
+            port.revalidate_root_bundle(&bundle).await.unwrap();port.install(package_ref.clone(),&lifecycle_owner()).await.unwrap();
+            let signer=ironclaw_mcp::McpTrustedContextSigner::new(ExtensionId::new("fixture").unwrap(),b"unit-fixture-not-production-authority".to_vec(),"http://127.0.0.1:39999/mcp/internal".into()).unwrap();
+            store.set_actual_signer(&signer).unwrap();store.bind_runtime(instance,Arc::new(||true)).unwrap();store.reserve(bundle,&scope.tenant_id,instance,Arc::new(||true)).unwrap();
+            if mutation=="digest" {changed.manifest_digest=Some(format!("sha256:{}","0".repeat(64)));}
+            else {
+                let url=match mutation {"localhost"=>"http://localhost:39999/mcp/internal","foreign-http"=>"http://foreign.example/mcp/internal",_=>"https://foreign.example/mcp/internal"};
+                changed.manifest.runtime=ironclaw_extensions::ExtensionRuntime::Mcp {transport:"http".into(),command:None,args:Vec::new(),url:Some(url.into())};
+            }
+            // Exercise the actual loaded lifecycle package, not only a helper.
+            let provider=changed.id.clone();
+            {let mut lifecycle=port.lifecycle_service.lock().await;lifecycle.remove(&provider).await.unwrap();lifecycle.install(changed).await.unwrap();}
+            assert!(port.package_requires_hosted_mcp_discovery(&package_ref).await.is_err());
+            assert!(port.activate_with_prechecked_credentials_for_test(package_ref.clone(),ExtensionActivationMode::Static).await.is_err());
+            let egress=Arc::new(CompleteRootCatalogEgress::default());
+            assert!(port.activate_with_prechecked_credentials_for_test(package_ref,ExtensionActivationMode::HostedMcpDiscovery {scope,runtime_http_egress:egress.clone()}).await.is_err());
+            assert_eq!(egress.calls.load(Ordering::SeqCst),0);assert!(active.snapshot().get_extension(&provider).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn root_loopback_lifecycle_requires_real_discovery_and_rejects_static_fallback() {
+        // Existing manager/install/activation caller fixture, not a helper-only
+        // classification test and never a production authority factory.
+        for success in [false,true] {
+            let store=Arc::new(crate::operator_late_admission::OperatorLateAdmissionStore::default());
+            let (_dir,port,_facade,active,available)=late_runtime_mechanism_ports(store.clone(),false);
+            let package_ref=available.package_ref.clone();
+            let scope=ResourceScope::local_default(lifecycle_owner(),InvocationId::new()).unwrap();
+            let instance="11111111-1111-4111-8111-111111111111";
+            let bundle=Arc::new(crate::RebornHostExtensionBundle::late_mechanism_fixture(available,scope.tenant_id.clone(),instance));
+            port.revalidate_root_bundle(&bundle).await.unwrap();
+            port.install(package_ref.clone(),&lifecycle_owner()).await.unwrap();
+            assert!(port.package_requires_hosted_mcp_discovery(&package_ref).await.is_err());
+            let signer=ironclaw_mcp::McpTrustedContextSigner::new(ExtensionId::new("fixture").unwrap(),b"unit-fixture-not-production-authority".to_vec(),"http://127.0.0.1:39999/mcp/internal".into()).unwrap();
+            store.set_actual_signer(&signer).unwrap();
+            let live=Arc::new(std::sync::atomic::AtomicBool::new(true));let observed=live.clone();
+            store.bind_runtime(instance,Arc::new(move||observed.load(Ordering::SeqCst))).unwrap();
+            let observed=live.clone();store.reserve(bundle,&scope.tenant_id,instance,Arc::new(move||observed.load(Ordering::SeqCst))).unwrap();
+            assert!(port.package_requires_hosted_mcp_discovery(&package_ref).await.unwrap());
+            assert!(port.activate_with_prechecked_credentials_for_test(package_ref.clone(),ExtensionActivationMode::Static).await.is_err());
+            let egress:Arc<dyn RuntimeHttpEgress>=if success {Arc::new(CompleteRootCatalogEgress::default())}else{Arc::new(EmptyToolsHostedMcpEgress)};
+            let result=port.activate_with_prechecked_credentials_for_test(package_ref.clone(),ExtensionActivationMode::HostedMcpDiscovery {scope,runtime_http_egress:egress}).await;
+            let snapshot=active.snapshot();let provider=ExtensionId::new("fixture").unwrap();
+            if success {
+                assert!(result.is_ok());
+                let package=snapshot.get_extension(&provider).unwrap();
+                let observed=package.capabilities.iter().find(|c|c.id.as_str()=="fixture.live-search").expect("actual discovered tool must replace static schema");
+                assert_eq!(observed.default_permission,PermissionMode::Ask); // Unknown cannot inherit Allow.
+                assert_eq!(package.capabilities.iter().find(|cap|cap.id.as_str()=="fixture.search").unwrap().default_permission,PermissionMode::Allow);
+            }else{
+                assert!(result.is_err());assert!(snapshot.get_extension(&provider).is_none());
+            }
+            live.store(false,Ordering::SeqCst);
+            assert!(port.package_requires_hosted_mcp_discovery(&package_ref).await.is_err());
+        }
+    }
+
+    /// Same normal manager/facade/storage fixtures used by lifecycle tests, never production authority.
+    pub(crate) fn late_runtime_mechanism_ports(store:Arc<crate::operator_late_admission::OperatorLateAdmissionStore>,restore:bool)->(tempfile::TempDir,Arc<RebornLocalExtensionManagementPort>,Arc<dyn ironclaw_product_workflow::LifecycleProductFacade>,Arc<SharedExtensionRegistry>,AvailableExtensionPackage) {
+        let manifest=LATE_RUNTIME_MECHANISM_MANIFEST;
+        let available=fixture_extension_package_from_manifest(manifest);
+        let mut catalog=AvailableExtensionCatalog::from_packages(vec![]);
+        let lifecycle=ExtensionLifecycleService::new(ExtensionRegistry::new());
+        if restore {
+            let mut fs=fixture_extension_package_from_manifest(manifest);fs.source=ManifestSource::InstalledLocal;fs.package.manifest.source=ManifestSource::InstalledLocal;
+            catalog=AvailableExtensionCatalog::from_packages(vec![fs]);
+        }
+        let (dir,_,port,registry,_)=extension_management_port_fixture_with_catalog_and_service(catalog,lifecycle);
+        let port=Arc::new(Arc::try_unwrap(port).unwrap_or_else(|_|panic!("one fixture owner")).with_operator_admission(store));
+        let skill=Arc::new(crate::extension_host::lifecycle::RebornLocalSkillManagementPort::new(lifecycle_owner(),port.filesystem.clone(),MountView::new(Vec::new()).unwrap()));
+        let facade=Arc::new(crate::extension_host::lifecycle::RebornLocalLifecycleFacade::new(skill).with_extension_management(port.clone()).with_runtime_http_egress(Arc::new(HostedMcpDiscoveryEgress::default())));
+        (dir,port,facade,registry,available)
+    }
+
+    /// Real FilesystemExtensionInstallationStore reopen; normal manager/facade, not PG/provider acceptance.
+    pub(crate) async fn late_runtime_persistent_ports(store:Arc<crate::operator_late_admission::OperatorLateAdmissionStore>,existing:Option<Arc<dyn RootFilesystem>>)
+        ->(tempfile::TempDir,Arc<dyn RootFilesystem>,Arc<RebornLocalExtensionManagementPort>,Arc<dyn ironclaw_product_workflow::LifecycleProductFacade>,Arc<SharedExtensionRegistry>,AvailableExtensionPackage) {
+        let (dir,base,_unused_facade,_unused_registry,available)=late_runtime_mechanism_ports(store.clone(),false);
+        let filesystem=existing.unwrap_or_else(||base.filesystem.clone());
+        let installation_store:Arc<dyn ExtensionInstallationStore>=Arc::new(crate::extension_host::extension_installation_store::FilesystemExtensionInstallationStore::load_at(filesystem.clone(),VirtualPath::new("/projects/.late-persistent-installations.json").unwrap()).await.unwrap());
+        let lifecycle=Arc::new(Mutex::new(ExtensionLifecycleService::new(ExtensionRegistry::new())));
+        let registry=Arc::new(SharedExtensionRegistry::new(ExtensionRegistry::new()));
+        let publisher=test_active_extension_publisher(registry.clone(),test_extension_trust_policy());
+        let catalog=AvailableExtensionCatalog::from_packages(vec![fixture_extension_package_from_manifest(LATE_RUNTIME_MECHANISM_MANIFEST)]);
+        restore_extension_lifecycle_state(&catalog,&filesystem,&installation_store,&lifecycle,&publisher).await.unwrap();
+        let manager=Arc::new(RebornLocalExtensionManagementPort::new(filesystem.clone(),catalog,installation_store,lifecycle,publisher,None,lifecycle_owner()).with_operator_admission(store));
+        let skill=Arc::new(crate::extension_host::lifecycle::RebornLocalSkillManagementPort::new(lifecycle_owner(),filesystem.clone(),MountView::new(Vec::new()).unwrap()));
+        let facade=Arc::new(crate::extension_host::lifecycle::RebornLocalLifecycleFacade::new(skill).with_extension_management(manager.clone()).with_runtime_http_egress(Arc::new(HostedMcpDiscoveryEgress::default())));
+        (dir,filesystem,manager,facade,registry,available)
     }
 
     fn extension_lifecycle_fixture() -> (

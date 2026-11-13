@@ -137,6 +137,9 @@ impl LlmProvider for BedrockProvider {
         let (input_tokens, output_tokens) = extract_token_usage(response.usage());
 
         Ok(CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: text,
             input_tokens,
             output_tokens,
@@ -202,6 +205,9 @@ impl LlmProvider for BedrockProvider {
         let (input_tokens, output_tokens) = extract_token_usage(response.usage());
 
         Ok(ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: if text.is_empty() { None } else { Some(text) },
             tool_calls,
             input_tokens,

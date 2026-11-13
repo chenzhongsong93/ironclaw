@@ -85,6 +85,7 @@ async fn approving_pending_dispatch_request_preserves_reviewed_grant_constraints
     )])
     .unwrap();
     let network = NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "api.example.com".to_string(),

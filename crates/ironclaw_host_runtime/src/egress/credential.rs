@@ -541,6 +541,7 @@ mod tests {
             headers: vec![],
             body: b"hello".to_vec(),
             network_policy: NetworkPolicy {
+                deny_redirects: false,
                 allowed_targets: vec![],
                 deny_private_ip_ranges: true,
                 max_egress_bytes: Some(4096),
@@ -882,6 +883,7 @@ mod path_placeholder_tests {
             headers: vec![],
             body: Vec::new(),
             network_policy: NetworkPolicy {
+                deny_redirects: false,
                 allowed_targets: vec![],
                 deny_private_ip_ranges: true,
                 max_egress_bytes: Some(4096),

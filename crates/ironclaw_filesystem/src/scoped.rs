@@ -392,6 +392,16 @@ where
         result
     }
 
+    pub async fn complete_event_prefix(&self, scope: &ResourceScope, path: &ScopedPath,
+        max_records: usize, max_bytes: usize, max_record_bytes: usize) -> Result<Option<crate::CompleteEventPrefix>,FilesystemError> {
+        let virtual_path=self.resolve_with_permission(scope,path,FilesystemOperation::Tail)?;
+        self.root.complete_event_prefix(&virtual_path,max_records,max_bytes,max_record_bytes).await
+    }
+    pub async fn event_log_generation(&self, scope: &ResourceScope, path: &ScopedPath) -> Result<Option<String>,FilesystemError> {
+        let virtual_path=self.resolve_with_permission(scope,path,FilesystemOperation::Tail)?;
+        self.root.event_log_generation(&virtual_path).await
+    }
+
     /// Read events at `path` starting just after `from`.
     pub async fn tail(
         &self,

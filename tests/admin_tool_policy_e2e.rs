@@ -44,6 +44,9 @@ mod tests {
             _request: CompletionRequest,
         ) -> Result<CompletionResponse, ironclaw::error::LlmError> {
             Ok(CompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: "ok".to_string(),
                 input_tokens: 0,
                 output_tokens: 1,
@@ -64,6 +67,9 @@ mod tests {
                 .expect("recording tools mutex poisoned")
                 .push(names);
             Ok(ToolCompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: Some("ok".to_string()),
                 tool_calls: Vec::new(),
                 input_tokens: 0,

@@ -905,6 +905,7 @@ fn policy(
     max_egress_bytes: Option<u64>,
 ) -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: None,
             host_pattern: host_pattern.to_string(),
@@ -925,4 +926,19 @@ fn sample_scope() -> ResourceScope {
         thread_id: None,
         invocation_id: InvocationId::new(),
     }
+}
+
+#[tokio::test]
+async fn typed_deny_redirect_keeps_complete_first_response_without_same_host_path_hop() {
+    let mut first=redirect_response("https://api.example.test/another-path");
+    first.body=b"redirect-body-must-survive".to_vec();first.usage=NetworkUsage {request_bytes:17,response_bytes:first.body.len() as u64,resolved_ip:Some(IpAddr::V4(Ipv4Addr::new(93,184,216,34)))};
+    let transport=ScriptedTransport::new(vec![first,ok_response("must-not-send")]);
+    let requests=transport.requests.clone();let mut allow=policy("api.example.test",Some(443),true,None);allow.deny_redirects=true;
+    let egress=PolicyNetworkHttpEgress::new_with_resolver(transport,StaticResolver::new(vec![IpAddr::V4(Ipv4Addr::new(93,184,216,34))]));
+    let response=egress.execute(NetworkHttpRequest {scope:sample_scope(),method:NetworkMethod::Get,
+        url:"https://api.example.test/exact".into(),headers:vec![],body:vec![],policy:allow,
+        response_body_limit:Some(1024),timeout_ms:None}).await.unwrap();
+    assert_eq!(response.status,302);assert_eq!(requests.lock().unwrap().len(),1);
+    assert_eq!(response.body,b"redirect-body-must-survive");assert_eq!(response.usage.request_bytes,17);assert_eq!(response.usage.response_bytes,response.body.len() as u64);assert!(response.usage.resolved_ip.is_some());
+    assert!(response.headers.iter().any(|(k,v)|k.eq_ignore_ascii_case("location")&&v.ends_with("/another-path")));
 }

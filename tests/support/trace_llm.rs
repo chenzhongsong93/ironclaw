@@ -728,6 +728,9 @@ impl LlmProvider for TraceLlm {
                     output_tokens,
                 } => {
                     return Ok(CompletionResponse {
+                        normalization_version: None,
+                        normalized_input_tokens: None,
+                        cache_details_observed: None,
                         content,
                         input_tokens,
                         output_tokens,
@@ -765,6 +768,9 @@ impl LlmProvider for TraceLlm {
                 input_tokens,
                 output_tokens,
             } => Ok(ToolCompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: Some(content),
                 tool_calls: Vec::new(),
                 input_tokens,
@@ -792,6 +798,9 @@ impl LlmProvider for TraceLlm {
                     })
                     .collect();
                 Ok(ToolCompletionResponse {
+                    normalization_version: None,
+                    normalized_input_tokens: None,
+                    cache_details_observed: None,
                     content: None,
                     tool_calls: calls,
                     input_tokens,

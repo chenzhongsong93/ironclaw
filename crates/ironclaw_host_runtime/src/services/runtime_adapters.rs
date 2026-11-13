@@ -404,28 +404,49 @@ where
                     "MCP runtime dispatch failed"
                 );
                 match error {
-                McpError::AuthRequired {
-                    required_secrets,
-                    credential_requirements,
-                } => DispatchError::AuthRequired {
-                    capability: request.capability_id.clone(),
-                    required_secrets,
-                    credential_requirements,
-                },
-                // `Client` is the one variant that may carry a host-authored
-                // `safe_hint` (sourced from the JSON-RPC `error.data.safe_hint`
-                // side-channel). Forward it as `safe_summary` so the model sees
-                // actionable remediation; `kind` stays a stable audit token.
-                McpError::Client { safe_hint, .. } => DispatchError::Mcp {
-                    kind: RuntimeDispatchErrorKind::Client,
-                    safe_summary: safe_hint,
-                },
-                error => DispatchError::Mcp {
-                    kind: mcp_error_kind(&error),
-                    safe_summary: None,
-                },
+                    McpError::AuthRequired {
+                        required_secrets,
+                        credential_requirements,
+                    } => DispatchError::AuthRequired {
+                        capability: request.capability_id.clone(),
+                        required_secrets,
+                        credential_requirements,
+                    },
+                    // `Client` is the one variant that may carry a host-authored
+                    // `safe_hint` (sourced from the JSON-RPC `error.data.safe_hint`
+                    // side-channel). Forward it as `safe_summary` so the model sees
+                    // actionable remediation; `kind` stays a stable audit token.
+                    McpError::Client { safe_hint, .. } => DispatchError::Mcp {
+                        kind: RuntimeDispatchErrorKind::Client,
+                        safe_summary: safe_hint,
+                    },
+                    error => DispatchError::Mcp {
+                        kind: mcp_error_kind(&error),
+                        safe_summary: None,
+                    },
                 }
             })?;
+
+        // MCP transport completion is not tool success. Usage was reconciled by
+        // the MCP runtime above, including failed tool operations. Never promote
+        // untrusted result text into host-authored remediation or retry this call.
+        if let Some(flag) = execution.result.output.get("isError") {
+            match flag.as_bool() {
+                Some(true) => {
+                    return Err(DispatchError::Mcp {
+                        kind: RuntimeDispatchErrorKind::OperationFailed,
+                        safe_summary: None,
+                    });
+                }
+                None => {
+                    return Err(DispatchError::Mcp {
+                        kind: RuntimeDispatchErrorKind::InvalidResult,
+                        safe_summary: None,
+                    });
+                }
+                Some(false) => {}
+            }
+        }
 
         Ok(RuntimeAdapterResult {
             output: execution.result.output,

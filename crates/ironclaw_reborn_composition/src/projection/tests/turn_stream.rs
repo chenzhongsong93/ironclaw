@@ -1547,6 +1547,9 @@ async fn terminal_event_with_usage_emits_turn_cost_payload() {
     // ISSUE-IRONCLAW-006: a Completed turn carrying model usage must surface a
     // TurnCost payload so billing consumers can charge real usage.
     let usage = ironclaw_turns::run_profile::LoopModelUsage {
+        normalization_version: None,
+        normalized_input_tokens: None,
+        cache_details_observed: None,
         input_tokens: 1234,
         output_tokens: 567,
         cache_read_input_tokens: 0,
@@ -1588,6 +1591,9 @@ async fn terminal_event_with_usage_emits_turn_cost_payload() {
 #[tokio::test]
 async fn failed_event_with_usage_also_emits_turn_cost() {
     let usage = ironclaw_turns::run_profile::LoopModelUsage {
+        normalization_version: None,
+        normalized_input_tokens: None,
+        cache_details_observed: None,
         input_tokens: 10,
         output_tokens: 3,
         cache_read_input_tokens: 0,
@@ -1625,4 +1631,33 @@ async fn non_terminal_event_with_usage_emits_no_turn_cost() {
             .iter()
             .any(|event| matches!(event.payload(), ProductOutboundPayload::TurnCost(_)))
     );
+}
+
+#[tokio::test]
+async fn v1_cost_is_this_run_canonical_total_including_known_cancelled_usage() {
+    for (status, kind) in [
+        (TurnStatus::Completed, TurnEventKind::Completed),
+        (TurnStatus::Failed, TurnEventKind::Failed),
+        (TurnStatus::Cancelled, TurnEventKind::Cancelled),
+    ] {
+        let usage = ironclaw_turns::run_profile::LoopModelUsage {
+            normalization_version: Some(1),
+            normalized_input_tokens: Some(109),
+            cache_details_observed: Some(true),
+            input_tokens: 2,
+            output_tokens: 3,
+            cache_read_input_tokens: 7,
+            cache_creation_input_tokens: 100,
+        };
+        let events = drain_single_event(status, kind, Some(usage)).await;
+        let cost = events
+            .iter()
+            .find_map(|event| match event.payload() {
+                ProductOutboundPayload::TurnCost(value) => Some(value),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!((cost.input_tokens, cost.output_tokens), (109, 3));
+        assert_eq!(cost.thread_id, "webui-cost-thread");
+    }
 }

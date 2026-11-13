@@ -9,7 +9,11 @@ use crate::llm_admin::llm_catalog::{
     resolve_reborn_mission_llm, resolve_reborn_runtime_llm,
 };
 use crate::llm_admin::llm_config_service::LlmReloadTrigger;
+use crate::runtime::{RebornStartupStage, reborn_startup_stage};
 use crate::runtime_input::ResolvedRebornLlm;
+#[path = "reload_diagnostic.rs"]
+mod diagnostic;
+use diagnostic::report_failure;
 
 /// Read the boot-time `[llm.mission] model`, tolerating a missing config file
 /// or slot (`None`). Mirrors the runtime assembly's boot-time read so drift
@@ -110,19 +114,27 @@ impl RebornLlmReloadAdapter {
 #[async_trait]
 impl LlmReloadTrigger for RebornLlmReloadAdapter {
     async fn reload(&self) -> Result<(), String> {
-        let config_file = RebornConfigFile::load(&self.boot.home().config_file_path())
-            .map_err(|error| error.to_string())?;
-        let Some(resolved) = self.resolve_effective_llm(config_file.as_ref()).await? else {
+        let config_file = report_failure(
+            RebornStartupStage::LlmReloadConfigReadFailed,
+            RebornConfigFile::load(&self.boot.home().config_file_path()),
+        )
+        .map_err(|error| error.to_string())?;
+        let Some(resolved) = report_failure(
+            RebornStartupStage::LlmReloadSelectionFailed,
+            self.resolve_effective_llm(config_file.as_ref()).await,
+        )?
+        else {
             // No provider selected yet, so there is nothing to swap.
+            reborn_startup_stage(RebornStartupStage::LlmReloadNoSelection);
             return Ok(());
         };
         let provider_id = resolved.provider_id().to_string();
         let mut config = resolved.config;
-        let key_applied = match self
-            .keys
-            .read(&provider_id)
-            .await
-            .map_err(|error| error.to_string())?
+        let key_applied = match report_failure(
+            RebornStartupStage::LlmReloadCredentialReadFailed,
+            self.keys.read(&provider_id).await,
+        )
+        .map_err(|error| error.to_string())?
         {
             Some(stored) => {
                 apply_stored_api_key(&mut config, stored);
@@ -130,11 +142,13 @@ impl LlmReloadTrigger for RebornLlmReloadAdapter {
             }
             None => false,
         };
-        let result = self
-            .reload_handle
-            .reload(&config, Arc::clone(&self.session))
-            .await
-            .map_err(|error| error.to_string());
+        let result = report_failure(
+            RebornStartupStage::LlmReloadDefaultBuildFailed,
+            self.reload_handle
+                .reload(&config, Arc::clone(&self.session))
+                .await,
+        )
+        .map_err(|error| error.to_string());
         // Never log key material — only provider id and whether a stored key
         // was applied.
         tracing::debug!(

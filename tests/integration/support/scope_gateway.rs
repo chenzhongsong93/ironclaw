@@ -156,6 +156,8 @@ mod tests {
             messages: Vec::new(),
             surface_version: None,
             resolved_model_route: None,
+            thread_id: None,
+            conversation_id: None,
             run_id: ironclaw_turns::TurnRunId::new(),
             turn_id: ironclaw_turns::TurnId::new(),
             llm_subject: None,

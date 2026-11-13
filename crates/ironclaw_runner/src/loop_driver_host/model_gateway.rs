@@ -107,6 +107,10 @@ struct LoopProgressHostStreamSink {
 
 #[async_trait]
 impl HostManagedModelStreamSink for LoopProgressHostStreamSink {
+    async fn provider_activity(&self) {
+        self.inner.provider_activity().await;
+    }
+
     async fn safe_text_update(&self, safe_text: String) {
         self.inner.model_text_update(safe_text).await;
     }

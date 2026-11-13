@@ -24,7 +24,6 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::builtin_capability_policy::BuiltinCapabilityPolicy;
 use crate::profile_approval_authorization::ApprovalSettingsProvider;
-use crate::runtime::ComposedSelectableSkillContextSource;
 use crate::runtime::local_dev::extension_surface::ExtensionCapabilitySurfaceSource;
 use crate::runtime::local_dev::external_tool_capability::wrap_external_tools;
 use crate::runtime::local_dev::outbound_delivery::outbound_delivery_capabilities;
@@ -33,6 +32,7 @@ use crate::runtime::local_dev::result_read::result_read_capability;
 use crate::runtime::local_dev::skill_activation::skill_activation_capability;
 use crate::runtime::local_dev::surface_disclosure::wrap_surface_disclosure;
 use crate::runtime::local_dev::synthetic_capability::wrap_synthetic_capabilities;
+use crate::runtime::shared_skill_binding::RuntimeSkillSelector;
 
 use super::{
     VisibleCapabilityInputs, capability_io_error, host_api_agent_loop_error,
@@ -40,54 +40,56 @@ use super::{
 };
 
 pub(crate) struct RefreshingCapabilityPortConfig {
-    pub(super) runtime: Arc<dyn HostRuntime>,
-    pub(super) run_context: LoopRunContext,
+    pub(in crate::runtime) runtime: Arc<dyn HostRuntime>,
+    pub(in crate::runtime) run_context: LoopRunContext,
     /// Factory-external shared provider tool-call input store(2026-08-24 天权
     /// 修复):本 port 每次 refresh/claim 重建,build_inner 里新建的
     /// HostRuntimeLoopCapabilityPortFactory 也随之重建——store 必须由 composition
     /// 层创建并经此传入,跨重建存活(run 挂起恢复后 digest ref 仍可解析)。
-    pub(super) provider_input_store: ironclaw_loop_host::ProviderToolCallInputStore,
-    pub(super) fallback_user_id: UserId,
-    pub(super) policy: Arc<BuiltinCapabilityPolicy>,
-    pub(super) workspace_mounts: MountView,
-    pub(super) skill_mounts: MountView,
-    pub(super) memory_mounts: MountView,
-    pub(super) system_extensions_lifecycle_mounts: MountView,
-    pub(super) extension_surface_source: ExtensionCapabilitySurfaceSource,
-    pub(super) input_resolver: Arc<dyn LoopCapabilityInputResolver>,
-    pub(super) result_writer: Arc<dyn LoopCapabilityResultWriter>,
-    pub(super) milestone_sink: Arc<dyn LoopHostMilestoneSink>,
-    pub(super) skill_activation_source: Option<Arc<ComposedSelectableSkillContextSource>>,
-    pub(super) project_service: Arc<dyn ProjectService>,
-    pub(super) thread_service: Arc<dyn SessionThreadService>,
-    pub(super) trajectory_observer: Option<Arc<dyn crate::RebornTrajectoryObserver>>,
-    pub(super) outbound_preferences_facade: Option<Arc<dyn OutboundPreferencesProductFacade>>,
-    pub(super) outbound_delivery_target_set_requires_approval: bool,
-    pub(super) approval_settings: Arc<dyn ApprovalSettingsProvider>,
-    pub(super) approval_requests: Arc<dyn ApprovalRequestStore>,
-    pub(super) capability_leases: Arc<dyn CapabilityLeaseStore>,
+    pub(in crate::runtime) provider_input_store: ironclaw_loop_host::ProviderToolCallInputStore,
+    pub(in crate::runtime) fallback_user_id: UserId,
+    pub(in crate::runtime) production_bound: bool,
+    pub(in crate::runtime) policy: Arc<BuiltinCapabilityPolicy>,
+    pub(in crate::runtime) workspace_mounts: MountView,
+    pub(in crate::runtime) skill_mounts: MountView,
+    pub(in crate::runtime) memory_mounts: MountView,
+    pub(in crate::runtime) system_extensions_lifecycle_mounts: MountView,
+    pub(in crate::runtime) extension_surface_source: ExtensionCapabilitySurfaceSource,
+    pub(in crate::runtime) input_resolver: Arc<dyn LoopCapabilityInputResolver>,
+    pub(in crate::runtime) result_writer: Arc<dyn LoopCapabilityResultWriter>,
+    pub(in crate::runtime) milestone_sink: Arc<dyn LoopHostMilestoneSink>,
+    pub(in crate::runtime) skill_activation_source: Option<RuntimeSkillSelector>,
+    pub(in crate::runtime) project_service: Arc<dyn ProjectService>,
+    pub(in crate::runtime) thread_service: Arc<dyn SessionThreadService>,
+    pub(in crate::runtime) trajectory_observer: Option<Arc<dyn crate::RebornTrajectoryObserver>>,
+    pub(in crate::runtime) outbound_preferences_facade:
+        Option<Arc<dyn OutboundPreferencesProductFacade>>,
+    pub(in crate::runtime) outbound_delivery_target_set_requires_approval: bool,
+    pub(in crate::runtime) approval_settings: Arc<dyn ApprovalSettingsProvider>,
+    pub(in crate::runtime) approval_requests: Arc<dyn ApprovalRequestStore>,
+    pub(in crate::runtime) capability_leases: Arc<dyn CapabilityLeaseStore>,
     /// Durable model-visible gate-record store the built capability port persists
     /// pending-gate records into (wires the #6245 production gap closed).
-    pub(super) gate_record_store: Arc<dyn ironclaw_run_state::GateRecordStore>,
+    pub(in crate::runtime) gate_record_store: Arc<dyn ironclaw_run_state::GateRecordStore>,
     /// Durable host-private replay-payload store the built capability port
     /// persists gate/auth replay payloads into and reconstitutes on resume
     /// (arch-simplification §5.3 Stage 2a-i).
-    pub(super) replay_payload_store: Arc<dyn ironclaw_capabilities::ReplayPayloadStore>,
-    pub(super) external_tool_catalog: Arc<dyn ExternalToolCatalog>,
+    pub(in crate::runtime) replay_payload_store: Arc<dyn ironclaw_capabilities::ReplayPayloadStore>,
+    pub(in crate::runtime) external_tool_catalog: Arc<dyn ExternalToolCatalog>,
     /// Per-capability mount overrides, merged via `with_capability_execution_mount`.
     /// Always empty at the sole production call site (`local_dev.rs`'s `create_capability_port`);
     /// populated only by the `test-support` constructor.
-    pub(super) capability_execution_mount_overrides: HashMap<CapabilityId, MountView>,
+    pub(in crate::runtime) capability_execution_mount_overrides: HashMap<CapabilityId, MountView>,
     /// Extra provider-trust entries merged into the visible request's
     /// provider-trust map. Always empty at the sole production call site
     /// (`local_dev.rs`'s `create_capability_port`); populated only by the `test-support` constructor.
-    pub(super) additional_provider_trust: BTreeMap<ExtensionId, TrustDecision>,
+    pub(in crate::runtime) additional_provider_trust: BTreeMap<ExtensionId, TrustDecision>,
     /// Narrows the FULL granted-capability set (builtin grants plus any
     /// appended extension grants) to this id set via `retain` in
     /// `build_inner`. `None` = no filtering (production's value at the sole
     /// call site, `local_dev.rs`'s `create_capability_port`); `Some(set)`
     /// keeps exactly `set`, including `Some(empty)` = zero grants.
-    pub(super) capability_id_filter: Option<HashSet<CapabilityId>>,
+    pub(in crate::runtime) capability_id_filter: Option<HashSet<CapabilityId>>,
     /// Synthetic grants for capability ids that neither the static builtin
     /// policy nor `extension_surface_source` produces (ad-hoc test-only
     /// `HostRuntime` backends). Applied in `build_inner` before
@@ -95,7 +97,7 @@ pub(crate) struct RefreshingCapabilityPortConfig {
     /// Always empty at the sole production call site (`local_dev.rs`'s
     /// `create_capability_port`); populated only by the `test-support`
     /// constructor.
-    pub(super) additional_capability_grants: Vec<ironclaw_host_api::CapabilityGrant>,
+    pub(in crate::runtime) additional_capability_grants: Vec<ironclaw_host_api::CapabilityGrant>,
 }
 
 pub(crate) async fn create_refreshing_capability_port(
@@ -106,6 +108,7 @@ pub(crate) async fn create_refreshing_capability_port(
         run_context: config.run_context,
         provider_input_store: config.provider_input_store,
         fallback_user_id: config.fallback_user_id,
+        production_bound: config.production_bound,
         policy: config.policy,
         workspace_mounts: config.workspace_mounts,
         skill_mounts: config.skill_mounts,
@@ -147,6 +150,7 @@ struct RefreshingCapabilityPort {
     run_context: LoopRunContext,
     provider_input_store: ironclaw_loop_host::ProviderToolCallInputStore,
     fallback_user_id: UserId,
+    production_bound: bool,
     policy: Arc<BuiltinCapabilityPolicy>,
     workspace_mounts: MountView,
     skill_mounts: MountView,
@@ -156,7 +160,7 @@ struct RefreshingCapabilityPort {
     input_resolver: Arc<dyn LoopCapabilityInputResolver>,
     result_writer: Arc<dyn LoopCapabilityResultWriter>,
     milestone_sink: Arc<dyn LoopHostMilestoneSink>,
-    skill_activation_source: Option<Arc<ComposedSelectableSkillContextSource>>,
+    skill_activation_source: Option<RuntimeSkillSelector>,
     project_service: Arc<dyn ProjectService>,
     thread_service: Arc<dyn SessionThreadService>,
     trajectory_observer: Option<Arc<dyn crate::RebornTrajectoryObserver>>,
@@ -186,18 +190,21 @@ impl RefreshingCapabilityPort {
         // Per-user workspace 隔离:按 run_context.scope 解析当前 tenant/user,
         // grant /workspace → /projects/tenants/{tenant}/users/{user}/workspace。
         // scope 缺 user_id 时 fallback 到全局 workspace_mounts(向后兼容)。
-        let scoped_workspace = self
-            .run_context
-            .scope
-            .explicit_owner_user_id()
-            .map(|user_id| {
-                crate::local_dev_mounts::scoped_workspace_mount_view(
-                    self.run_context.scope.tenant_id.as_str(),
-                    user_id.as_str(),
-                )
-            })
-            .transpose()
-            .map_err(host_api_agent_loop_error)?;
+        let scoped_workspace = if self.production_bound {
+            None
+        } else {
+            self.run_context
+                .scope
+                .explicit_owner_user_id()
+                .map(|user_id| {
+                    crate::local_dev_mounts::scoped_workspace_mount_view(
+                        self.run_context.scope.tenant_id.as_str(),
+                        user_id.as_str(),
+                    )
+                })
+                .transpose()
+                .map_err(host_api_agent_loop_error)?
+        };
         let workspace_mounts = scoped_workspace.as_ref().unwrap_or(&self.workspace_mounts);
         let mut visible_request = visible_capability_request(
             &self.run_context,
@@ -211,6 +218,17 @@ impl RefreshingCapabilityPort {
                 extension_surface: &extension_surface,
             },
         )?;
+        if self.production_bound {
+            visible_request.context.authenticated_actor_user_id =
+                self.run_context.actor().map(|a| a.user_id.clone());
+            visible_request.context.run_id = Some(ironclaw_host_api::RunId::from_uuid(
+                self.run_context.run_id.as_uuid(),
+            ));
+            visible_request
+                .context
+                .validate()
+                .map_err(host_api_agent_loop_error)?;
+        }
         // Test-support-only synthetic grants (empty in production; see the
         // `additional_capability_grants` doc-comment for the invariant).
         // Overlays network+secrets onto a same-id builtin grant, or inserts
@@ -325,9 +343,9 @@ impl RefreshingCapabilityPort {
         let port = factory.for_run_context(self.run_context.clone());
         let mut synthetic_capabilities = match &self.skill_activation_source {
             Some(skill_activation_source) => {
-                vec![skill_activation_capability(Arc::clone(
-                    skill_activation_source,
-                ))?]
+                vec![skill_activation_capability(
+                    skill_activation_source.clone(),
+                )?]
             }
             None => Vec::new(),
         };
@@ -541,7 +559,8 @@ pub(crate) async fn create_refreshing_capability_port_for_test(
     // Recover the crate-private `ComposedSelectableSkillContextSource` from
     // the opaque `SkillActivationTestSource` handle the harness passed in
     // (see the field's doc-comment on `RefreshingCapabilityPortTestParts`).
-    let skill_activation_source = skill_activation_source.map(|handle| handle.activation_source());
+    let skill_activation_source = skill_activation_source
+        .map(|handle| RuntimeSkillSelector::Local(handle.activation_source()));
 
     create_refreshing_capability_port(RefreshingCapabilityPortConfig {
         runtime,
@@ -550,6 +569,7 @@ pub(crate) async fn create_refreshing_capability_port_for_test(
             std::collections::HashMap::new(),
         )),
         fallback_user_id,
+        production_bound: false,
         policy,
         workspace_mounts,
         skill_mounts,

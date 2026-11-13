@@ -360,6 +360,9 @@ mod tests {
         ) -> Result<CompletionResponse, LlmError> {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             Ok(CompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: "ok".into(),
                 input_tokens: 1,
                 output_tokens: 1,
@@ -375,6 +378,9 @@ mod tests {
             _request: ToolCompletionRequest,
         ) -> Result<ToolCompletionResponse, LlmError> {
             Ok(ToolCompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: Some("ok".into()),
                 tool_calls: vec![],
                 input_tokens: 1,

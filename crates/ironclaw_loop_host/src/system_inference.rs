@@ -119,6 +119,10 @@ where
         &self,
         request: SystemInferenceRequest,
     ) -> Result<SystemInferenceResponse, SystemInferenceError> {
+        let conversation_id = crate::model_conversation::conversation_id(&self.run_context)
+            .map_err(|_| SystemInferenceError::Failed {
+                safe_summary: safe("system inference conversation scope is invalid"),
+            })?;
         if estimate_tokens_from_chars(&request.input_text).as_u64() > request.max_input_tokens {
             return Err(SystemInferenceError::InputTooLarge);
         }
@@ -127,6 +131,8 @@ where
         let system_ref = system_inference_ref(request.task_id.as_uuid(), "system-prompt")?;
         let input_ref = system_inference_ref(request.task_id.as_uuid(), "input")?;
         let model_request = HostManagedModelRequest {
+            thread_id: Some(self.run_context.thread_id.clone()),
+            conversation_id: Some(conversation_id),
             model_profile_id: self
                 .run_context
                 .resolved_run_profile
@@ -484,6 +490,8 @@ mod tests {
         assert_eq!(request.resolved_model_route, context.resolved_model_route);
         assert_eq!(request.run_id, context.run_id);
         assert_eq!(request.turn_id, context.turn_id);
+        // CH-SYSTEM-01: never derive the conversation from system input text.
+        assert_eq!(serde_json::to_value(&request).unwrap()["thread_id"], context.thread_id.to_string());
         assert_eq!(request.surface_version, None);
         assert_eq!(request.messages.len(), 2);
         assert_eq!(
@@ -526,6 +534,47 @@ mod tests {
             .expect_err("policy denial should reject system inference");
 
         assert!(matches!(error, SystemInferenceError::Failed { .. }));
+    }
+
+    // CH-SYSTEM-02: same canonical conversation, different runs; tenants/subjects stay separate.
+    #[tokio::test]
+    async fn conversation_identity_is_stable_and_tenant_subject_scoped() {
+        let mut first = test_run_context("conversation-identity").await;
+        first.llm_subject = Some("fixture-subject-a".into());
+        let mut next_run = first.clone();
+        next_run.run_id = TurnRunId::new();
+        next_run.turn_id = TurnId::new();
+        let mut other_tenant = first.clone();
+        other_tenant.scope.tenant_id = TenantId::new("fixture-other-tenant").unwrap();
+        let mut other_subject = first.clone();
+        other_subject.llm_subject = Some("fixture-subject-b".into());
+        let mut identities = Vec::new();
+        for context in [first, next_run, other_tenant, other_subject] {
+            let gateway = Arc::new(RecordingGateway::new(
+                crate::HostManagedModelResponse::assistant_reply("summary"),
+            ));
+            let port = ModelGatewayBackedSystemInferencePort::new(gateway.clone(), context);
+            port.call_system_inference(system_request("fixture input")).await.unwrap();
+            let request = serde_json::to_value(gateway.request()).unwrap();
+            let id = request["conversation_id"].as_str().expect("trusted conversation identity").to_owned();
+            assert_eq!(id.len(), 64);
+            assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+            identities.push(id);
+        }
+        assert_eq!(identities[0], identities[1]);
+        assert_ne!(identities[0], identities[2]);
+        assert_ne!(identities[0], identities[3]);
+    }
+
+    #[tokio::test]
+    async fn conversation_identity_rejects_inconsistent_run_thread_before_dispatch() {
+        let mut context = test_run_context("conversation-mismatch").await;
+        context.thread_id = ThreadId::new("fixture-other-thread").unwrap();
+        let gateway = Arc::new(RecordingGateway::new(
+            crate::HostManagedModelResponse::assistant_reply("must not dispatch"),
+        ));
+        let port = ModelGatewayBackedSystemInferencePort::new(gateway, context);
+        assert!(port.call_system_inference(system_request("fixture input")).await.is_err());
     }
 
     #[tokio::test]

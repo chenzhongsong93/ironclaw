@@ -288,6 +288,14 @@ impl RootFilesystem for CompositeRootFilesystem {
         self.matching_mount(path)?.backend.tail(path, from).await
     }
 
+    async fn complete_event_prefix(&self,path:&VirtualPath,max_records:usize,max_bytes:usize,max_record_bytes:usize)
+        -> Result<Option<crate::CompleteEventPrefix>,FilesystemError> {
+        self.matching_mount(path)?.backend.complete_event_prefix(path,max_records,max_bytes,max_record_bytes).await
+    }
+    async fn event_log_generation(&self,path:&VirtualPath)->Result<Option<String>,FilesystemError> {
+        self.matching_mount(path)?.backend.event_log_generation(path).await
+    }
+
     async fn tail_bounded(
         &self,
         path: &VirtualPath,

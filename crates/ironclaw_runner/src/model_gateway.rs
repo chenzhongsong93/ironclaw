@@ -279,6 +279,10 @@ struct LoopProgressHostStreamSink {
 
 #[async_trait]
 impl HostManagedModelStreamSink for LoopProgressHostStreamSink {
+    async fn provider_activity(&self) {
+        self.inner.provider_activity().await;
+    }
+
     async fn safe_text_update(&self, safe_text: String) {
         self.inner.model_text_update(safe_text).await;
     }
@@ -447,7 +451,14 @@ where
         let mut completion =
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(model_override);
-        add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
+        add_request_metadata(
+            &mut completion,
+            &model_profile_id,
+            run_id,
+            turn_id,
+            request.thread_id.as_ref(),
+            request.conversation_id.as_deref(),
+        );
         add_llm_subject_metadata(&mut completion, request.llm_subject.as_deref());
 
         complete_model_request(
@@ -492,7 +503,14 @@ where
         let mut completion =
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(model_override);
-        add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
+        add_request_metadata(
+            &mut completion,
+            &model_profile_id,
+            run_id,
+            turn_id,
+            request.thread_id.as_ref(),
+            request.conversation_id.as_deref(),
+        );
         add_llm_subject_metadata(&mut completion, request.llm_subject.as_deref());
 
         complete_model_request(
@@ -537,7 +555,14 @@ where
         let mut completion =
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(model_override);
-        add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
+        add_request_metadata(
+            &mut completion,
+            &model_profile_id,
+            run_id,
+            turn_id,
+            request.thread_id.as_ref(),
+            request.conversation_id.as_deref(),
+        );
         add_llm_subject_metadata(&mut completion, request.llm_subject.as_deref());
 
         let provider_turn_scope = format!(
@@ -587,7 +612,14 @@ where
         let mut completion =
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(model_override);
-        add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
+        add_request_metadata(
+            &mut completion,
+            &model_profile_id,
+            run_id,
+            turn_id,
+            request.thread_id.as_ref(),
+            request.conversation_id.as_deref(),
+        );
         add_llm_subject_metadata(&mut completion, request.llm_subject.as_deref());
 
         let provider_turn_scope = format!(
@@ -764,7 +796,14 @@ where
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(snapshot.route().model_id().to_string());
         validate_provider_model_binding_matches_route(snapshot.route(), provider.as_ref())?;
-        add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
+        add_request_metadata(
+            &mut completion,
+            &model_profile_id,
+            run_id,
+            turn_id,
+            request.thread_id.as_ref(),
+            request.conversation_id.as_deref(),
+        );
         add_llm_subject_metadata(&mut completion, request.llm_subject.as_deref());
         add_route_metadata(&mut completion, &snapshot);
 
@@ -804,7 +843,14 @@ where
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(snapshot.route().model_id().to_string());
         validate_provider_model_binding_matches_route(snapshot.route(), provider.as_ref())?;
-        add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
+        add_request_metadata(
+            &mut completion,
+            &model_profile_id,
+            run_id,
+            turn_id,
+            request.thread_id.as_ref(),
+            request.conversation_id.as_deref(),
+        );
         add_llm_subject_metadata(&mut completion, request.llm_subject.as_deref());
         add_route_metadata(&mut completion, &snapshot);
 
@@ -844,7 +890,14 @@ where
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(snapshot.route().model_id().to_string());
         validate_provider_model_binding_matches_route(snapshot.route(), provider.as_ref())?;
-        add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
+        add_request_metadata(
+            &mut completion,
+            &model_profile_id,
+            run_id,
+            turn_id,
+            request.thread_id.as_ref(),
+            request.conversation_id.as_deref(),
+        );
         add_llm_subject_metadata(&mut completion, request.llm_subject.as_deref());
         add_route_metadata(&mut completion, &snapshot);
 
@@ -889,7 +942,14 @@ where
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(snapshot.route().model_id().to_string());
         validate_provider_model_binding_matches_route(snapshot.route(), provider.as_ref())?;
-        add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
+        add_request_metadata(
+            &mut completion,
+            &model_profile_id,
+            run_id,
+            turn_id,
+            request.thread_id.as_ref(),
+            request.conversation_id.as_deref(),
+        );
         add_llm_subject_metadata(&mut completion, request.llm_subject.as_deref());
         add_route_metadata(&mut completion, &snapshot);
 
@@ -932,7 +992,15 @@ fn add_request_metadata(
     model_profile_id: &ModelProfileId,
     run_id: TurnRunId,
     turn_id: TurnId,
+    thread_id: Option<&ironclaw_host_api::ThreadId>,
+    conversation_id: Option<&str>,
 ) {
+    if let Some(thread_id) = thread_id {
+        completion.metadata.insert("thread_id".to_string(), thread_id.to_string());
+    }
+    if let Some(conversation_id) = conversation_id {
+        completion.metadata.insert("conversation_id".to_string(), conversation_id.to_owned());
+    }
     completion.metadata.insert(
         "model_profile_id".to_string(),
         model_profile_id.as_str().to_string(),
@@ -1179,6 +1247,10 @@ impl ProviderStreamSink {
 
 #[async_trait]
 impl CompletionStreamSink for ProviderStreamSink {
+    async fn provider_activity(&self) {
+        self.inner.provider_activity().await;
+    }
+
     async fn text_delta(&self, delta: String) {
         if delta.is_empty() {
             return;
@@ -1220,85 +1292,30 @@ impl CompletionStreamSink for ProviderStreamSink {
     }
 }
 
-/// 可观测性切片 1(2026-08-26):模型交换全文按 run 落 trace 文件。
-/// provider_turn_scope 形如 run=.../turn=.../model_call=n;request 事件在
-/// dispatch 前写(克隆序列化),response 事件在两个返回点旁写。best-effort。
-/// 增量记录(2026-08-27 冗余治理:实测 22 次请求 94% 消息重复,全量存单 run 15MB):
-/// 每个 (run,model_call 序号) 只存与上次的 diff——新增消息全文 + 历史前缀引用
-/// (`messages_base_n`:引用同 run 内第 n 次 model_request 的事件序号,dossier
-/// 端点按引用链重建完整视图)。system 与首条消息每 run 首次全量。
+/// 每次模型请求独立写base0完整消息；原slim内容库仍按消息CAS去重。
+/// 不以OS线程局部或跨run序号引用逻辑run历史，重试与任务换线程不丢前缀。
 fn trace_model_request_event(
     provider_turn_scope: Option<&str>,
     provider_id: &str,
     completion: &CompletionRequest,
 ) {
     use ironclaw_common::run_trace::append_trace_event_slim;
-    use std::cell::RefCell;
-    thread_local! {
-        /// (run_id → 上次请求的完整 messages JSON)——同 run 增量对比用
-        static LAST_MESSAGES: RefCell<Vec<(String, serde_json::Value, u32)>> =
-            const { RefCell::new(Vec::new()) };
-    }
     let (run, turn) = parse_provider_turn_scope(provider_turn_scope);
     let all = serde_json::to_value(&completion.messages).unwrap_or(serde_json::json!([]));
-    let seq = LAST_MESSAGES.with(|lm| {
-        let mut lm = lm.borrow_mut();
-        let seq = lm.len() as u32 + 1;
-        if let Some((_, prev, _)) = lm.iter().rev().find(|(r, _, _)| r == &run) {
-            // 增量:找公共前缀长度
-            let prev_arr = prev.as_array().cloned().unwrap_or_default();
-            let cur_arr = all.as_array().cloned().unwrap_or_default();
-            let mut common = 0;
-            for (a, b) in prev_arr.iter().zip(cur_arr.iter()) {
-                if a == b {
-                    common += 1;
-                } else {
-                    break;
-                }
-            }
-            let new_msgs: Vec<_> = cur_arr[common.min(cur_arr.len())..].to_vec();
-            let (prefix_ref, prev_seq) = lm
-                .iter()
-                .rev()
-                .find(|(r, _, _)| r == &run)
-                .map(|(_, _, s)| (common > 0, *s))
-                .unwrap_or((false, 0));
-            append_trace_event_slim(
-                "model_request",
-                &run,
-                None,
-                turn.as_deref(),
-                serde_json::json!({
-                    "provider_id": provider_id,
-                    "model": completion.model,
-                    "max_tokens": completion.max_tokens,
-                    // 引用:同 run 第 prev_seq 次请求的前 common 条为历史前缀
-                    "messages_base_seq": if prefix_ref { prev_seq } else { 0 },
-                    "messages_base_count": common,
-                    "new_messages": new_msgs,
-                }),
-            );
-        } else {
-            // 该 run 首次请求:全量
-            append_trace_event_slim(
-                "model_request",
-                &run,
-                None,
-                turn.as_deref(),
-                serde_json::json!({
-                    "provider_id": provider_id,
-                    "model": completion.model,
-                    "max_tokens": completion.max_tokens,
-                    "messages_base_seq": 0,
-                    "messages_base_count": 0,
-                    "new_messages": all,
-                }),
-            );
-        }
-        lm.push((run.clone(), all, seq));
-        seq
-    });
-    let _ = seq;
+    append_trace_event_slim(
+        "model_request",
+        &run,
+        None,
+        turn.as_deref(),
+        serde_json::json!({
+            "provider_id": provider_id,
+            "model": completion.model,
+            "max_tokens": completion.max_tokens,
+            "messages_base_seq": 0,
+            "messages_base_count": 0,
+            "new_messages": all,
+        }),
+    );
 }
 
 fn trace_model_response_event(
@@ -1661,6 +1678,9 @@ fn recover_textual_tool_calls_from_tool_response(
         "reborn model gateway recovered capability calls from textual provider response"
     );
     Ok(ToolCompletionResponse {
+        normalization_version: None,
+        normalized_input_tokens: None,
+        cache_details_observed: None,
         content: Some(clean_response(content)),
         tool_calls: recovered_tool_calls,
         input_tokens: response.input_tokens,
@@ -1722,18 +1742,18 @@ async fn tool_response_to_host(
             content_bytes = response.content.as_ref().map(|content| content.len()).unwrap_or(0),
             "reborn model gateway received tool-capable provider response"
         );
-        trace_model_response_event(
-            Some(provider_turn_scope),
-            &replay_identity.provider_id,
-            serde_json::json!(format!("{:?}", response.finish_reason)),
-            &response
-                .content
-                .as_ref()
-                .and_then(|c| serde_json::to_value(c).ok())
-                .unwrap_or(serde_json::json!(null)),
-            serde_json::to_value(&response.tool_calls).unwrap_or(serde_json::json!([])),
-        );
     }
+    trace_model_response_event(
+        Some(provider_turn_scope),
+        &replay_identity.provider_id,
+        serde_json::json!(format!("{:?}", response.finish_reason)),
+        &response
+            .content
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok())
+            .unwrap_or(serde_json::json!(null)),
+        serde_json::to_value(&response.tool_calls).unwrap_or(serde_json::json!([])),
+    );
     if !response.tool_calls.is_empty()
         && matches!(
             response.finish_reason,
@@ -1751,6 +1771,9 @@ async fn tool_response_to_host(
                 response.reasoning,
             )
             .with_usage(LoopModelUsage {
+                normalization_version: response.normalization_version,
+                normalized_input_tokens: response.normalized_input_tokens,
+                cache_details_observed: response.cache_details_observed,
                 input_tokens: response.input_tokens,
                 output_tokens: response.output_tokens,
                 cache_read_input_tokens: response.cache_read_input_tokens,
@@ -1836,6 +1859,9 @@ async fn tool_response_to_host(
             response.reasoning,
         )
         .with_usage(LoopModelUsage {
+            normalization_version: response.normalization_version,
+            normalized_input_tokens: response.normalized_input_tokens,
+            cache_details_observed: response.cache_details_observed,
             input_tokens: response.input_tokens,
             output_tokens: response.output_tokens,
             cache_read_input_tokens: response.cache_read_input_tokens,
@@ -1861,6 +1887,9 @@ async fn tool_response_to_host(
                 response.reasoning,
             )
             .with_usage(LoopModelUsage {
+                normalization_version: response.normalization_version,
+                normalized_input_tokens: response.normalized_input_tokens,
+                cache_details_observed: response.cache_details_observed,
                 input_tokens: response.input_tokens,
                 output_tokens: response.output_tokens,
                 cache_read_input_tokens: response.cache_read_input_tokens,
@@ -2181,6 +2210,9 @@ fn response_to_host_reply(
     response: CompletionResponse,
 ) -> Result<HostManagedModelResponse, HostManagedModelError> {
     let usage = LoopModelUsage {
+        normalization_version: response.normalization_version,
+        normalized_input_tokens: response.normalized_input_tokens,
+        cache_details_observed: response.cache_details_observed,
         input_tokens: response.input_tokens,
         output_tokens: response.output_tokens,
         cache_read_input_tokens: response.cache_read_input_tokens,
@@ -2713,6 +2745,14 @@ fn map_provider_error(error: LlmError) -> HostManagedModelError {
         .safe_with_detail(provider_detail.clone());
     }
     match error {
+        LlmError::PolicyDenied { .. } => HostManagedModelError::safe(
+            HostManagedModelErrorKind::PolicyDenied,
+            "model request was denied by provider policy",
+        ),
+        LlmError::InvalidRequest { .. } => HostManagedModelError::safe(
+            HostManagedModelErrorKind::ConfigurationError,
+            "model request metadata or headers are invalid",
+        ),
         LlmError::ContextLengthExceeded { .. } => HostManagedModelError::safe(
             HostManagedModelErrorKind::BudgetExceeded,
             "model request exceeded its context budget",
@@ -2786,6 +2826,9 @@ mod tests {
             _request: CompletionRequest,
         ) -> Result<CompletionResponse, LlmError> {
             Ok(CompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: self.name.to_string(),
                 input_tokens: 0,
                 output_tokens: 0,
@@ -2800,6 +2843,9 @@ mod tests {
             _request: ToolCompletionRequest,
         ) -> Result<ToolCompletionResponse, LlmError> {
             Ok(ToolCompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: Some(self.name.to_string()),
                 tool_calls: Vec::new(),
                 input_tokens: 0,
@@ -3383,6 +3429,9 @@ mod tests {
         };
 
         let response = ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: Some(
                 "Searching now.\nto=demo__echo weirdjson\n{\"message\":\"hello\"}".to_string(),
             ),
@@ -3461,6 +3510,9 @@ mod tests {
         };
 
         let response = ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: Some("Calling tool.".to_string()),
             tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),
@@ -3526,6 +3578,45 @@ mod tests {
         assert!(
             unavailable_requested_capability_guard(&messages, &tools).is_none(),
             "guard must not misfire on the decimal `0.95`"
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "model_gateway_trace_tests.rs"]
+mod trace_base0_tests;
+
+#[cfg(test)]
+mod normalized_sidecar_tests {
+    use super::*;
+    #[test]
+    fn actual_host_conversion_keeps_original_four_and_normalized_sidecar() {
+        let response = CompletionResponse {
+            content: "ok".into(),
+            input_tokens: 2,
+            output_tokens: 3,
+            cache_read_input_tokens: 7,
+            cache_creation_input_tokens: 100,
+            normalization_version: Some(1),
+            normalized_input_tokens: Some(109),
+            cache_details_observed: Some(true),
+            finish_reason: FinishReason::Stop,
+            reasoning: None,
+        };
+        let host = response_to_host_reply(response).unwrap();
+        let usage = host.usage.unwrap();
+        assert_eq!(
+            (
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_input_tokens,
+                usage.cache_creation_input_tokens
+            ),
+            (2, 3, 7, 100)
+        );
+        assert_eq!(
+            (usage.normalization_version, usage.normalized_input_tokens),
+            (Some(1), Some(109))
         );
     }
 }

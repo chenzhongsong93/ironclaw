@@ -36,11 +36,20 @@ pub mod identity_context;
 mod input_port;
 mod input_queue;
 mod model_capability_view;
+mod model_conversation;
 mod prompt_context_budget;
 mod pinned_role_bundle;
 mod skill_bundle_context_source;
 mod skill_bundle_source;
 mod skill_context;
+mod opaque_prompt_input;
+pub use opaque_prompt_input::{
+    HostSpawnInputFacts, OpaquePromptInputReceipt, OpaquePromptInputMaterial,
+    SubagentOpaqueInputPort, OpaquePromptInputBackend,
+    OpaquePromptInputOutcome, OpaquePromptInputRecord, OpaquePromptInputRecoveredMaterial,
+    OpaqueBackedSubagentPromptMaterialSource,
+    OpaquePromptInputHostServices, OpaquePromptInputBackendFactory, FactoryOpaquePromptInputBackend,
+};
 mod subagent_prompt_port;
 mod subagent_spawn_port;
 mod system_inference;
@@ -375,6 +384,47 @@ impl<S> LoopContextPort for ThreadBackedLoopContextPort<S>
 where
     S: SessionThreadService + ?Sized + Send + Sync,
 {
+    async fn read_host_product_command(&self) -> Result<String, AgentLoopHostError> {
+        use ironclaw_turns::run_profile::PrivilegedRunProfileDimension;
+
+        validate_thread_scope_for_run(&self.thread_scope, &self.run_context)?;
+        let context = &self.run_context;
+        let denied = || AgentLoopHostError::new(
+            AgentLoopHostErrorKind::InvalidInvocation,
+            "host product command requires an exact privileged owner run",
+        );
+        if !context.resolved_run_profile.provenance.effective_privileges
+            .contains(&PrivilegedRunProfileDimension::SpecialDriver)
+            || !context.actor().is_some_and(|actor| {
+                context.scope.explicit_owner_user_id() == Some(&actor.user_id)
+            })
+        {
+            return Err(denied());
+        }
+        let accepted = context.accepted_message_ref.as_ref()
+            .and_then(|reference| reference.as_str().strip_prefix("msg:"))
+            .ok_or_else(denied)?;
+        let message_id = ThreadMessageId::parse(accepted).map_err(|_| denied())?;
+        let stored = self.thread_service.load_context_messages(LoadContextMessagesRequest {
+            scope: self.thread_scope.clone(),
+            thread_id: context.thread_id.clone(),
+            message_ids: vec![message_id],
+        }).await.map_err(context_read_error)?;
+        let [message] = stored.messages.as_slice() else {
+            return Err(denied());
+        };
+        if stored.thread_id != context.thread_id
+            || message.message_id != Some(message_id)
+            || message.kind != MessageKind::User
+            || !message.image_attachments.is_empty()
+            || message.content.is_empty()
+            || message.content.len() > 8 * 1024
+        {
+            return Err(denied());
+        }
+        Ok(message.content.clone())
+    }
+
     async fn load_loop_context(
         &self,
         request: LoopContextRequest,
@@ -1166,6 +1216,7 @@ where
         request: LoopModelRequest,
     ) -> Result<LoopModelResponse, AgentLoopHostError> {
         validate_thread_scope_for_run(&self.thread_scope, &self.run_context)?;
+        let conversation_id = model_conversation::conversation_id(&self.run_context)?;
         let requested_model_profile_id = request.model_preference.clone();
         let model_profile_id = requested_model_profile_id.clone().unwrap_or_else(|| {
             self.run_context
@@ -1200,6 +1251,8 @@ where
         self.emit_model_started(requested_model_profile_id).await;
         let host_request = HostManagedModelRequest {
             model_profile_id: model_profile_id.clone(),
+            thread_id: Some(self.run_context.thread_id.clone()),
+            conversation_id: Some(conversation_id),
             messages: resolved_messages,
             surface_version: request.surface_version.clone(),
             resolved_model_route: self.run_context.resolved_model_route.clone(),
@@ -1653,11 +1706,18 @@ pub trait HostManagedModelGateway: Send + Sync {
 #[async_trait::async_trait]
 pub trait HostManagedModelStreamSink: Send + Sync {
     async fn safe_text_update(&self, safe_text: String);
+    async fn provider_activity(&self) {}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostManagedModelRequest {
     pub model_profile_id: ModelProfileId,
+    /// Trusted host thread identity; legacy serialized requests may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<ironclaw_host_api::ThreadId>,
+    /// Scope-derived opaque routing/cache identity, never authorization or a credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
     pub messages: Vec<HostManagedModelMessage>,
     pub surface_version: Option<CapabilitySurfaceVersion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -23,9 +23,29 @@ pub enum LlmConfigError {
 /// so error mapping must fail fast instead of riding an availability backoff.
 pub const UNCONFIGURED_PROVIDER_ID: &str = "unconfigured";
 
+/// Fixed provider policy reasons for an explicit request-scope stop report.
+/// This reports the configured endpoint's refusal, not settled account credit or cash.
+/// Never populated from an upstream message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ProviderPolicyDeniedReason {
+    #[error("permission_denied")]
+    PermissionDenied,
+}
+
 /// LLM provider errors.
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
+    #[error("Provider {provider} denied the request: {reason}")]
+    PolicyDenied {
+        provider: String,
+        reason: ProviderPolicyDeniedReason,
+    },
+
+    /// Local request/configuration validation; never an availability retry or failover.
+    /// Codes are fixed source enums, not metadata values or raw header errors.
+    #[error("Provider {provider} rejected local request: {code}")]
+    InvalidRequest { provider: String, code: &'static str },
+
     #[error("Provider {provider} request failed: {reason}")]
     RequestFailed { provider: String, reason: String },
 

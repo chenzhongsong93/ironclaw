@@ -10156,6 +10156,9 @@ async fn get_run_state_surfaces_token_usage_and_priced_cost() {
     // the token counts and a USD cost priced from the shared cost table.
     coordinator.set_run_state_usage(
         LoopModelUsage {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             input_tokens: 1_000,
             output_tokens: 500,
             cache_read_input_tokens: 0,
@@ -10219,6 +10222,9 @@ async fn get_run_state_prices_default_model_run_against_active_model() {
     // model so the run is still priced instead of reporting `usage` with no
     // `cost`.
     coordinator.set_run_state_usage_default_model(LoopModelUsage {
+        normalization_version: None,
+        normalized_input_tokens: None,
+        cache_details_observed: None,
         input_tokens: 1_000,
         output_tokens: 500,
         cache_read_input_tokens: 0,
@@ -10266,6 +10272,9 @@ async fn get_run_state_prices_default_model_run_against_active_model() {
 async fn get_run_state_default_model_run_omits_cost_without_active_model() {
     let coordinator = Arc::new(FakeTurnCoordinator::default());
     coordinator.set_run_state_usage_default_model(LoopModelUsage {
+        normalization_version: None,
+        normalized_input_tokens: None,
+        cache_details_observed: None,
         input_tokens: 1_000,
         output_tokens: 500,
         cache_read_input_tokens: 0,

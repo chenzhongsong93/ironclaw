@@ -422,6 +422,12 @@ pub use hosted_mcp_discovery::{
     HostedMcpDiscoveredTool, HostedMcpDiscoveredToolAnnotations, is_hosted_http_mcp_package,
     package_with_discovered_hosted_mcp_tools,
 };
+/// Pure loopback metadata conversion consumed by composition's verified Root
+/// discovery path; caller tests live in extension_host::mcp and extension_lifecycle,
+/// and metadata invariants in hosted_mcp_discovery::tests. This grants no IO/authority.
+pub use hosted_mcp_discovery::{
+    is_host_bundled_loopback_http_mcp_package, package_with_discovered_loopback_http_mcp_tools,
+};
 pub use v2::{
     CapabilityDeclV2, CapabilityVisibility, ExtensionManifestV2, ExtensionRuntimeV2,
     HookSectionEntryV2, HostApiContractRegistry, HostApiId, HostApiManifestContext,

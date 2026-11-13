@@ -245,15 +245,30 @@ impl ProjectService for RebornProjectService {
             ProjectRole::Viewer,
         )
         .await?;
-        let members = self
+        let project = self
+            .repository
+            .get_project(&caller.tenant_id, &project_id)
+            .await
+            .map_err(map_repo_error)?
+            .ok_or(ProjectServiceError::NotFound)?;
+        let mut members = self
             .repository
             .list_members(&caller.tenant_id, &project_id)
             .await
-            .map_err(map_repo_error)?
-            .into_iter()
-            .map(member_info)
-            .collect();
-        Ok(RebornListMembersResponse { members })
+            .map_err(map_repo_error)?;
+        // 产品成员视图包含领域定义的standing owner；repository仍只列显式grant。
+        // owner权限来自project本身，异常显式owner行不能撤销、降权或重复该权限。
+        let owner = project.owner_membership();
+        members.retain(|member| member.user_id != owner.user_id);
+        members.push(owner);
+        members.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.user_id.as_str().cmp(b.user_id.as_str()))
+        });
+        Ok(RebornListMembersResponse {
+            members: members.into_iter().map(member_info).collect(),
+        })
     }
 
     async fn add_member(
@@ -675,3 +690,7 @@ mod tests {
         assert_eq!(response.project.role, RebornProjectRole::Owner);
     }
 }
+
+#[cfg(test)]
+#[path = "project_standing_owner_tests.rs"]
+mod standing_owner_tests;

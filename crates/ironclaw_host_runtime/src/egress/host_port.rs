@@ -453,6 +453,7 @@ mod tests {
 
     fn network_policy() -> NetworkPolicy {
         NetworkPolicy {
+            deny_redirects: false,
             allowed_targets: vec![NetworkTargetPattern {
                 scheme: Some(NetworkScheme::Https),
                 host_pattern: "api.example.test".to_string(),

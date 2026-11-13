@@ -3223,6 +3223,9 @@ mod tests {
                 _request: ironclaw_llm::CompletionRequest,
             ) -> Result<ironclaw_llm::CompletionResponse, crate::error::LlmError> {
                 Ok(ironclaw_llm::CompletionResponse {
+                    normalization_version: None,
+                    normalized_input_tokens: None,
+                    cache_details_observed: None,
                     content: "ok".to_string(),
                     input_tokens: 0,
                     output_tokens: 0,
@@ -3238,6 +3241,9 @@ mod tests {
                 _request: ironclaw_llm::ToolCompletionRequest,
             ) -> Result<ironclaw_llm::ToolCompletionResponse, crate::error::LlmError> {
                 Ok(ironclaw_llm::ToolCompletionResponse {
+                    normalization_version: None,
+                    normalized_input_tokens: None,
+                    cache_details_observed: None,
                     content: Some("ok".to_string()),
                     tool_calls: Vec::new(),
                     input_tokens: 0,
@@ -3366,6 +3372,9 @@ mod tests {
             _request: ironclaw_llm::CompletionRequest,
         ) -> Result<ironclaw_llm::CompletionResponse, crate::error::LlmError> {
             Ok(ironclaw_llm::CompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: "unused".to_string(),
                 input_tokens: 0,
                 output_tokens: 0,
@@ -3383,6 +3392,9 @@ mod tests {
             let call = self.calls.fetch_add(1, Ordering::Relaxed);
             if call == 0 {
                 return Ok(ironclaw_llm::ToolCompletionResponse {
+                    normalization_version: None,
+                    normalized_input_tokens: None,
+                    cache_details_observed: None,
                     content: None,
                     tool_calls: vec![ToolCall {
                         id: "call_img_0".to_string(),
@@ -3403,6 +3415,9 @@ mod tests {
             }
 
             Ok(ironclaw_llm::ToolCompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: Some(
                     "已生成小猫图片：\n\n![小猫](/mnt/data/generated_image.jpg)".to_string(),
                 ),

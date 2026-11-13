@@ -215,6 +215,7 @@ impl Drop for LiveLoopbackHttpServer {
 #[allow(dead_code)] // Shared test support; consumed outside support_unit_tests.
 pub fn loopback_http_policy(port: u16) -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Http),
             host_pattern: "127.0.0.1".to_string(),

@@ -28,3 +28,7 @@ pub use url_target::{
     NetworkTargetUrlError, is_rfc3986_unreserved_segment, network_target_for_url,
     percent_decode_url_component_lossy,
 };
+
+/// Compiled protocol version for the host-mediated typed deny-redirect constraint.
+/// This identifier does not establish native/source provenance or runtime readiness.
+pub fn host_http_egress_protocol_version()->&'static str {"network-policy-deny-redirect/1"}

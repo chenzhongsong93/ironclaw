@@ -961,6 +961,9 @@ mod tests {
             resolved_run_profile_version: RunProfileVersion::new(1),
             resolved_model_route: None,
             model_usage: Some(crate::run_profile::LoopModelUsage {
+                normalization_version: Some(1),
+                normalized_input_tokens: Some(1234),
+                cache_details_observed: Some(true),
                 input_tokens: 1234,
                 output_tokens: 567,
                 cache_read_input_tokens: 0,
@@ -983,6 +986,13 @@ mod tests {
         let usage = event.model_usage.expect("terminal event carries usage");
         assert_eq!(usage.input_tokens, 1234);
         assert_eq!(usage.output_tokens, 567);
+        assert_eq!(
+            (usage.normalization_version, usage.normalized_input_tokens),
+            (Some(1), Some(1234))
+        );
+        let encoded = serde_json::to_vec(&event).unwrap();
+        let decoded: TurnLifecycleEvent = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.model_usage, event.model_usage);
     }
 
     #[test]

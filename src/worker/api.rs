@@ -246,6 +246,9 @@ impl WorkerHttpClient {
             .await?;
 
         Ok(CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: proxy_resp.content,
             input_tokens: proxy_resp.input_tokens,
             output_tokens: proxy_resp.output_tokens,
@@ -276,6 +279,9 @@ impl WorkerHttpClient {
             .await?;
 
         Ok(ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: proxy_resp.content,
             tool_calls: proxy_resp.tool_calls,
             input_tokens: proxy_resp.input_tokens,

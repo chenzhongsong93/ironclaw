@@ -538,6 +538,22 @@ async fn session_minted_via_oauth_callback_authenticates_protected_v2_route() {
     assert_eq!(logout.status(), StatusCode::NO_CONTENT);
     assert_eq!(session_store.len(), 0, "session must be revoked");
 
+    let run_path = "/api/webchat/v2/threads/thread-x/runs/123e4567-e89b-12d3-a456-426614174000";
+    for token in [None, Some(bearer.as_str())] {
+        let request = Request::builder().method(Method::GET).uri(run_path);
+        let request = if let Some(token) = token {
+            request.header(header::AUTHORIZATION, format!("Bearer {token}"))
+        } else {
+            request
+        };
+        let response = app
+            .clone()
+            .oneshot(with_peer(request.body(Body::empty()).expect("request")))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     let post_logout = app
         .oneshot(with_peer(
             Request::builder()

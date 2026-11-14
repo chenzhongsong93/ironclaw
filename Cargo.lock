@@ -4693,6 +4693,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "url",
  "uuid",
 ]
@@ -5239,6 +5240,7 @@ dependencies = [
  "ironclaw_host_runtime",
  "ironclaw_llm",
  "ironclaw_loop_host",
+ "ironclaw_mcp",
  "ironclaw_observability",
  "ironclaw_processes",
  "ironclaw_reborn_event_store",
@@ -5254,6 +5256,7 @@ dependencies = [
  "jsonschema",
  "libsql",
  "parking_lot",
+ "reqwest 0.12.28",
  "rust_decimal",
  "secrecy",
  "serde",

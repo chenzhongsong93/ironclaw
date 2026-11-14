@@ -8,8 +8,8 @@ use ironclaw_host_api::{AgentId, ProjectId, RuntimeCredentialAuthRequirement, Te
 use crate::{
     AcceptedMessageRef, AdmissionRejection, CancelRunRequest, CancelRunResponse,
     CapabilityActivityId, GateRef, GetRunStateRequest, IdempotencyKey, LoopCheckpointRecord,
-    ReplyTargetBindingRef, ResumeTurnRequest, ResumeTurnResponse, RetryTurnRequest,
-    RetryTurnResponse, RunProfileResolver, SourceBindingRef, SubmitChildRunRequest,
+    RecoverTurnRequest, ReplyTargetBindingRef, ResumeTurnRequest, ResumeTurnResponse,
+    RetryTurnRequest, RetryTurnResponse, RunProfileResolver, SourceBindingRef, SubmitChildRunRequest,
     SubmitTurnRequest, SubmitTurnResponse, ThreadBusy, TurnActiveRunRefState, TurnActor,
     TurnAdmissionPolicy, TurnAdmissionReservationRecord, TurnCapacityResource, TurnCheckpointId,
     TurnError, TurnErrorCategory, TurnId, TurnLeaseToken, TurnLifecycleEvent, TurnRunId,
@@ -33,6 +33,18 @@ pub trait TurnStateStore: Send + Sync {
     ) -> Result<ResumeTurnResponse, TurnError>;
 
     async fn retry_turn(&self, request: RetryTurnRequest) -> Result<RetryTurnResponse, TurnError>;
+
+    /// Re-drive an exact failed special-driver root in place.
+    ///
+    /// Stores that do not implement this narrow recovery protocol fail closed.
+    async fn recover_turn(
+        &self,
+        request: RecoverTurnRequest,
+    ) -> Result<ResumeTurnResponse, TurnError> {
+        Err(TurnError::RunNotRetryable {
+            run_id: request.run_id,
+        })
+    }
 
     async fn request_cancel(
         &self,

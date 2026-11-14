@@ -452,6 +452,9 @@ mod tests {
             sink.text_delta("Hel".to_string()).await;
             sink.text_delta("lo".to_string()).await;
             Ok(CompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: "Hello".to_string(),
                 finish_reason: FinishReason::Stop,
                 input_tokens: 1,
@@ -480,6 +483,9 @@ mod tests {
             sink.text_delta("Too".to_string()).await;
             sink.text_delta("ls".to_string()).await;
             Ok(ToolCompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: Some("Tools".to_string()),
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,

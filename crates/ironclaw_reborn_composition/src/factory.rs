@@ -1,4 +1,4 @@
-// arch-exempt: large_file, needs Reborn composition helper extraction, plan #4469
+// arch-exempt: large_file, project repository private mount stays at existing assembly seam; helper extraction remains tracked, plan #4469
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
@@ -436,6 +436,7 @@ where
 fn attach_hosted_mcp_runtime<F, G, S, R>(
     services: HostRuntimeServices<F, G, S, R>,
     allow_local_mcp: bool,
+    allow_hosted_local_mcp: bool,
 ) -> Result<HostRuntimeServices<F, G, S, R>, RebornBuildError>
 where
     F: ironclaw_filesystem::RootFilesystem + 'static,
@@ -443,9 +444,6 @@ where
     S: ironclaw_processes::ProcessStore + 'static,
     R: ironclaw_processes::ProcessResultStore + 'static,
 {
-    // Soft-disable when host runtime HTTP egress is absent. Builds without
-    // egress — in-memory test services, minimal compositions — must still
-    // succeed; only hosted MCP capabilities go dark.
     let Some(runtime_ports) = services.product_auth_provider_runtime_ports() else {
         tracing::debug!(
             "skipping hosted MCP runtime: host runtime HTTP egress absent \
@@ -455,12 +453,77 @@ where
     };
     let runtime_http_egress = runtime_ports.runtime_http_egress();
     let registry = services.shared_extension_registry();
-
     Ok(services.with_mcp_runtime(Arc::new(hosted_http_mcp_runtime(
         registry,
         runtime_http_egress,
         allow_local_mcp,
+        allow_hosted_local_mcp,
     ))))
+}
+
+fn attach_hosted_mcp_runtime_with_store<F, G, S, R>(
+    services: HostRuntimeServices<F, G, S, R>,
+    operator_admission: Arc<crate::operator_late_admission::OperatorLateAdmissionStore>,
+    allow_local_mcp: bool,
+    allow_hosted_local_mcp: bool,
+) -> Result<HostRuntimeServices<F, G, S, R>, RebornBuildError>
+where
+    F: ironclaw_filesystem::RootFilesystem + 'static,
+    G: ironclaw_resources::ResourceGovernor + 'static,
+    S: ironclaw_processes::ProcessStore + 'static,
+    R: ironclaw_processes::ProcessResultStore + 'static,
+{
+    let Some(runtime_ports) = services.product_auth_provider_runtime_ports() else {
+        tracing::debug!(
+            "skipping hosted MCP runtime: host runtime HTTP egress absent \
+             (only affects hosted MCP extensions, e.g. Notion, NEAR AI)"
+        );
+        return Ok(services);
+    };
+    let runtime = crate::extension_host::mcp::hosted_http_mcp_runtime_with_store(
+        services.shared_extension_registry(),
+        runtime_ports.runtime_http_egress(),
+        operator_admission,
+        allow_local_mcp,
+        allow_hosted_local_mcp,
+    )
+    .map_err(|error| RebornBuildError::InvalidConfig {
+        reason: format!("hosted MCP operator admission wiring failed: {error}"),
+    })?;
+    Ok(services.with_mcp_runtime(Arc::new(runtime)))
+}
+
+fn attach_production_hosted_mcp_runtime<F, G, S, R>(
+    services: HostRuntimeServices<F, G, S, R>,
+    bundles: &[Arc<crate::RebornHostExtensionBundle>],
+    actual_validated_runtime_tenant: &ironclaw_host_api::TenantId,
+    operator_store: Arc<crate::operator_late_admission::OperatorLateAdmissionStore>,
+) -> Result<HostRuntimeServices<F, G, S, R>, RebornBuildError>
+where
+    F: ironclaw_filesystem::RootFilesystem + 'static,
+    G: ironclaw_resources::ResourceGovernor + 'static,
+    S: ironclaw_processes::ProcessStore + 'static,
+    R: ironclaw_processes::ProcessResultStore + 'static,
+{
+    let Some(ports) = services.product_auth_provider_runtime_ports() else {
+        if bundles.is_empty() {
+            return Ok(services);
+        }
+        return Err(RebornBuildError::InvalidConfig {
+            reason: "configured Production HostBundle requires actual runtime HTTP egress".into(),
+        });
+    };
+    let runtime = crate::extension_host::mcp::hosted_http_mcp_runtime_with_late_store(
+        services.shared_extension_registry(),
+        ports.runtime_http_egress(),
+        bundles,
+        actual_validated_runtime_tenant,
+        operator_store,
+    )
+    .map_err(|error| RebornBuildError::InvalidConfig {
+        reason: format!("Production operator MCP binding failed: {error}"),
+    })?;
+    Ok(services.with_mcp_runtime(Arc::new(runtime)))
 }
 
 fn attach_wasm_runtime<F, G, S, R>(
@@ -971,6 +1034,7 @@ fn active_extension_network_policy_for_test(
         });
     }
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: targets,
         deny_private_ip_ranges: true,
         max_egress_bytes: is_web_access_exa_mcp.then_some(NETWORK_EGRESS_LIMIT),
@@ -1105,6 +1169,13 @@ pub(crate) struct RebornRuntimeSubstrate {
     // wiring need scoped storage/registry ownership before this is reused
     // outside local-dev composition. Tracked in #4091.
     pub(crate) extension_management: Option<Arc<RebornLocalExtensionManagementPort>>,
+    /// Same-runtime Root admission state shared by the local extension lifecycle
+    /// manager and the hosted MCP egress planner.
+    pub(crate) operator_admission:
+        Option<Arc<crate::operator_late_admission::OperatorLateAdmissionStore>>,
+    /// Product lifecycle facade used only by the trusted startup admission path.
+    pub(crate) lifecycle_facade:
+        Option<Arc<dyn ironclaw_product_workflow::LifecycleProductFacade>>,
     /// Late-binding slot for the per-caller channel-connection facade. Created
     /// empty here and shared with the extension-lifecycle capability handler so
     /// an inbound-channel activation can check whether the caller has already
@@ -1158,7 +1229,19 @@ pub(crate) struct RebornProductionRuntimeStoreGraph<F>
 where
     F: RootFilesystem + 'static,
 {
+    // Private typed ports over the same production identity tree and secret substrate.
+    user_directory: Arc<dyn ironclaw_reborn_identity::RebornUserDirectory>,
+    identity_resolver: Arc<dyn ironclaw_reborn_identity::RebornIdentityResolver>,
+    admin_secret_provisioner: Arc<dyn crate::admin_secrets::AdminSecretProvisioner>,
     pub(crate) scoped_filesystem: Arc<ScopedFilesystem<F>>,
+    // 正式project facade只存在composition；repository/权限mount不公开给SDK。
+    pub(crate) project_service: Arc<dyn ProjectService>,
+    // 同Host registry的正式生命周期高层facade；一次late-bind，失败不降Local。
+    lifecycle_facade: OnceLock<Arc<dyn ironclaw_product_workflow::LifecycleProductFacade>>,
+    _host_extension_bundles: Vec<Arc<crate::RebornHostExtensionBundle>>,
+    operator_admission: Arc<crate::operator_late_admission::OperatorLateAdmissionStore>,
+    pub(crate) normal_capability_binding:
+        OnceLock<crate::runtime::production_dynamic_capability::ProductionNormalCapabilityBinding>,
     /// Registry used by the production host runtime for extension descriptors.
     #[allow(dead_code)]
     pub(crate) extension_registry: Arc<ExtensionRegistry>,
@@ -1192,6 +1275,119 @@ impl RebornProductionRuntimeServices {
         }
     }
 
+    pub(crate) fn user_directory(&self) -> Arc<dyn ironclaw_reborn_identity::RebornUserDirectory> {
+        match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(graph) => Arc::clone(&graph.user_directory),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(graph) => Arc::clone(&graph.user_directory),
+        }
+    }
+
+    pub(crate) fn identity_resolver(
+        &self,
+    ) -> Arc<dyn ironclaw_reborn_identity::RebornIdentityResolver> {
+        match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(graph) => Arc::clone(&graph.identity_resolver),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(graph) => Arc::clone(&graph.identity_resolver),
+        }
+    }
+
+    pub(crate) fn admin_secret_provisioner(
+        &self,
+    ) -> Arc<dyn crate::admin_secrets::AdminSecretProvisioner> {
+        match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(graph) => Arc::clone(&graph.admin_secret_provisioner),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(graph) => Arc::clone(&graph.admin_secret_provisioner),
+        }
+    }
+
+    pub(crate) fn normal_capability_binding(
+        &self,
+    ) -> Result<
+        crate::runtime::production_dynamic_capability::ProductionNormalCapabilityBinding,
+        RebornBuildError,
+    > {
+        let slot = match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(g) => &g.normal_capability_binding,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(g) => &g.normal_capability_binding,
+        };
+        slot.get()
+            .cloned()
+            .ok_or_else(|| RebornBuildError::InvalidConfig {
+                reason: "Production normal capability binding was not initialized".into(),
+            })
+    }
+    pub(crate) fn operator_admission(
+        &self,
+    ) -> Arc<crate::operator_late_admission::OperatorLateAdmissionStore> {
+        match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(g) => g.operator_admission.clone(),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(g) => g.operator_admission.clone(),
+        }
+    }
+    pub(crate) fn lifecycle_facade(
+        &self,
+    ) -> Result<Arc<dyn ironclaw_product_workflow::LifecycleProductFacade>, RebornBuildError> {
+        let slot = match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(graph) => &graph.lifecycle_facade,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(graph) => &graph.lifecycle_facade,
+        };
+        slot.get()
+            .cloned()
+            .ok_or_else(|| RebornBuildError::InvalidConfig {
+                reason: "Production lifecycle facade was not initialized".into(),
+            })
+    }
+
+    /// 从同Production graph构造真实durable stores；无Noop/独立存储默认。
+    pub(crate) fn execution_surface_stores(
+        &self,
+    ) -> (
+        Arc<dyn ironclaw_run_state::GateRecordStore>,
+        Arc<dyn ironclaw_capabilities::ReplayPayloadStore>,
+    ) {
+        match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(graph) => (
+                Arc::new(ironclaw_run_state::FilesystemGateRecordStore::new(
+                    graph.scoped_filesystem.clone(),
+                )),
+                Arc::new(ironclaw_capabilities::FilesystemReplayPayloadStore::new(
+                    graph.scoped_filesystem.clone(),
+                )),
+            ),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(graph) => (
+                Arc::new(ironclaw_run_state::FilesystemGateRecordStore::new(
+                    graph.scoped_filesystem.clone(),
+                )),
+                Arc::new(ironclaw_capabilities::FilesystemReplayPayloadStore::new(
+                    graph.scoped_filesystem.clone(),
+                )),
+            ),
+        }
+    }
+
+    pub(crate) fn project_service(&self) -> Arc<dyn ProjectService> {
+        match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(graph) => graph.project_service.clone(),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(graph) => graph.project_service.clone(),
+        }
+    }
+
     /// Returns the trigger repository from whichever production store graph is
     /// active. Backs the WebUI automations facade for production profiles
     /// (libSQL / Postgres) where `local_runtime` is None.
@@ -1208,6 +1404,17 @@ impl RebornProductionRuntimeServices {
     /// Pairs with [`Self::trigger_repository`] so the automations facade
     /// derives active-hold projections from the same runtime's run state
     /// (#5886).
+    pub(crate) fn run_tree_usage_source(
+        &self,
+    ) -> Arc<dyn ironclaw_turns::RunTreeUsagePrefixSource> {
+        match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(graph) => graph.turn_state.clone(),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(graph) => graph.turn_state.clone(),
+        }
+    }
+
     pub(crate) fn turn_run_snapshot_source(
         &self,
     ) -> Arc<dyn crate::turn_run_snapshot::TurnRunSnapshotSource> {
@@ -1318,6 +1525,7 @@ impl RebornServices {
 pub async fn build_reborn_services(
     input: RebornBuildInput,
 ) -> Result<RebornServices, RebornBuildError> {
+    input.validate_host_bundle_profile()?;
     tracing::debug!(
         profile = %input.profile(),
         owner_id = %input.owner_id,
@@ -1677,7 +1885,10 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
     #[cfg(any(feature = "libsql", feature = "postgres"))]
     let project_repository: Arc<dyn ProjectRepository> =
         Arc::new(ironclaw_projects::FilesystemProjectRepository::new(
-            crate::wrap_scoped(Arc::clone(&filesystem)),
+            Arc::new(ScopedFilesystem::new(
+                Arc::clone(&filesystem),
+                crate::project_repository_mount_view,
+            )),
             owner_user_id.clone(),
             project_agent_id,
         ));
@@ -1823,7 +2034,13 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
     } else {
         services.try_with_host_http_egress_with_body_store(
             ironclaw_network::PolicyNetworkHttpEgress::new(
-                ironclaw_network::ReqwestNetworkTransport::default(),
+                ironclaw_network::ReqwestNetworkTransport::new(
+                    ironclaw_reborn_config::HostHttpTimeouts::from_process_env()
+                        .map_err(|error| RebornBuildError::InvalidConfig {
+                            reason: error.to_string(),
+                        })?
+                        .host_timeout(),
+                ),
             ),
             http_body_filesystem,
         )?
@@ -1831,7 +2048,13 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
     #[cfg(not(any(test, feature = "test-support")))]
     let services = services.try_with_host_http_egress_with_body_store(
         ironclaw_network::PolicyNetworkHttpEgress::new(
-            ironclaw_network::ReqwestNetworkTransport::default(),
+            ironclaw_network::ReqwestNetworkTransport::new(
+                ironclaw_reborn_config::HostHttpTimeouts::from_process_env()
+                    .map_err(|error| RebornBuildError::InvalidConfig {
+                        reason: error.to_string(),
+                    })?
+                    .host_timeout(),
+            ),
         ),
         http_body_filesystem,
     )?;
@@ -1856,13 +2079,28 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
     services = apply_post_edit_check_from_env(services)?;
     // Local-dev profiles admit InstalledLocal + http + private/loopback MCP
     // egress so container-internal MCP servers (e.g. TianQuan api on
-    // localhost:3002) can be reached. Production/hosted profiles stay
-    // fail-closed (HostBundled + https + public IP only).
+    // localhost:3002) can be reached. HostedSingleTenant is the self-hosted
+    // single-process shape: it admits host-bundled http/private targets for the
+    // bundled local API, while still rejecting InstalledLocal packages. Generic
+    // Production stays fail-closed (HostBundled + https + public IP only).
     let allow_local_mcp = matches!(
         profile,
         RebornCompositionProfile::LocalDev | RebornCompositionProfile::LocalDevYolo
     );
-    services = attach_hosted_mcp_runtime(services, allow_local_mcp)?;
+    let allow_hosted_local_mcp = matches!(profile, RebornCompositionProfile::HostedSingleTenant);
+    let operator_admission = allow_hosted_local_mcp.then(|| {
+        Arc::new(crate::operator_late_admission::OperatorLateAdmissionStore::default())
+    });
+    services = if let Some(operator_admission) = operator_admission.as_ref() {
+        attach_hosted_mcp_runtime_with_store(
+            services,
+            Arc::clone(operator_admission),
+            allow_local_mcp,
+            allow_hosted_local_mcp,
+        )?
+    } else {
+        attach_hosted_mcp_runtime(services, allow_local_mcp, allow_hosted_local_mcp)?
+    };
     let product_auth_runtime_ports = require_product_auth_runtime_ports(&services)?;
     let provider_composition = compose_provider_client(
         oauth_provider_configs,
@@ -2066,22 +2304,25 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
             });
         }
     }
-    let extension_management = Arc::new(
-        RebornLocalExtensionManagementPort::new(
-            extension_filesystem,
-            available_extensions,
-            extension_installation_store,
-            extension_lifecycle_service,
-            active_extensions,
-            Some(Arc::clone(&product_auth) as Arc<dyn ExtensionCredentialCleanup>),
-            // #5459 P1: the base owner is the tenant operator in local-dev —
-            // their installs are tenant-shared, everyone else's are private.
-            nearai_mcp_owner_scope.user_id.clone(),
-        )
-        .with_account_setup_registry(account_setups)
-        .with_removal_cleanup_registry(removal_cleanup)
-        .with_provider_instance_readiness(provider_instance_readiness),
-    );
+    let mut extension_management = RebornLocalExtensionManagementPort::new(
+        extension_filesystem,
+        available_extensions,
+        extension_installation_store,
+        extension_lifecycle_service,
+        active_extensions,
+        Some(Arc::clone(&product_auth) as Arc<dyn ExtensionCredentialCleanup>),
+        // #5459 P1: the base owner is the tenant operator in local-dev —
+        // their installs are tenant-shared, everyone else's are private.
+        nearai_mcp_owner_scope.user_id.clone(),
+    )
+    .with_account_setup_registry(account_setups)
+    .with_removal_cleanup_registry(removal_cleanup)
+    .with_provider_instance_readiness(provider_instance_readiness);
+    if let Some(operator_admission) = operator_admission.as_ref() {
+        extension_management =
+            extension_management.with_operator_admission(Arc::clone(operator_admission));
+    }
+    let extension_management = Arc::new(extension_management);
     let lifecycle_facade =
         RebornLocalLifecycleFacade::new(store_graph.local_runtime.skill_management.clone())
             .with_extension_management(Arc::clone(&extension_management))
@@ -2092,7 +2333,7 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
     let lifecycle_facade: Arc<dyn ironclaw_product_workflow::LifecycleProductFacade> =
         Arc::new(lifecycle_facade);
     lifecycle_auth_continuation_slot
-        .set(lifecycle_facade)
+        .set(Arc::clone(&lifecycle_facade))
         .map_err(|_| RebornBuildError::InvalidConfig {
             reason: "extension lifecycle auth continuation facade was already attached".to_string(),
         })?;
@@ -2106,6 +2347,10 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
     nearai_mcp_bootstrap_outcome.log_completion();
     if let Some(local_runtime) = Arc::get_mut(&mut store_graph.local_runtime) {
         local_runtime.extension_management = Some(Arc::clone(&extension_management));
+        local_runtime.operator_admission = operator_admission.clone();
+        if operator_admission.is_some() {
+            local_runtime.lifecycle_facade = Some(Arc::clone(&lifecycle_facade));
+        }
         local_runtime.runtime_http_egress = Some(product_auth_runtime_ports.runtime_http_egress());
         local_runtime.extension_registry = Arc::clone(&extension_registry);
         local_runtime.shared_extension_registry = Some(services.shared_extension_registry());
@@ -2663,6 +2908,8 @@ async fn build_local_runtime_store_graph(
         budget_gate_store,
         skill_management,
         extension_management: None,
+        operator_admission: None,
+        lifecycle_facade: None,
         channel_connection_facade_slot: Arc::new(std::sync::OnceLock::new()),
         runtime_http_egress: None,
         host_runtime_http_egress: None,
@@ -2861,6 +3108,8 @@ async fn build_local_runtime_store_graph(
         budget_gate_store,
         skill_management,
         extension_management: None,
+        operator_admission: None,
+        lifecycle_facade: None,
         channel_connection_facade_slot: Arc::new(std::sync::OnceLock::new()),
         runtime_http_egress: None,
         host_runtime_http_egress: None,
@@ -3208,20 +3457,25 @@ async fn build_local_runtime_root_filesystem(
         workspace_root,
         host_home_root,
     )?);
+    #[cfg(feature = "postgres")]
+    let postgres_durable = matches!(&storage_backend_input, StorageBackendInput::Postgres(_));
+    #[cfg(not(feature = "postgres"))]
+    let postgres_durable = false;
     let mut composite = CompositeRootFilesystem::new();
     let durable_backend = match storage_backend_input {
         #[cfg(feature = "postgres")]
         StorageBackendInput::Postgres(pool) => {
             let database = Arc::new(PostgresRootFilesystem::new(pool.clone()));
             database.run_migrations().await?;
-            mount_local_dev_database_roots(&mut composite, database)?;
+            mount_local_dev_database_roots(&mut composite, Arc::clone(&database))?;
+            mount_local_dev_database_extension_root(&mut composite, database)?;
             DurableBackend::Postgres(pool)
         }
         StorageBackendInput::LocalDefault => {
             build_default_local_dev_database_roots(root, &mut composite).await?
         }
     };
-    mount_local_dev_project_roots(&mut composite, local)?;
+    mount_local_dev_project_roots(&mut composite, local, !postgres_durable)?;
     Ok(RootFilesystemBundle {
         filesystem: Arc::new(composite),
         durable_backend,
@@ -3594,9 +3848,33 @@ where
     Ok(())
 }
 
+#[cfg(feature = "postgres")]
+fn mount_local_dev_database_extension_root<F>(
+    root: &mut CompositeRootFilesystem,
+    database: Arc<F>,
+) -> Result<(), RebornBuildError>
+where
+    F: RootFilesystem + 'static,
+{
+    root.mount(
+        local_dev_mount_descriptor(
+            "/system/extensions",
+            "local-dev-database-extensions",
+            BackendKind::DatabaseFilesystem,
+            StorageClass::FileContent,
+            ContentKind::ExtensionPackage,
+            IndexPolicy::NotIndexed,
+            database.capabilities(),
+        )?,
+        database,
+    )?;
+    Ok(())
+}
+
 fn mount_local_dev_project_roots(
     root: &mut CompositeRootFilesystem,
     local: Arc<DiskFilesystem>,
+    mount_disk_extensions: bool,
 ) -> Result<(), RebornBuildError> {
     root.mount(
         local_dev_mount_descriptor(
@@ -3610,18 +3888,20 @@ fn mount_local_dev_project_roots(
         )?,
         Arc::clone(&local),
     )?;
-    root.mount(
-        local_dev_mount_descriptor(
-            "/system/extensions",
-            "local-dev-system-extensions",
-            BackendKind::DiskFilesystem,
-            StorageClass::FileContent,
-            ContentKind::ExtensionPackage,
-            IndexPolicy::NotIndexed,
-            BackendCapabilities::bytes_only(),
-        )?,
-        local,
-    )?;
+    if mount_disk_extensions {
+        root.mount(
+            local_dev_mount_descriptor(
+                "/system/extensions",
+                "local-dev-system-extensions",
+                BackendKind::DiskFilesystem,
+                StorageClass::FileContent,
+                ContentKind::ExtensionPackage,
+                IndexPolicy::NotIndexed,
+                BackendCapabilities::bytes_only(),
+            )?,
+            local,
+        )?;
+    }
     Ok(())
 }
 
@@ -4279,10 +4559,15 @@ fn production_builtin_extension_registry(
     let mut registry = ExtensionRegistry::new();
     registry
         .insert(
-            builtin_first_party_package_for_process_backend(process_backend).map_err(|error| {
-                RebornBuildError::InvalidConfig {
-                    reason: format!("built-in first-party package is invalid: {error}"),
-                }
+            extend_builtin_first_party_package(
+                builtin_first_party_package_for_process_backend(process_backend).map_err(
+                    |error| RebornBuildError::InvalidConfig {
+                        reason: format!("built-in first-party package is invalid: {error}"),
+                    },
+                )?,
+            )
+            .map_err(|error| RebornBuildError::InvalidConfig {
+                reason: error.to_string(),
             })?,
         )
         .map_err(|error| RebornBuildError::InvalidConfig {
@@ -4544,6 +4829,8 @@ async fn build_production_shaped(
     let RebornBuildInput {
         deployment,
         owner_id,
+        host_extension_bundles,
+        private_startup_admission_hold: _, // Runtime already read this before service construction.
         local_runtime_identity,
         storage,
         production_trust_policy,
@@ -4640,7 +4927,13 @@ async fn build_production_shaped(
                 scheduler_wake_wiring.notifier(),
                 runtime_process_binding,
             )?;
+            crate::runtime::reborn_startup_stage(
+                crate::runtime::RebornStartupStage::SecretKeyBegin,
+            );
             let secret_master_key = resolve_secret_master_key(secret_master_key).await?;
+            crate::runtime::reborn_startup_stage(
+                crate::runtime::RebornStartupStage::SecretKeyReady,
+            );
             let context = RebornProductionBuildContext {
                 profile,
                 wiring_config,
@@ -4650,6 +4943,7 @@ async fn build_production_shaped(
                 oauth_dcr_provider_configs,
                 slack_personal_oauth_lazy_slot,
                 owner_id,
+                host_extension_bundles,
                 local_runtime_identity,
                 turn_state_store_limits,
                 scheduler_wake_wiring,
@@ -4686,7 +4980,13 @@ async fn build_production_shaped(
                 scheduler_wake_wiring.notifier(),
                 runtime_process_binding,
             )?;
+            crate::runtime::reborn_startup_stage(
+                crate::runtime::RebornStartupStage::SecretKeyBegin,
+            );
             let secret_master_key = resolve_secret_master_key(secret_master_key).await?;
+            crate::runtime::reborn_startup_stage(
+                crate::runtime::RebornStartupStage::SecretKeyReady,
+            );
             let context = RebornProductionBuildContext {
                 profile,
                 wiring_config,
@@ -4696,6 +4996,7 @@ async fn build_production_shaped(
                 oauth_dcr_provider_configs,
                 slack_personal_oauth_lazy_slot,
                 owner_id,
+                host_extension_bundles,
                 local_runtime_identity,
                 turn_state_store_limits,
                 scheduler_wake_wiring,
@@ -4741,6 +5042,7 @@ struct RebornProductionBuildContext {
     slack_personal_oauth_lazy_slot:
         Option<crate::slack::slack_setup::SlackPersonalSetupServiceSlot>,
     owner_id: String,
+    host_extension_bundles: Vec<Arc<crate::RebornHostExtensionBundle>>,
     local_runtime_identity: Option<RebornLocalRuntimeIdentity>,
     turn_state_store_limits: ironclaw_turns::TurnStateStoreLimits,
     /// The pre-minted scheduler wake wiring to carry to `RebornServices` so
@@ -5092,7 +5394,13 @@ where
     let services = services
         .try_with_host_http_egress_with_body_store(
             ironclaw_network::PolicyNetworkHttpEgress::new(
-                ironclaw_network::ReqwestNetworkTransport::default(),
+                ironclaw_network::ReqwestNetworkTransport::new(
+                    ironclaw_reborn_config::HostHttpTimeouts::from_process_env()
+                        .map_err(|error| crate::RebornCompositionError::InvalidConfig {
+                            reason: error.to_string(),
+                        })?
+                        .host_timeout(),
+                ),
             ),
             Arc::clone(&scoped_filesystem),
         )
@@ -5114,6 +5422,8 @@ struct FilesystemSecretCredentialStores<F>
 where
     F: RootFilesystem + 'static,
 {
+    // Preserve the existing crypto instance for admin setup over the same raw root.
+    crypto: Arc<ironclaw_secrets::SecretsCrypto>,
     secret_store: Arc<FilesystemSecretStore<F>>,
     credential_broker: Arc<FilesystemCredentialBroker<F>>,
 }
@@ -5132,7 +5442,11 @@ where
                 Arc::clone(&scoped_filesystem),
                 Arc::clone(&crypto),
             )),
-            credential_broker: Arc::new(FilesystemCredentialBroker::new(scoped_filesystem, crypto)),
+            credential_broker: Arc::new(FilesystemCredentialBroker::new(
+                scoped_filesystem,
+                Arc::clone(&crypto),
+            )),
+            crypto,
         }
     }
 
@@ -5212,7 +5526,9 @@ where
             Arc::clone(&scoped_filesystem),
             secret_master_key,
         )?;
+        crate::runtime::reborn_startup_stage(crate::runtime::RebornStartupStage::GovernorWarmBegin);
         let resource_governor = warm_resource_governor_for_build(resource_governor).await?;
+        crate::runtime::reborn_startup_stage(crate::runtime::RebornStartupStage::GovernorWarmReady);
 
         Ok(Self {
             filesystem,
@@ -5240,7 +5556,7 @@ where
 }
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
-fn production_skill_management_mount_view(
+pub(crate) fn production_skill_management_mount_view(
     scope: &ResourceScope,
 ) -> Result<MountView, HostApiError> {
     MountView::new(vec![
@@ -5286,6 +5602,7 @@ where
         oauth_dcr_provider_configs,
         slack_personal_oauth_lazy_slot,
         owner_id,
+        host_extension_bundles,
         local_runtime_identity,
         turn_state_store_limits,
         scheduler_wake_wiring,
@@ -5302,19 +5619,33 @@ where
             default_runtime_owner_scope(owner_user_id.clone()).map_err(RebornBuildError::Mount)?
         }
     };
+    crate::operator_host_bundle::validate_operator_runtime_tenant(
+        &host_extension_bundles,
+        &turn_state_scope.tenant_id,
+    )
+    .map_err(|_| RebornBuildError::InvalidConfig {
+        reason: "hostBundleValidatedRuntimeTenantMismatch".into(),
+    })?;
     let turn_state_filesystem =
         owner_turn_state_filesystem(Arc::clone(&stores.filesystem), &turn_state_scope)
             .map_err(RebornBuildError::Mount)?;
     let secret_store: Arc<dyn SecretStore> = stores.secret_credentials.secret_store.clone();
     let skill_management_filesystem: Arc<dyn RootFilesystem> = stores.filesystem.clone();
     let skill_management = Arc::new(RebornLocalSkillManagementPort::new_with_mount_resolver(
-        owner_user_id,
+        owner_user_id.clone(),
         skill_management_filesystem,
         Arc::new(production_skill_management_mount_view),
     ));
     let trigger_create_hook = Arc::new(ScopedFilesystemTriggerCreatorPairingHook::new(Arc::clone(
         &stores.scoped_filesystem,
     )));
+    let lifecycle_trust_policy = production_wiring.trust_policy.clone();
+    let lifecycle_auth_slot = Arc::new(OnceLock::new());
+    let lifecycle_owner = owner_user_id.clone();
+    let lifecycle_state_path = VirtualPath::new(format!(
+        "/tenants/{}/system/extensions/.installations/state.json",
+        crate::resource_scope_path_segment(turn_state_scope.tenant_id.as_str())
+    ))?;
     let process_backend = production_wiring.runtime_policy.process_backend;
     let extension_registry = production_builtin_extension_registry(process_backend)?;
     let extension_registry = Arc::new(extension_registry);
@@ -5342,14 +5673,62 @@ where
     let budget_gate_store: Arc<dyn BudgetGateStore> = Arc::new(FilesystemBudgetGateStore::new(
         Arc::clone(&stores.scoped_filesystem),
     ));
+    crate::runtime::reborn_startup_stage(crate::runtime::RebornStartupStage::EventStoresBegin);
     let event_stores = ironclaw_reborn_event_store::build_reborn_event_stores(
         profile.to_event_store_profile(),
         stores.event_store,
     )
     .await?;
+    crate::runtime::reborn_startup_stage(crate::runtime::RebornStartupStage::EventStoresReady);
     let event_log = Arc::clone(&event_stores.events);
     let audit_log = Arc::clone(&event_stores.audit);
+    // 与同Production filesystem一致，复用现项目仓/ACL facade和最窄项目mount。
+    let project_agent_id = ironclaw_host_api::AgentId::new("reborn-projects").map_err(|error| {
+        RebornBuildError::InvalidConfig {
+            reason: error.to_string(),
+        }
+    })?;
+    let project_repository: Arc<dyn ProjectRepository> =
+        Arc::new(ironclaw_projects::FilesystemProjectRepository::new(
+            Arc::new(ScopedFilesystem::new(
+                stores.filesystem.clone(),
+                crate::project_repository_mount_view,
+            )),
+            owner_user_id.clone(),
+            project_agent_id,
+        ));
+    let project_service: Arc<dyn ProjectService> =
+        Arc::new(RebornProjectService::new(project_repository));
+    let identity_store = Arc::new(
+        ironclaw_reborn_identity::FilesystemRebornIdentityStore::new(
+            Arc::clone(&stores.scoped_filesystem),
+            turn_state_scope.tenant_id.clone(),
+            owner_user_id.clone(),
+            turn_state_scope
+                .agent_id
+                .clone()
+                .ok_or_else(|| RebornBuildError::InvalidConfig {
+                    reason: "Production identity runtime agent missing".into(),
+                })?,
+            turn_state_scope.project_id.clone(),
+        ),
+    );
+    let admin_secret_provisioner =
+        Arc::new(crate::admin_secrets::FilesystemAdminSecretProvisioner::new(
+            Arc::clone(&stores.filesystem),
+            Arc::clone(&stores.secret_credentials.crypto),
+        ));
     let production_runtime_graph = Arc::new(RebornProductionRuntimeStoreGraph {
+        user_directory: identity_store.clone(),
+        identity_resolver: identity_store,
+        admin_secret_provisioner,
+        lifecycle_facade: OnceLock::new(),
+        _host_extension_bundles: host_extension_bundles.clone(),
+        operator_admission: Arc::new(
+            crate::operator_late_admission::OperatorLateAdmissionStore::default(),
+        ),
+        normal_capability_binding: OnceLock::new(),
+        project_service,
         scoped_filesystem: Arc::clone(&stores.scoped_filesystem),
         extension_registry: Arc::clone(&extension_registry),
         turn_state: Arc::clone(&turn_state),
@@ -5362,7 +5741,7 @@ where
         event_log,
         audit_log,
     });
-    let production_runtime = production_runtime_services(production_runtime_graph);
+    let production_runtime = production_runtime_services(production_runtime_graph.clone());
     // Same store-backed lookup the WebUI automations panel builds via
     // `RebornProductionRuntimeServices::turn_run_snapshot_source` (#5886).
     let trigger_active_run_lookup: Arc<dyn TriggerActiveRunLookup> = Arc::new(
@@ -5381,11 +5760,48 @@ where
         Arc::clone(&stores.scoped_filesystem),
     )?;
     let product_auth_filesystem = Arc::clone(&stores.scoped_filesystem);
+    let normal_policy =
+        Arc::new(
+            builtin_capability_policy().map_err(|e| RebornBuildError::InvalidConfig {
+                reason: e.to_string(),
+            })?,
+        );
+    let normal_leases = stores.leases.clone();
+    let normal_requests = Arc::new(FilesystemApprovalRequestStore::new(
+        stores.scoped_filesystem.clone(),
+    ));
+    let normal_run_state = Arc::new(FilesystemRunStateStore::new(
+        stores.scoped_filesystem.clone(),
+    ));
+    let normal_settings: Arc<dyn crate::profile_approval_authorization::ApprovalSettingsProvider> =
+        Arc::new(StoreApprovalSettingsProvider::new(
+            Arc::new(FilesystemToolPermissionOverrideStore::new(
+                stores.scoped_filesystem.clone(),
+            )),
+            Arc::new(FilesystemAutoApproveSettingStore::new(
+                stores.scoped_filesystem.clone(),
+            )),
+            stores.persistent_approval_policies.clone(),
+        ));
+    let normal_gate_policy: Arc<
+        dyn crate::profile_approval_authorization::ProfileApprovalGatePolicy,
+    > = Arc::new(
+        crate::runtime_profile_approval_policy::RuntimeProfileApprovalGatePolicy::new(
+            ironclaw_runtime_policy::minimal_approval_bypass(&production_wiring.runtime_policy),
+            normal_policy.approval_gate_effects(),
+        )
+        .with_exempt_capabilities(normal_policy.approval_gate_exempt_capabilities()),
+    );
+    let normal_authorizer = crate::profile_approval_authorization::profile_approval_authorizer(
+        production_wiring.runtime_policy.approval_policy,
+        normal_gate_policy,
+        normal_settings.clone(),
+    );
     let services = HostRuntimeServices::new(
         Arc::clone(&extension_registry),
         Arc::clone(&stores.filesystem),
         Arc::new(InMemoryResourceGovernor::new()),
-        Arc::new(ironclaw_authorization::GrantAuthorizer::new()),
+        normal_authorizer,
         ProcessServices::filesystem(Arc::clone(&stores.scoped_filesystem)),
         CapabilitySurfaceVersion::new("reborn-app-v1")?,
     )
@@ -5398,18 +5814,30 @@ where
     .with_security_audit_sink(Arc::new(ironclaw_events::TracingSecurityAuditSink))
     .try_with_host_http_egress_with_body_store(
         ironclaw_network::PolicyNetworkHttpEgress::new(
-            ironclaw_network::ReqwestNetworkTransport::default(),
+            ironclaw_network::ReqwestNetworkTransport::new(
+                ironclaw_reborn_config::HostHttpTimeouts::from_process_env()
+                    .map_err(|error| crate::RebornCompositionError::InvalidConfig {
+                        reason: error.to_string(),
+                    })?
+                    .host_timeout(),
+            ),
         ),
         Arc::clone(&stores.scoped_filesystem),
     )?
     .with_resource_governor(Arc::clone(&resource_governor))
     .with_production_reborn_event_stores(event_stores)
-    .with_filesystem_run_state(Arc::clone(&stores.scoped_filesystem))
+    .with_run_state(normal_run_state)
+    .with_approval_requests(normal_requests.clone())
     .with_turn_state_and_transition_port(Arc::clone(&turn_state))
     .with_run_profile_resolver(planned_run_profile_resolver()?)
     .with_turn_run_wake_notifier_dyn(production_wiring.turn_run_wake_notifier);
     let product_auth_runtime_ports = require_product_auth_runtime_ports(&services)?;
-    let services = attach_hosted_mcp_runtime(services, false)?;
+    let services = attach_production_hosted_mcp_runtime(
+        services,
+        &host_extension_bundles,
+        &turn_state_scope.tenant_id,
+        production_runtime_graph.operator_admission.clone(),
+    )?;
     let provider_composition = compose_provider_client(
         oauth_provider_configs,
         oauth_dcr_provider_configs,
@@ -5465,7 +5893,7 @@ where
             turn_coordinator: turn_coordinator.clone(),
             blocked_auth_snapshot_source: Some(Arc::clone(&turn_state)
                 as Arc<dyn crate::blocked_auth_resume::BlockedAuthSnapshotSource>),
-            lifecycle: Arc::new(OnceLock::new()),
+            lifecycle: lifecycle_auth_slot.clone(),
             provider_composition,
             security_audit_sink,
             secret_store: Arc::clone(&secret_store),
@@ -5511,11 +5939,129 @@ where
     .map_err(|error| RebornBuildError::InvalidConfig {
         reason: format!("GSuite first-party handlers are invalid: {error}"),
     })?;
-    let services = services.with_first_party_capabilities(Arc::new(first_party_registry));
 
     #[cfg(any(test, feature = "test-support"))]
     let local_dev_wasm_runtime_credential_provider_captured =
         services.wasm_runtime_credential_provider_captured_for_test();
+    // 目录发现继续保InstalledLocal语义；不改包来源，也不放开MCP私网。
+    let extension_filesystem: Arc<dyn RootFilesystem> = stores.filesystem.clone();
+    crate::runtime::reborn_startup_stage(crate::runtime::RebornStartupStage::CatalogLoadBegin);
+    let mut available_extensions = AvailableExtensionCatalog::from_filesystem_root(
+        extension_filesystem.as_ref(),
+        &VirtualPath::new("/system/extensions")?,
+    )
+    .await
+    .map_err(|error| RebornBuildError::InvalidConfig {
+        reason: format!("Production extension catalog load failed: {error}"),
+    })?;
+    crate::runtime::reborn_startup_stage(crate::runtime::RebornStartupStage::CatalogLoadReady);
+    available_extensions.extend(
+        AvailableExtensionCatalog::from_first_party_assets_with_nearai_mcp_config(None).map_err(
+            |error| RebornBuildError::InvalidConfig {
+                reason: format!("Production first-party catalog load failed: {error}"),
+            },
+        )?,
+    );
+    for bundle in &host_extension_bundles {
+        bundle
+            .merge_into_catalog(&mut available_extensions)
+            .map_err(|error| RebornBuildError::InvalidConfig {
+                reason: format!("Production Root HostBundle catalog merge failed: {error}"),
+            })?;
+    }
+    crate::runtime::reborn_startup_stage(crate::runtime::RebornStartupStage::InstallationLoadBegin);
+    let installation_store: Arc<dyn ExtensionInstallationStore> = Arc::new(
+        FilesystemExtensionInstallationStore::load_at(
+            extension_filesystem.clone(),
+            lifecycle_state_path,
+        )
+        .await
+        .map_err(|error| RebornBuildError::InvalidConfig {
+            reason: format!("Production extension state load failed: {error}"),
+        })?,
+    );
+    crate::runtime::reborn_startup_stage(crate::runtime::RebornStartupStage::InstallationLoadReady);
+    let lifecycle_service = Arc::new(tokio::sync::Mutex::new(ExtensionLifecycleService::new(
+        services.shared_extension_registry().snapshot_owned(),
+    )));
+    let publisher = ActiveExtensionPublisher::new(
+        services.shared_extension_registry(),
+        lifecycle_trust_policy,
+        Arc::new(ironclaw_trust::InvalidationBus::new()),
+    );
+    crate::runtime::reborn_startup_stage(crate::runtime::RebornStartupStage::CatalogRestoreBegin);
+    restore_extension_lifecycle_state(
+        &available_extensions,
+        &extension_filesystem,
+        &installation_store,
+        &lifecycle_service,
+        &publisher,
+    )
+    .await
+    .map_err(|error| RebornBuildError::InvalidConfig {
+        reason: format!("Production extension restore failed: {error}"),
+    })?;
+    crate::runtime::reborn_startup_stage(crate::runtime::RebornStartupStage::CatalogRestoreReady);
+    let extension_management = Arc::new(
+        RebornLocalExtensionManagementPort::new(
+            extension_filesystem,
+            available_extensions,
+            installation_store,
+            lifecycle_service,
+            publisher,
+            Some(product_auth_services.clone() as Arc<dyn ExtensionCredentialCleanup>),
+            lifecycle_owner,
+        )
+        .with_operator_admission(production_runtime_graph.operator_admission.clone()),
+    );
+    insert_extension_lifecycle_handlers(
+        &mut first_party_registry,
+        extension_management.clone(),
+        product_auth_services.runtime_credential_account_selection_service(),
+    )
+    .map_err(|e| RebornBuildError::InvalidConfig {
+        reason: e.to_string(),
+    })?;
+    let services = services.with_first_party_capabilities(Arc::new(first_party_registry));
+    production_runtime_graph.normal_capability_binding.set(crate::runtime::production_dynamic_capability::ProductionNormalCapabilityBinding {
+        policy:normal_policy,extensions:crate::runtime::local_dev::extension_surface::ExtensionCapabilitySurfaceSource::new(Some(extension_management.clone())),
+        project_service:production_runtime_graph.project_service.clone(),approval_settings:normal_settings,
+        approval_requests:normal_requests,leases:normal_leases,
+        context_filesystem: stores.filesystem.clone(),
+        skill_source: Arc::new(ironclaw_loop_host::FilesystemSkillBundleSource::new(
+            Arc::new(ScopedFilesystem::new(stores.filesystem.clone(), production_skill_management_mount_view)),
+            vec![
+                ironclaw_loop_host::FilesystemSkillBundleRoot::system(ironclaw_host_api::ScopedPath::new("/system/skills")?),
+                ironclaw_loop_host::FilesystemSkillBundleRoot::user(ironclaw_host_api::ScopedPath::new("/skills")?),
+            ],
+        ).map_err(|_| RebornBuildError::InvalidConfig { reason: "Production skill source could not be constructed".into() })?.with_thread_owner_scope()),
+    }).map_err(|_|RebornBuildError::InvalidConfig {reason:"Production normal binding was already initialized".into()})?;
+    let lifecycle_facade: Arc<dyn ironclaw_product_workflow::LifecycleProductFacade> = Arc::new(
+        crate::extension_host::lifecycle::RebornLocalLifecycleFacade::new(skill_management.clone())
+            .with_extension_management(extension_management)
+            .with_runtime_http_egress(product_auth_runtime_ports.runtime_http_egress())
+            .with_runtime_credential_accounts(
+                product_auth_services.runtime_credential_account_selection_service(),
+            ),
+    );
+    let lifecycle_facade: Arc<dyn ironclaw_product_workflow::LifecycleProductFacade> = Arc::new(
+        crate::production_lifecycle::TenantBoundLifecycleFacade::new(
+            turn_state_scope.tenant_id.clone(),
+            lifecycle_facade,
+        ),
+    );
+    lifecycle_auth_slot
+        .set(lifecycle_facade.clone())
+        .map_err(|_| RebornBuildError::InvalidConfig {
+            reason: "Production lifecycle auth continuation was already initialized".into(),
+        })?;
+    production_runtime_graph
+        .lifecycle_facade
+        .set(lifecycle_facade)
+        .map_err(|_| RebornBuildError::InvalidConfig {
+            reason: "Production lifecycle graph was already initialized".into(),
+        })?;
+
     let host_runtime: Arc<dyn ironclaw_host_runtime::HostRuntime> =
         Arc::new(services.host_runtime_for_production(&wiring_config)?);
 
@@ -5613,16 +6159,28 @@ async fn build_postgres_production(
     // This clone stays PRIVATE — it is never exposed through any public facade.
     let pool_for_refresh_lock = pool.clone();
     let filesystem = Arc::new(PostgresRootFilesystem::new(pool.clone()));
+    crate::runtime::reborn_startup_stage(
+        crate::runtime::RebornStartupStage::PostgresFsMigrateBegin,
+    );
     filesystem.run_migrations().await?;
+    crate::runtime::reborn_startup_stage(
+        crate::runtime::RebornStartupStage::PostgresFsMigrateReady,
+    );
     let trigger_repository = Arc::new(ironclaw_triggers::PostgresTriggerRepository::new(
         pool.clone(),
     ));
+    crate::runtime::reborn_startup_stage(
+        crate::runtime::RebornStartupStage::PostgresTriggerMigrateBegin,
+    );
     trigger_repository
         .run_migrations()
         .await
         .map_err(|error| RebornBuildError::InvalidConfig {
             reason: format!("PostgreSQL trigger repository migrations failed: {error}"),
         })?;
+    crate::runtime::reborn_startup_stage(
+        crate::runtime::RebornStartupStage::PostgresTriggerMigrateReady,
+    );
     let resource_governor =
         FilesystemResourceGovernor::new(crate::wrap_scoped(Arc::clone(&filesystem)));
     let stores = ProductionStoreBundle::new(
@@ -5848,6 +6406,35 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn postgres_database_extension_mount_wins_over_disk_extension_mount() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(dir.path().join("system/extensions")).expect("disk extension root");
+        let local = Arc::new(
+            local_dev_project_filesystem(dir.path(), &workspace, None)
+                .expect("local project filesystem"),
+        );
+        let database = Arc::new(ironclaw_filesystem::InMemoryBackend::new());
+        let mut composite = CompositeRootFilesystem::new();
+
+        mount_local_dev_database_extension_root(&mut composite, database)
+            .expect("database extension root");
+        mount_local_dev_project_roots(&mut composite, local, false)
+            .expect("project roots without disk extensions");
+
+        let path = VirtualPath::new("/system/extensions/tianquan-graph/manifest.toml")
+            .expect("extension path");
+        let placement = composite.describe_path(&path).await.expect("placement");
+
+        assert_eq!(
+            placement.backend_id.as_str(),
+            "local-dev-database-extensions"
+        );
+        assert_eq!(placement.backend_kind, BackendKind::DatabaseFilesystem);
+    }
     struct FailingConversationActorPairingService;
 
     #[async_trait::async_trait]
@@ -6129,6 +6716,8 @@ mod tests {
             budget_gate_store: Arc::clone(&base_runtime.budget_gate_store),
             skill_management: Arc::clone(&base_runtime.skill_management),
             extension_management: base_runtime.extension_management.clone(),
+            operator_admission: base_runtime.operator_admission.clone(),
+            lifecycle_facade: base_runtime.lifecycle_facade.clone(),
             channel_connection_facade_slot: Arc::clone(
                 &base_runtime.channel_connection_facade_slot,
             ),
@@ -6548,7 +7137,7 @@ mod tests {
 
         // attach_hosted_mcp_runtime must succeed (soft-skip) rather than error.
         let services =
-            attach_hosted_mcp_runtime(services, false).expect("soft-disable must not error");
+            attach_hosted_mcp_runtime(services, false, false).expect("soft-disable must not error");
 
         // Runtime ports still absent — no egress was added by the attachment.
         assert!(services.product_auth_provider_runtime_ports().is_none());
@@ -7844,7 +8433,8 @@ mod tests {
             CapabilitySurfaceVersion::new("surface-v1").unwrap(),
         );
 
-        let services = attach_hosted_mcp_runtime(services, false).expect("attach is optional");
+        let services =
+            attach_hosted_mcp_runtime(services, false, false).expect("attach is optional");
 
         assert!(services.product_auth_provider_runtime_ports().is_none());
     }
@@ -8396,6 +8986,7 @@ mod tests {
 
     fn web_access_network_policy() -> NetworkPolicy {
         NetworkPolicy {
+            deny_redirects: false,
             allowed_targets: vec![NetworkTargetPattern {
                 scheme: Some(ironclaw_host_api::NetworkScheme::Https),
                 host_pattern: "mcp.exa.ai".to_string(),
@@ -8478,6 +9069,7 @@ mod tests {
 
     fn network_policy() -> NetworkPolicy {
         NetworkPolicy {
+            deny_redirects: false,
             allowed_targets: vec![NetworkTargetPattern {
                 scheme: None,
                 host_pattern: "*".to_string(),
@@ -8490,6 +9082,7 @@ mod tests {
 
     fn notion_mcp_network_policy() -> NetworkPolicy {
         NetworkPolicy {
+            deny_redirects: false,
             allowed_targets: vec![NetworkTargetPattern {
                 scheme: Some(NetworkScheme::Https),
                 host_pattern: "mcp.notion.com".to_string(),

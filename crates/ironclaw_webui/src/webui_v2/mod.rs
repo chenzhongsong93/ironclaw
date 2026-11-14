@@ -129,3 +129,5 @@ pub use static_assets::{
     StaticRouterConfig, StaticRouterConfigError, serve_root, serve_wildcard, static_router,
     static_router_with_config,
 };
+
+pub use descriptors::{WEBUI_V2_PATTERN_USAGE_TREE,WEBUI_V2_ROUTE_USAGE_TREE};

@@ -104,12 +104,23 @@ impl ProjectService for RebornProjectService {
         caller: ProjectCaller,
         request: RebornCreateProjectRequest,
     ) -> Result<RebornProjectResponse, ProjectServiceError> {
-        let mut record = ProjectRecord::new(
-            caller.tenant_id.clone(),
-            caller.user_id.clone(),
-            request.name,
-            request.description,
-        )
+        let mut record = match request.project_id {
+            Some(project_id) => ProjectRecord::new_with_id(
+                ProjectId::new(project_id).map_err(|_| ProjectServiceError::InvalidInput {
+                    field: "project_id".into(),
+                })?,
+                caller.tenant_id.clone(),
+                caller.user_id.clone(),
+                request.name,
+                request.description,
+            ),
+            None => ProjectRecord::new(
+                caller.tenant_id.clone(),
+                caller.user_id.clone(),
+                request.name,
+                request.description,
+            ),
+        }
         .map_err(map_repo_error)?;
         record.icon = request.icon;
         record.color = request.color;
@@ -234,15 +245,30 @@ impl ProjectService for RebornProjectService {
             ProjectRole::Viewer,
         )
         .await?;
-        let members = self
+        let project = self
+            .repository
+            .get_project(&caller.tenant_id, &project_id)
+            .await
+            .map_err(map_repo_error)?
+            .ok_or(ProjectServiceError::NotFound)?;
+        let mut members = self
             .repository
             .list_members(&caller.tenant_id, &project_id)
             .await
-            .map_err(map_repo_error)?
-            .into_iter()
-            .map(member_info)
-            .collect();
-        Ok(RebornListMembersResponse { members })
+            .map_err(map_repo_error)?;
+        // 产品成员视图包含领域定义的standing owner；repository仍只列显式grant。
+        // owner权限来自project本身，异常显式owner行不能撤销、降权或重复该权限。
+        let owner = project.owner_membership();
+        members.retain(|member| member.user_id != owner.user_id);
+        members.push(owner);
+        members.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.user_id.as_str().cmp(b.user_id.as_str()))
+        });
+        Ok(RebornListMembersResponse {
+            members: members.into_iter().map(member_info).collect(),
+        })
     }
 
     async fn add_member(
@@ -651,6 +677,7 @@ mod tests {
             .create_project(
                 caller(),
                 RebornCreateProjectRequest {
+                    project_id: None,
                     name: "P".to_string(),
                     description: String::new(),
                     icon: None,
@@ -663,3 +690,7 @@ mod tests {
         assert_eq!(response.project.role, RebornProjectRole::Owner);
     }
 }
+
+#[cfg(test)]
+#[path = "project_standing_owner_tests.rs"]
+mod standing_owner_tests;

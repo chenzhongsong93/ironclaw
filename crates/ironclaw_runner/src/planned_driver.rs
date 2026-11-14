@@ -304,7 +304,7 @@ pub(crate) fn map_executor_error(error: AgentLoopExecutorError) -> AgentLoopDriv
     if matches!(error, AgentLoopExecutorError::Cancelled) {
         tracing::debug!(?error, "planned driver executor cancelled");
     } else {
-        tracing::warn!(?error, "planned driver executor returned sanitized error");
+        tracing::warn!("planned driver executor returned sanitized error");
     }
     match error {
         AgentLoopExecutorError::HostUnavailable { stage } => AgentLoopDriverError::Unavailable {
@@ -318,6 +318,22 @@ pub(crate) fn map_executor_error(error: AgentLoopExecutorError) -> AgentLoopDriv
             diagnostic_ref,
             detail,
         } => {
+            if stage == HostStage::Capability {
+                if let Some(diagnostic) = diagnostic_ref
+                    .as_ref()
+                    .and_then(ironclaw_turns::run_profile::HostSafeDiagnostic::from_diagnostic_ref)
+                {
+                    return AgentLoopDriverError::Failed {
+                        reason_kind:
+                            crate::failure_categories::HOST_STAGE_UNAVAILABLE_CAPABILITY_CATEGORY
+                                .to_string(),
+                        detail: Some(diagnostic.detail_code()),
+                    };
+                }
+                return AgentLoopDriverError::Unavailable {
+                    reason: "Capability: unavailable".to_string(),
+                };
+            }
             tracing::warn!(
                 stage = ?stage,
                 kind = ?kind,
@@ -562,6 +578,29 @@ mod tests {
             host.call_log().contains(&MockHostCall::StreamModel),
             "the driver must reach the in-flight model call before mapping cancellation"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_policy_denied_has_no_recovery_or_compaction_dispatch() {
+        let registry = build_loop_family_registry().expect("registry");
+        let driver = PlannedDriver::default_from_registry(&registry).expect("driver");
+        let context = run_context_for_driver(&driver);
+        let (host, _checkpoints) = MockAgentLoopDriverHost::builder()
+            .run_context(context.clone())
+            .fail_model_with(AgentLoopHostErrorKind::PolicyDenied)
+            .build();
+        let result = driver.run(AgentLoopDriverRunRequest {
+            turn_id: context.turn_id,
+            run_id: context.run_id,
+            resolved_run_profile: context.resolved_run_profile.clone(),
+        }, &host).await;
+        assert!(result.is_err(), "policy denial cannot produce Completed");
+        assert_eq!(host.model_call_count(), 1);
+        assert_eq!(host.prompt_requests().len(), 1);
+        assert!(!host.progress_events().iter().any(|event| matches!(event,
+            ironclaw_turns::run_profile::LoopProgressEvent::CompactionStarted { .. }
+            | ironclaw_turns::run_profile::LoopProgressEvent::CompactionCompleted { .. }
+        )));
     }
 
     #[test]

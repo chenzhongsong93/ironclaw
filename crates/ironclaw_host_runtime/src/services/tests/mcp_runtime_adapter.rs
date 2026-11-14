@@ -6,7 +6,9 @@ use ironclaw_host_api::{
     RuntimeCredentialAuthRequirement, RuntimeKind, UserId,
 };
 use ironclaw_mcp::{
-    McpError, McpExecutionRequest, McpExecutionResult, McpExecutor, McpTrustedExecutionContext,
+    McpClient, McpError, McpExecutionRequest, McpExecutionResult, McpExecutor, McpHostHttp,
+    McpHostHttpClient, McpHostHttpEgressPlan, McpHostHttpError, McpHostHttpResponse, McpRuntime,
+    McpRuntimeConfig, McpTrustedExecutionContext, StaticMcpHostHttpEgressPlanner,
 };
 use serde_json::json;
 
@@ -118,7 +120,7 @@ async fn mcp_adapter_forwards_host_identity_outside_model_arguments() {
     );
     assert_eq!(
         capture.model_inputs.lock().unwrap().as_slice(),
-        &[model_input.clone()]
+        std::slice::from_ref(&model_input)
     );
 
     let non_loop_input = json!({"query":"non-loop call"});
@@ -181,6 +183,157 @@ visibility = "model"
 input_schema_ref = "schemas/test-mcp/search.input.v1.json"
 output_schema_ref = "schemas/test-mcp/search.output.v1.json"
 "#;
+
+// 覆盖:mcp.md §5 MCP tool errors / ISSUE-IRONCLAW-047：真实协议解析→结算→adapter。
+#[tokio::test]
+async fn mcp_adapter_tool_error_flag_preserves_failure_and_accounting() {
+    for (flag, expected) in [
+        (
+            Some(json!(true)),
+            Some(RuntimeDispatchErrorKind::OperationFailed),
+        ),
+        (
+            Some(json!("true")),
+            Some(RuntimeDispatchErrorKind::InvalidResult),
+        ),
+        (
+            Some(json!(null)),
+            Some(RuntimeDispatchErrorKind::InvalidResult),
+        ),
+        (Some(json!(false)), None),
+        (None, None),
+    ] {
+        let mut output = json!({"content":[{"type":"text","text":"private-content-sentinel"}]});
+        if let Some(flag) = flag {
+            output["isError"] = flag;
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let receipts = Arc::new(Mutex::new(Vec::new()));
+        let client = McpHostHttpClient::new(
+            ToolResultHttp {
+                output,
+                calls: calls.clone(),
+            },
+            StaticMcpHostHttpEgressPlanner::new(McpHostHttpEgressPlan {
+                network_policy: NetworkPolicy {
+                    deny_redirects: true,
+                    allowed_targets: Vec::new(),
+                    deny_private_ip_ranges: true,
+                    max_egress_bytes: Some(4096),
+                },
+                credential_injections: Vec::new(),
+                response_body_limit: Some(4096),
+                timeout_ms: Some(1000),
+            }),
+        );
+        let adapter = McpRuntimeAdapter::from_executor(Arc::new(ReceiptObserver {
+            runtime: McpRuntime::new(McpRuntimeConfig::for_testing(), client),
+            receipts: receipts.clone(),
+        }));
+        let descriptor = test_descriptor(RuntimeKind::Mcp, Vec::new());
+        let filesystem = DiskFilesystem::new();
+        let governor = InMemoryResourceGovernor::new();
+        let package = test_package(MCP_MANIFEST, "test");
+        let policy = policy_with(
+            FilesystemBackendKind::HostWorkspace,
+            ProcessBackendKind::LocalHost,
+            NetworkMode::DirectLogged,
+            SecretMode::ScrubbedEnv,
+        );
+        let result = adapter
+            .dispatch_json(RuntimeAdapterRequest {
+                run_id: None,
+                package: &package,
+                descriptor: &descriptor,
+                filesystem: &filesystem,
+                governor: &governor,
+                runtime_policy: &policy,
+                capability_id: &descriptor.id,
+                scope: sample_scope(),
+                authenticated_actor_user_id: None,
+                estimate: ResourceEstimate::default(),
+                mounts: None,
+                resource_reservation: None,
+                input: json!({"query":"invalid tool input"}),
+            })
+            .await;
+        match expected {
+            Some(expected) => {
+                let error = result.expect_err("tool errors cannot be successful dispatches");
+                assert!(matches!(&error, DispatchError::Mcp { kind, .. } if *kind == expected));
+                assert!(!format!("{error:?} {error}").contains("private-content-sentinel"));
+            }
+            None => {
+                result.expect("missing or false isError remains successful");
+            }
+        }
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &["initialize", "notifications/initialized", "tools/call"]
+        );
+        let receipts = receipts.lock().unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].status, ReservationStatus::Reconciled);
+    }
+}
+
+struct ToolResultHttp {
+    output: serde_json::Value,
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl McpHostHttp for ToolResultHttp {
+    async fn request(
+        &self,
+        request: ironclaw_host_api::CapabilityHostHttpRequest,
+    ) -> Result<McpHostHttpResponse, McpHostHttpError> {
+        let rpc: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let method = rpc["method"].as_str().unwrap();
+        self.calls.lock().unwrap().push(method.to_owned());
+        let result = match method {
+            "initialize" => json!({"protocolVersion":"2025-06-18","capabilities":{}}),
+            "notifications/initialized" => serde_json::Value::Null,
+            "tools/call" => self.output.clone(),
+            _ => panic!("unexpected HTTP method"),
+        };
+        Ok(McpHostHttpResponse {
+            status: if method == "notifications/initialized" {
+                202
+            } else {
+                200
+            },
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            body: serde_json::to_vec(&json!({"jsonrpc":"2.0","id":rpc["id"],"result":result}))
+                .unwrap(),
+            saved_body: None,
+            request_bytes: request.body.len() as u64,
+            response_bytes: 0,
+            redaction_applied: false,
+        })
+    }
+}
+
+struct ReceiptObserver<C> {
+    runtime: McpRuntime<C>,
+    receipts: Arc<Mutex<Vec<ResourceReceipt>>>,
+}
+
+#[async_trait]
+impl<C: McpClient> McpExecutor for ReceiptObserver<C> {
+    async fn execute_extension_json(
+        &self,
+        governor: &dyn ResourceGovernor,
+        request: McpExecutionRequest<'_>,
+    ) -> Result<McpExecutionResult, McpError> {
+        let result = self
+            .runtime
+            .execute_extension_json(governor, request)
+            .await?;
+        self.receipts.lock().unwrap().push(result.receipt.clone());
+        Ok(result)
+    }
+}
 
 struct AuthRequiredMcpExecutor {
     requirement: RuntimeCredentialAuthRequirement,

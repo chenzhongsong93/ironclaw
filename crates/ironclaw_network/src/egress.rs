@@ -121,7 +121,7 @@ where
             // network policy does not already allow. Credential-bearing headers
             // are stripped before the next hop so a host-injected token never
             // follows a redirect off its audience host.
-            if redirects_remaining == 0 || !is_redirect_status(response.status) {
+            if request.policy.deny_redirects || redirects_remaining == 0 || !is_redirect_status(response.status) {
                 return Ok(response);
             }
             let Some(location) = find_header(&response.headers, "location") else {

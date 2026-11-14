@@ -29,6 +29,7 @@ pub mod nearai_chat;
 pub mod openai_codex_provider;
 pub(crate) mod openai_codex_session;
 mod provider;
+mod provider_policy;
 mod reasoning;
 pub mod recording;
 pub mod registry;
@@ -2029,3 +2030,8 @@ mod tests {
         assert_eq!(route_anthropic(&config).unwrap(), AnthropicRoute::Rig);
     }
 }
+
+#[cfg(test)]
+mod minimax_inline_contract_tests;
+
+mod usage_normalization;

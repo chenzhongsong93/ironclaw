@@ -50,8 +50,8 @@ use tracing::{Instrument, field};
 use crate::{
     AllowAllTurnAdmissionLimitProvider, CancelRunRequest, CancelRunResponse, EventCursor,
     GetLoopCheckpointRequest, GetRunStateRequest, LoopCheckpointRecord, LoopCheckpointStore,
-    PutLoopCheckpointRequest, ResumeTurnRequest, ResumeTurnResponse, RetryTurnRequest,
-    RetryTurnResponse, RunProfileResolver, SpawnTreeReservation, SubmitChildRunRequest,
+    PutLoopCheckpointRequest, RecoverTurnRequest, ResumeTurnRequest, ResumeTurnResponse,
+    RetryTurnRequest, RetryTurnResponse, RunProfileResolver, SpawnTreeReservation, SubmitChildRunRequest,
     SubmitTurnRequest, SubmitTurnResponse, TurnAdmissionLimitProvider, TurnAdmissionPolicy,
     TurnError, TurnEventPage, TurnEventProjectionSource, TurnPersistenceSnapshot, TurnRunId,
     TurnRunRecord, TurnRunState, TurnScope, TurnSpawnTreeStateStore, TurnStateStore, TurnStatus,
@@ -748,6 +748,16 @@ where
         }
     }
 
+    async fn recover_turn(
+        &self,
+        request: RecoverTurnRequest,
+    ) -> Result<ResumeTurnResponse, TurnError> {
+        match self {
+            Self::Blob(store) => store.recover_turn(request).await,
+            Self::Row(store) => store.recover_turn(request).await,
+        }
+    }
+
     async fn request_cancel(
         &self,
         request: CancelRunRequest,
@@ -1117,6 +1127,20 @@ where
             async move {
                 // WS-3 implements failed-run retry semantics and idempotency.
                 let outcome = store.retry_turn(request).await;
+                (outcome, store)
+            }
+        })
+        .await
+    }
+
+    async fn recover_turn(
+        &self,
+        request: RecoverTurnRequest,
+    ) -> Result<ResumeTurnResponse, TurnError> {
+        self.apply(RunnerLeaseOverlay::None, |store| {
+            let request = request.clone();
+            async move {
+                let outcome = store.recover_turn(request).await;
                 (outcome, store)
             }
         })

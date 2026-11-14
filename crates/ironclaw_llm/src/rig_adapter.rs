@@ -646,6 +646,40 @@ fn convert_tool_choice(choice: Option<&str>) -> Option<RigToolChoice> {
     }
 }
 
+// MiniMax-M3's OpenAI compatible endpoint places leading reasoning in text.
+const MINIMAX_INLINE_PREFIX_ID: &str = "ironclaw.minimax-inline-prefix";
+
+fn split_minimax_prefix(raw: &str) -> (&str, &str) {
+    let Some(open) = raw.trim_start().strip_prefix("<think>") else {
+        return ("", raw);
+    };
+    let Some(end) = open.find("</think>") else {
+        return (raw, "");
+    };
+    let boundary = raw.len() - open.len() + end + "</think>".len();
+    raw.split_at(boundary)
+}
+
+fn restore_minimax_tool_history(messages: &mut [ChatMessage], minimax: bool) {
+    for msg in messages {
+        let Some(details) = msg.reasoning_details.as_mut() else { continue };
+        if details.id.as_deref() != Some(MINIMAX_INLINE_PREFIX_ID) {
+            continue;
+        }
+        if minimax && msg.role == crate::Role::Assistant && msg.tool_calls.is_some() {
+            if let Some(IronReasoningDetail::Text { text, signature: None }) =
+                details.content.first()
+            {
+                msg.content.insert_str(0, text);
+            }
+        }
+        if !details.content.is_empty() {
+            details.content.remove(0);
+        }
+        details.id = None;
+    }
+}
+
 fn message_has_reasoning(msg: &ChatMessage) -> bool {
     msg.reasoning_details
         .as_ref()
@@ -975,7 +1009,7 @@ fn inject_model_override(
 impl<M> LlmProvider for RigAdapter<M>
 where
     M: CompletionModel + Send + Sync + 'static,
-    M::Response: Send + Sync + Serialize + DeserializeOwned,
+    M::Response: Send + Sync + Serialize + DeserializeOwned + 'static,
 {
     fn model_name(&self) -> &str {
         &self.model_name
@@ -1015,13 +1049,16 @@ where
         mut request: CompletionRequest,
     ) -> Result<CompletionResponse, LlmError> {
         let model_override = request.take_model_override();
+        let minimax = model_override.as_deref().unwrap_or(&self.model_name)
+            .eq_ignore_ascii_case("MiniMax-M3");
 
         request.max_tokens = self.effective_max_tokens(request.max_tokens);
         self.strip_unsupported_completion_params(&mut request);
 
         let mut messages = request.messages;
         crate::provider::sanitize_tool_messages(&mut messages);
-        let (preamble, history) = convert_messages(&messages, self.discard_reasoning);
+        restore_minimax_tool_history(&mut messages, minimax);
+        let (preamble, history) = convert_messages(&messages, self.discard_reasoning || minimax);
 
         let mut rig_req = build_rig_request(
             preamble,
@@ -1044,13 +1081,37 @@ where
 
         let (text, _tool_calls, finish, _reasoning, _reasoning_details) =
             extract_response(&response.choice, &response.usage);
+        let mut content = text.unwrap_or_default();
+        let mut reasoning = None;
+        if minimax {
+            let (prefix, final_text) = split_minimax_prefix(&content);
+            if final_text.trim().is_empty() {
+                return Err(LlmError::EmptyResponse { provider: self.model_name.clone() });
+            }
+            if !prefix.is_empty() {
+                reasoning = Some(prefix.to_owned());
+                content = final_text.to_owned();
+            }
+        }
 
+        let normalized = crate::usage_normalization::from_rig_response(&response.raw_response)
+            .ok()
+            .filter(|value| {
+                let (_, output, read, create, _) = value.parts();
+                output == saturate_u32(response.usage.output_tokens)
+                    && read == saturate_u32(response.usage.cached_input_tokens)
+                    && create == extract_cache_creation(&response.raw_response)
+            });
+        let normalization_version = normalized.map(|_| 1);
         let resp = CompletionResponse {
-            content: text.unwrap_or_default(),
+            content,
             input_tokens: saturate_u32(response.usage.input_tokens),
+            normalization_version,
+            normalized_input_tokens: normalized.map(|value| value.parts().0),
+            cache_details_observed: normalized.map(|value| value.cache_details_observed()),
             output_tokens: saturate_u32(response.usage.output_tokens),
             finish_reason: finish,
-            reasoning: None,
+            reasoning,
             cache_read_input_tokens: saturate_u32(response.usage.cached_input_tokens),
             cache_creation_input_tokens: extract_cache_creation(&response.raw_response),
         };
@@ -1073,6 +1134,8 @@ where
         mut request: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
         let model_override = request.take_model_override();
+        let minimax = model_override.as_deref().unwrap_or(&self.model_name)
+            .eq_ignore_ascii_case("MiniMax-M3");
 
         request.max_tokens = self.effective_max_tokens(request.max_tokens);
         self.strip_unsupported_tool_params(&mut request);
@@ -1082,7 +1145,8 @@ where
 
         let mut messages = request.messages;
         crate::provider::sanitize_tool_messages(&mut messages);
-        let (preamble, history) = convert_messages(&messages, self.discard_reasoning);
+        restore_minimax_tool_history(&mut messages, minimax);
+        let (preamble, history) = convert_messages(&messages, self.discard_reasoning || minimax);
         let tools = convert_tools(&request.tools);
         let tool_choice = convert_tool_choice(request.tool_choice.as_deref());
 
@@ -1105,7 +1169,7 @@ where
             .await
             .map_err(|e| map_rig_error(&self.model_name, e))?;
 
-        let (text, mut tool_calls, finish, mut reasoning, mut reasoning_details) =
+        let (mut text, mut tool_calls, finish, mut reasoning, mut reasoning_details) =
             extract_response(&response.choice, &response.usage);
 
         if self.discard_reasoning {
@@ -1115,6 +1179,28 @@ where
             // validation never triggers.
             reasoning = None;
             reasoning_details = None;
+        }
+
+        if minimax {
+            let (prefix, final_text) = split_minimax_prefix(text.as_deref().unwrap_or_default());
+            if final_text.trim().is_empty() && tool_calls.is_empty() {
+                return Err(LlmError::EmptyResponse { provider: self.model_name.clone() });
+            }
+            if !prefix.is_empty() {
+                reasoning = Some(prefix.to_owned());
+                if !tool_calls.is_empty() {
+                    let details = reasoning_details.get_or_insert_with(|| IronReasoningDetails {
+                        id: None,
+                        content: Vec::new(),
+                    });
+                    details.id = Some(MINIMAX_INLINE_PREFIX_ID.into());
+                    details.content.insert(0, IronReasoningDetail::Text {
+                        text: prefix.to_owned(),
+                        signature: None,
+                    });
+                }
+                text = (!final_text.trim().is_empty()).then(|| final_text.to_owned());
+            }
         }
 
         // Normalize tool call names: some proxies prepend "proxy_" prefixes.
@@ -1140,10 +1226,22 @@ where
             crate::tool_schema::PlaceholderStrippingMode::NullOnly,
         );
 
+        let normalized = crate::usage_normalization::from_rig_response(&response.raw_response)
+            .ok()
+            .filter(|value| {
+                let (_, output, read, create, _) = value.parts();
+                output == saturate_u32(response.usage.output_tokens)
+                    && read == saturate_u32(response.usage.cached_input_tokens)
+                    && create == extract_cache_creation(&response.raw_response)
+            });
+        let normalization_version = normalized.map(|_| 1);
         let resp = ToolCompletionResponse {
             content: text,
             tool_calls,
             input_tokens: saturate_u32(response.usage.input_tokens),
+            normalization_version,
+            normalized_input_tokens: normalized.map(|value| value.parts().0),
+            cache_details_observed: normalized.map(|value| value.cache_details_observed()),
             output_tokens: saturate_u32(response.usage.output_tokens),
             finish_reason: finish,
             cache_read_input_tokens: saturate_u32(response.usage.cached_input_tokens),

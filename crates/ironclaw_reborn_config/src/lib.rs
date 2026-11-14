@@ -28,6 +28,7 @@ mod config_file;
 mod config_seed;
 mod doctor;
 mod home;
+mod http_timeouts;
 mod profile;
 mod secrets_guard;
 
@@ -58,5 +59,7 @@ pub use config_seed::{
 };
 pub use doctor::RebornDoctorReport;
 pub use home::{REBORN_HOME_ENV, RebornConfigError, RebornHome, RebornHomeSource};
+/// composition factory与MCP egress planner的等待预算；见http_timeout_contract测试。
+pub use http_timeouts::{HostHttpTimeoutError, HostHttpTimeouts};
 pub use profile::{REBORN_PROFILE_ENV, RebornProfile};
 pub use secrets_guard::{InlineSecretError, reject_inline_secret};

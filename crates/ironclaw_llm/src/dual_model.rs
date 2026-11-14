@@ -176,6 +176,9 @@ mod tests {
             _request: CompletionRequest,
         ) -> Result<CompletionResponse, LlmError> {
             Ok(CompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: self.name.to_string(),
                 input_tokens: 0,
                 output_tokens: 0,
@@ -190,6 +193,9 @@ mod tests {
             _request: ToolCompletionRequest,
         ) -> Result<ToolCompletionResponse, LlmError> {
             Ok(ToolCompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: Some(self.name.to_string()),
                 tool_calls: Vec::new(),
                 input_tokens: 0,

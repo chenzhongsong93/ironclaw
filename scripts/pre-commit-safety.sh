@@ -34,7 +34,13 @@
 set -euo pipefail
 
 TEST_BOUNDARIES_FILE=""
-GATEWAY_APP_JS_TMP=""
+GATEWAY_JS_TMP=""
+REVIEW_TREE=""
+cleanup() {
+    rm -f "${TEST_BOUNDARIES_FILE:-}" "${GATEWAY_JS_TMP:-}"
+    if [ -n "$REVIEW_TREE" ]; then rm -rf "$REVIEW_TREE"; fi
+}
+trap cleanup EXIT
 
 # Determine a suitable base ref for standalone diffs.
 resolve_base_ref() {
@@ -59,17 +65,46 @@ resolve_base_ref() {
     exit 1
 }
 
-# i18n parity: when any language pack changes, all languages must stay in sync.
-# Run before the .rs-focused checks so it fires even when no .rs files change.
-if git diff --cached --quiet 2>/dev/null; then
+# Choose one review scope for ALL checks. An empty path subset is not a
+# reason to fall back to history when any other file is staged.
+if git diff --cached --quiet; then
     HAS_STAGED_CHANGES=0
-    I18N_CHANGED=$(git diff --name-only -- 'crates/ironclaw_gateway/static/i18n/*.js' 2>/dev/null || true)
-    GATEWAY_APP_JS_CHANGED=$(git diff --name-only -- 'crates/ironclaw_gateway/static/js/' 2>/dev/null || true)
+    BASE_REF="$(resolve_base_ref)"
+    DIFF_ARGS=("$BASE_REF")
 else
+    status=$?
+    if [ "$status" -ne 1 ]; then exit "$status"; fi
     HAS_STAGED_CHANGES=1
-    I18N_CHANGED=$(git diff --cached --name-only -- 'crates/ironclaw_gateway/static/i18n/*.js' 2>/dev/null || true)
-    GATEWAY_APP_JS_CHANGED=$(git diff --cached --name-only -- 'crates/ironclaw_gateway/static/js/' 2>/dev/null || true)
+    DIFF_ARGS=(--cached)
 fi
+review_diff() { git diff "${DIFF_ARGS[@]}" "$@"; }
+
+file_content_for_file() {
+    local f="$1"
+    if [ "$HAS_STAGED_CHANGES" -eq 1 ]; then
+        git show ":$f"
+    else
+        cat "$f"
+    fi
+}
+
+# Existing whole-tree gates need baseline dependencies as well as changed
+# files. Export only their indexed inputs to a disposable data tree, never
+# touching the real index/config or reading unrelated files (e.g. credentials).
+prepare_review_tree() {
+    [ -z "$REVIEW_TREE" ] || return 0
+    REVIEW_TREE=$(mktemp -d "${TMPDIR:-/tmp}/precommit-review.XXXXXX")
+    git ls-files -z -- 'crates/**/*.rs' \
+        'crates/ironclaw_gateway/static/i18n/*.js' \
+        'scripts/check-i18n-parity.sh' \
+        'scripts/ci/check-composition-budget.sh' \
+        'scripts/ci/composition-budget.toml' \
+        | git checkout-index --stdin -z --prefix="$REVIEW_TREE/"
+}
+
+# i18n parity fires even when no Rust files change.
+I18N_CHANGED=$(review_diff --name-only -- 'crates/ironclaw_gateway/static/i18n/*.js')
+GATEWAY_APP_JS_CHANGED=$(review_diff --name-only --diff-filter=ACMR -- 'crates/ironclaw_gateway/static/js/')
 if [ -n "$I18N_CHANGED" ]; then
     # Resolve script location even when invoked via a symlink (the
     # pre-commit hook is typically a symlink at .git/hooks/pre-commit
@@ -84,7 +119,13 @@ if [ -n "$I18N_CHANGED" ]; then
         esac
     done
     SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
-    if ! "$SCRIPT_DIR/check-i18n-parity.sh"; then
+    if [ "$HAS_STAGED_CHANGES" -eq 1 ]; then
+        prepare_review_tree
+        I18N_SCRIPT="$REVIEW_TREE/scripts/check-i18n-parity.sh"
+    else
+        I18N_SCRIPT="$SCRIPT_DIR/check-i18n-parity.sh"
+    fi
+    if ! bash "$I18N_SCRIPT"; then
         echo ""
         echo "Commit blocked: i18n parity check failed."
         echo "Every key added to en.js must also be added to all other language files (zh-CN.js, ko.js, ...)."
@@ -110,17 +151,12 @@ if [ -n "$GATEWAY_APP_JS_CHANGED" ]; then
     fi
 
     GATEWAY_JS_TMP=$(mktemp "${TMPDIR:-/tmp}/gateway-js.XXXXXX.js")
-    trap 'rm -f "${TEST_BOUNDARIES_FILE:-}" "${GATEWAY_JS_TMP:-}"' EXIT
     FAILED=0
     while IFS= read -r f; do
         [ -z "$f" ] && continue
-        # Only validate files still present (skip deletes).
-        if [ "$HAS_STAGED_CHANGES" -eq 1 ]; then
-            git show ":$f" > "$GATEWAY_JS_TMP" 2>/dev/null || continue
-        else
-            [ -f "$f" ] || continue
-            cp "$f" "$GATEWAY_JS_TMP"
-        fi
+        # Deletes were excluded by the scoped name-only diff. Any read failure
+        # for a remaining path must block instead of silently skipping review.
+        file_content_for_file "$f" > "$GATEWAY_JS_TMP"
         if ! node --check "$GATEWAY_JS_TMP" >/dev/null 2>&1; then
             echo "  ✗ syntax error: $f"
             FAILED=1
@@ -141,21 +177,12 @@ fi
 # (composition growth OR another crate shrinking both lift the share — the metric
 # is a ratio) or a change to the gate itself.
 #
-# LIMITATION: the gate measures the WORKING TREE, not the staged index, so an
-# unstaged edit can mask a staged breach or cause a false block. This hook is a
-# fast local advisory; CI (.github/workflows/code_style.yml) runs the gate on the
-# actual merge commit and is the authoritative check.
-if [ "$HAS_STAGED_CHANGES" -eq 1 ]; then
-    COMPOSITION_STAGED=$(git diff --cached --name-only -- \
-        'crates/**/*.rs' \
-        'scripts/ci/composition-budget.toml' \
-        'scripts/ci/check-composition-budget.sh' 2>/dev/null || true)
-else
-    COMPOSITION_STAGED=$(git diff --name-only -- \
-        'crates/**/*.rs' \
-        'scripts/ci/composition-budget.toml' \
-        'scripts/ci/check-composition-budget.sh' 2>/dev/null || true)
-fi
+# Staged checks measure an indexed data snapshot; standalone measures the
+# working tree. CI still checks the actual merge commit with the same budget.
+COMPOSITION_STAGED=$(review_diff --name-only -- \
+    'crates/**/*.rs' \
+    'scripts/ci/composition-budget.toml' \
+    'scripts/ci/check-composition-budget.sh')
 if [ -n "$COMPOSITION_STAGED" ]; then
     SOURCE="${BASH_SOURCE[0]:-$0}"
     while [ -L "$SOURCE" ]; do
@@ -166,7 +193,13 @@ if [ -n "$COMPOSITION_STAGED" ]; then
         esac
     done
     PCS_SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
-    if ! "$PCS_SCRIPT_DIR/ci/check-composition-budget.sh"; then
+    if [ "$HAS_STAGED_CHANGES" -eq 1 ]; then
+        prepare_review_tree
+        COMPOSITION_SCRIPT="$REVIEW_TREE/scripts/ci/check-composition-budget.sh"
+    else
+        COMPOSITION_SCRIPT="$PCS_SCRIPT_DIR/ci/check-composition-budget.sh"
+    fi
+    if ! bash "$COMPOSITION_SCRIPT"; then
         echo ""
         echo "Commit blocked: composition mass budget exceeded (see above)."
         echo "Carve behavior out of ironclaw_reborn_composition, or raise the ceiling in"
@@ -175,65 +208,73 @@ if [ -n "$COMPOSITION_STAGED" ]; then
     fi
 fi
 
-# Support both pre-commit hook (staged files) and standalone (all changed vs base)
-if git diff --cached --quiet 2>/dev/null; then
-    # No staged changes -- compare working tree against a resolved base ref
-    BASE_REF="$(resolve_base_ref)"
-    DIFF_OUTPUT=$(git diff "$BASE_REF" -- '*.rs' 2>/dev/null || true)
-    CHANGED_FILES=$(git diff --name-only "$BASE_REF" -- '*.rs' 2>/dev/null || true)
+# Keep standalone context; staged checks use precise added-line hunks.
+if [ "$HAS_STAGED_CHANGES" -eq 1 ]; then
+    DIFF_OUTPUT=$(review_diff -U0 -- '*.rs')
 else
-    DIFF_OUTPUT=$(git diff --cached -U0 -- '*.rs' 2>/dev/null || true)
-    CHANGED_FILES=$(git diff --cached --name-only --diff-filter=AM -- '*.rs' 2>/dev/null || true)
+    DIFF_OUTPUT=$(review_diff -- '*.rs')
 fi
+CHANGED_FILES=$(review_diff --name-only --diff-filter=ACMR -- '*.rs')
 
 # Early exit if there are no relevant .rs changes
 if [ -z "$DIFF_OUTPUT" ]; then
     exit 0
 fi
 
-# Build a "test mod start line" lookup per changed file by scanning the actual
-# file content. The previous heuristic relied on `mod tests` appearing in the
-# git diff hunk header (`@@ ... mod tests @@`), but that context only shows up
-# for tiny edits inside a known test fn — and never for brand-new files added
-# in a merge. Reading the file directly catches both cases.
+# Find closed top-level test module ranges in the SAME content view as the
+# diff. Names and hunk context do not establish test-only compilation: cfg
+# must require `test` (including all(test, ...), never any(test, feature)).
 TEST_BOUNDARIES_FILE=$(mktemp)
-trap 'rm -f "${TEST_BOUNDARIES_FILE:-}" "${GATEWAY_APP_JS_TMP:-}"' EXIT
-for f in $CHANGED_FILES; do
-    [ -f "$f" ] || continue
-    test_line=$(awk '
-        /^#\[cfg\(test\)\]/ { cfg_at = NR; next }
-        cfg_at && /^mod tests([[:space:]]*\{)?[[:space:]]*$/ { print NR; exit }
-        cfg_at && NF > 0 && !/^[[:space:]]*$/ { cfg_at = 0 }
-    ' "$f")
-    if [ -n "$test_line" ]; then
-        printf '%s\t%s\n' "$f" "$test_line" >> "$TEST_BOUNDARIES_FILE"
+while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    test_ranges=$(file_content_for_file "$f" | awk '
+        # Conservative recognition of formatted top-level modules: cfg(test)
+        # or cfg(all(test, ...)) requires test regardless of feature flags.
+        # Only emit a range when its top-level closing brace is observed.
+        /^#\[cfg[[:space:]]*\(/ { cfg = $0; collecting = 1 }
+        collecting {
+            if (cfg != $0) cfg = cfg $0
+            if (cfg !~ /\][[:space:]]*$/) next
+            gsub(/[[:space:]]/, "", cfg)
+            required = (cfg == "#[cfg(test)]" || cfg ~ /^#\[cfg\(all\(test[,)]/)
+            collecting = 0
+            next
+        }
+        required && /^mod[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\{[[:space:]]*$/ {
+            start = NR; required = 0; next
+        }
+        start && /^\}[[:space:]]*(\/\/.*)?$/ { print start "\t" NR; start = 0 }
+        NF && !/^[[:space:]]*\/\// && !/^#\[/ { required = 0 }
+    ')
+    if [ -n "$test_ranges" ]; then
+        while IFS= read -r range; do
+            printf '%s\t%s\n' "$f" "$range" >> "$TEST_BOUNDARIES_FILE"
+        done <<<"$test_ranges"
     fi
-done
+done <<<"$CHANGED_FILES"
 
-# Filter a unified diff (DIFF_OUTPUT-shaped) to drop `+` lines that come from
-# test code: either inside a `#[cfg(test)] mod tests` block (per the
-# precomputed boundaries) or in any file under the top-level `tests/` dir.
+# Drop added lines in the observed closed test-module ranges or conventional
+# test files. Never extend a test-module range to the rest of its source file.
 # Marker, header, and context lines pass through untouched so downstream
 # grep/awk pipelines still see file/hunk anchors.
 strip_test_mod_lines() {
     awk -v boundaries="$TEST_BOUNDARIES_FILE" '
         BEGIN {
             while ((getline line < boundaries) > 0) {
-                idx = index(line, "\t")
-                if (idx) {
-                    f = substr(line, 1, idx - 1)
-                    test_start[f] = substr(line, idx + 1) + 0
+                if (split(line, fields, "\t") == 3) {
+                    f = fields[1]
+                    n = ++range_count[f]
+                    test_start[f, n] = fields[2] + 0
+                    test_end[f, n] = fields[3] + 0
                 }
             }
             close(boundaries)
             cur_file = ""
-            cur_start = 0
             cur_skip_all = 0
             new_line = 0
         }
         /^\+\+\+ b\// {
             cur_file = substr($0, 7)
-            cur_start = (cur_file in test_start) ? test_start[cur_file] : 0
             cur_skip_all = (cur_file ~ /(^|\/)tests\// ||
                 cur_file ~ /(^|\/)tests\.rs$/ ||
                 cur_file ~ /(^|\/)test_[^\/]+\.rs$/ ||
@@ -243,7 +284,7 @@ strip_test_mod_lines() {
             next
         }
         /^\+\+\+ / {
-            cur_file = ""; cur_start = 0; cur_skip_all = 0; new_line = 0
+            cur_file = ""; cur_skip_all = 0; new_line = 0
             print
             next
         }
@@ -266,7 +307,11 @@ strip_test_mod_lines() {
         /^\+/ {
             new_line++
             if (cur_skip_all) next
-            if (cur_start > 0 && new_line >= cur_start) next
+            in_test = 0
+            for (i = 1; i <= range_count[cur_file]; i++) {
+                if (new_line >= test_start[cur_file, i] && new_line <= test_end[cur_file, i]) in_test = 1
+            }
+            if (in_test) next
             print
             next
         }
@@ -294,23 +339,7 @@ arch_exempt_re() {
     printf '//[[:space:]]*arch-exempt:[[:space:]]*%s,[[:space:]]*.+,[[:space:]]*plan #[0-9]+' "$category"
 }
 
-diff_for_file() {
-    local f="$1"
-    if [ "$HAS_STAGED_CHANGES" -eq 1 ]; then
-        git diff --cached -U0 -- "$f" 2>/dev/null || true
-    else
-        git diff "$BASE_REF" -U0 -- "$f" 2>/dev/null || true
-    fi
-}
-
-file_content_for_file() {
-    local f="$1"
-    if [ "$HAS_STAGED_CHANGES" -eq 1 ]; then
-        git show ":$f" 2>/dev/null || true
-    else
-        cat "$f" 2>/dev/null || true
-    fi
-}
+diff_for_file() { review_diff -U0 -- "$1"; }
 
 # 1. Unsafe UTF-8 byte slicing: &s[..N] or &s[..some_var] on strings
 #    Safe patterns: is_char_boundary, char_indices, // safety:
@@ -341,7 +370,7 @@ fi
 # 5. Multi-step DB operations without transaction
 #    Uses -W (function context) to reduce false positives from existing transactions.
 #    Suppressible with "// safety:" in the hunk.
-DIFF_W_OUTPUT=$(git diff --cached -W -- '*.rs' 2>/dev/null || git diff "$(resolve_base_ref)" -W -- '*.rs' 2>/dev/null || true)
+DIFF_W_OUTPUT=$(review_diff -W -- '*.rs')
 if [ -n "$DIFF_W_OUTPUT" ]; then
     HUNK_COUNT=$(echo "$DIFF_W_OUTPUT" | awk '
         /^@@/ {
@@ -383,14 +412,7 @@ fi
 PROD_DIFF="$DIFF_OUTPUT_NO_TESTS"
 # Strip hunks from test-only files (tests/ directory, *_test.rs, test_*.rs)
 PROD_DIFF=$(echo "$PROD_DIFF" | grep -v '^+++ b/tests/' || true)
-# Strip hunks whose @@ context line indicates a test module.
-# git diff includes the enclosing function/module name after @@.
-# Only match `mod tests` (the conventional #[cfg(test)] module) — do NOT
-# match `fn test_*` because production code can have functions named test_*.
-PROD_DIFF=$(echo "$PROD_DIFF" | awk '
-    /^@@ / { in_test = ($0 ~ /mod tests/) }
-    !in_test { print }
-' || true)
+# Test compilation is established by indexed cfg ranges, not hunk names.
 if echo "$PROD_DIFF" | grep -nE '^\+' \
     | grep -E '\.(unwrap|expect)\(|[^_]assert(_eq|_ne)?!' \
     | grep -vE 'debug_assert|// safety:|#\[cfg\(test\)\]|#\[test\]|mod tests' \
@@ -411,10 +433,7 @@ fi
 #    The check looks at .rs files under src/channels/web/handlers/ and
 #    src/cli/ for newly-added lines that touch direct manager fields on the
 #    gateway state. Suppress with "// dispatch-exempt: <reason>".
-DISPATCH_DIFF=$(git diff --cached -U0 -- 'src/channels/web/handlers/*.rs' 'src/cli/*.rs' 2>/dev/null || true)
-if [ "$HAS_STAGED_CHANGES" -eq 0 ] && [ -z "$DISPATCH_DIFF" ]; then
-    DISPATCH_DIFF=$(git diff "$(resolve_base_ref)" -U0 -- 'src/channels/web/handlers/*.rs' 'src/cli/*.rs' 2>/dev/null || true)
-fi
+DISPATCH_DIFF=$(review_diff -U0 -- 'src/channels/web/handlers/*.rs' 'src/cli/*.rs')
 if [ -n "$DISPATCH_DIFF" ]; then
     DISPATCH_HITS=$(echo "$DISPATCH_DIFF" | grep -nE '^\+' \
         | grep -E 'state\.(store|workspace|workspace_pool|extension_manager|skill_registry|session_manager)\.' \
@@ -438,10 +457,7 @@ fi
 #    Suppress with "// web-identity-exempt: <reason>" when the reference
 #    is genuinely reading an already-typed value off a backend struct
 #    (e.g., destructuring `ResumeKind::Authentication` to log the name).
-WEB_IDENTITY_DIFF=$(git diff --cached -U0 -- 'src/channels/web/*.rs' 'src/channels/web/**/*.rs' 2>/dev/null || true)
-if [ -z "$WEB_IDENTITY_DIFF" ]; then
-    WEB_IDENTITY_DIFF=$(git diff "$(resolve_base_ref)" -U0 -- 'src/channels/web/*.rs' 'src/channels/web/**/*.rs' 2>/dev/null || true)
-fi
+WEB_IDENTITY_DIFF=$(review_diff -U0 -- 'src/channels/web/*.rs' 'src/channels/web/**/*.rs')
 if [ -n "$WEB_IDENTITY_DIFF" ]; then
     # Strip lines inside `#[cfg(test)] mod tests` blocks using the same
     # precomputed boundaries used for other prod-only checks.
@@ -538,7 +554,15 @@ if [ -n "$PUB_DECL_LINES" ]; then
         [ -z "$ident" ] && continue
         # Count repo-wide occurrences of the identifier as a whole word.
         # `git grep -w` is fast and respects .gitignore; one hit == definition only.
-        occ=$(git grep -wIE "$ident" -- '*.rs' 2>/dev/null | wc -l | tr -d ' ')
+        GREP_ARGS=()
+        if [ "$HAS_STAGED_CHANGES" -eq 1 ]; then GREP_ARGS=(--cached); fi
+        occ=$({
+            if git grep "${GREP_ARGS[@]}" -wIE "$ident" -- '*.rs'; then :;
+            else
+                status=$?
+                [ "$status" -eq 1 ] || exit "$status"
+            fi
+        } | wc -l | tr -d ' ')
         if [ "${occ:-0}" -le 1 ]; then
             PUB_API_HITS="${PUB_API_HITS}    ${ident} (${occ:-0} occurrence) — ${line#+}
 "
@@ -674,22 +698,22 @@ fi
 
 LARGE_FILE_EXEMPT_RE=$(arch_exempt_re "large_file")
 LARGE_FILE_HITS=""
-for f in $CHANGED_FILES; do
+while IFS= read -r f; do
     case "$f" in
         src/*.rs|crates/*.rs) ;;
         *) continue ;;
     esac
-    [ -f "$f" ] || continue
     line_count=$(file_content_for_file "$f" | wc -l | tr -d ' ')
     [ "${line_count:-0}" -gt 1500 ] || continue
     file_diff=$(diff_for_file "$f")
     added_count=$(printf '%s\n' "$file_diff" | awk '/^\+/ && !/^\+\+\+ / { count++ } END { print count + 0 }')
     [ "${added_count:-0}" -gt 0 ] || continue
-    if ! file_content_for_file "$f" | grep -Eq "$LARGE_FILE_EXEMPT_RE"; then
+    content=$(file_content_for_file "$f")
+    if ! printf '%s\n' "$content" | grep -E "$LARGE_FILE_EXEMPT_RE" >/dev/null; then
         LARGE_FILE_HITS="${LARGE_FILE_HITS}    ${f} (${line_count} lines, +${added_count})
 "
     fi
-done
+done <<<"$CHANGED_FILES"
 if [ -n "$LARGE_FILE_HITS" ]; then
     warn "ARCH-SPRAWL" "Adding to a .rs file over 1,500 lines requires '// arch-exempt: large_file, <reason>, plan #NNNN' or a decomposition follow-up."
     printf '%s' "$LARGE_FILE_HITS" | head -5

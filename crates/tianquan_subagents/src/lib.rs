@@ -56,6 +56,30 @@ impl TianquanSubagentDefinitionResolver {
 
 #[async_trait]
 impl SubagentDefinitionResolver for TianquanSubagentDefinitionResolver {
+    async fn resolve_kind_for_run(
+        &self,
+        kind: &SubagentKindId,
+        parent: &LoopRunContext,
+    ) -> Result<Option<SubagentDefinition>, AgentLoopHostError> {
+        use ironclaw_turns::run_profile::PrivilegedRunProfileDimension;
+        let profile = &parent.resolved_run_profile;
+        if profile.profile_id.as_str() != "reborn-tianquan-novel-reviewer" {
+            return self.resolve_kind(kind).await;
+        }
+        if kind.as_str() != "auditor" || profile.profile_version.as_u64() != 1
+            || !profile.provenance.effective_privileges.contains(&PrivilegedRunProfileDimension::SpecialDriver)
+        {
+            return Ok(None);
+        }
+        let requested_run_profile = RunProfileRequest::new(profile.profile_id.as_str())
+            .map_err(|reason| AgentLoopHostError::new(AgentLoopHostErrorKind::Internal, reason))?;
+        Ok(Some(SubagentDefinition {
+            subagent_kind: kind.clone(),
+            allow_nesting: false,
+            requested_run_profile,
+        }))
+    }
+
     async fn resolve_kind(
         &self,
         kind: &SubagentKindId,

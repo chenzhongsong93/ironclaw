@@ -9,6 +9,7 @@ layer = "runtimes"
 
 [dependencies]
 async-trait = "0.1"
+tracing = "0.1"
 base64 = "0.22"
 futures-util = "0.3"
 hex = "0.4"

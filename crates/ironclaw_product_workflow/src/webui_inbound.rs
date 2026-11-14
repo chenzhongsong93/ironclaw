@@ -7,8 +7,8 @@
 use ironclaw_attachments::InboundAttachment;
 use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_turns::{
-    CancelRunRequest, GateRef, IdempotencyKey, SanitizedCancelReason, TurnActor, TurnRunId,
-    TurnScope,
+    CancelRunRequest, GateRef, IdempotencyKey, SanitizedCancelReason, SanitizedFailure, TurnActor,
+    TurnCheckpointId, TurnRunId, TurnScope,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -287,6 +287,21 @@ pub struct WebUiRetryRunRequest {
     pub run_id: Option<String>,
 }
 
+/// Browser body for one exact same-root in-place recovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WebUiRecoverRunRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_action_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_checkpoint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_failure_category: Option<String>,
+}
+
 /// Browser query for WebUI list-threads read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct WebUiListThreadsRequest {
@@ -479,6 +494,14 @@ pub enum WebUiInboundCommand {
         run_id: TurnRunId,
         client_action_id: IdempotencyKey,
     },
+    RecoverRun {
+        scope: TurnScope,
+        actor: TurnActor,
+        run_id: TurnRunId,
+        expected_checkpoint_id: TurnCheckpointId,
+        expected_failure_category: String,
+        client_action_id: IdempotencyKey,
+    },
 }
 
 impl WebUiCreateThreadRequest {
@@ -573,6 +596,27 @@ impl WebUiRetryRunRequest {
     }
 }
 
+impl WebUiRecoverRunRequest {
+    pub fn into_command(
+        self,
+        caller: WebUiAuthenticatedCaller,
+    ) -> Result<WebUiInboundCommand, WebUiInboundValidationError> {
+        let client_action_id = parse_client_action_id(self.client_action_id)?;
+        let thread_id = parse_thread_id(self.thread_id)?;
+        let run_id = parse_run_id(self.run_id)?;
+        let expected_checkpoint_id = parse_checkpoint_id(self.expected_checkpoint_id)?;
+        let expected_failure_category = parse_failure_category(self.expected_failure_category)?;
+        Ok(WebUiInboundCommand::RecoverRun {
+            scope: caller.turn_scope(thread_id),
+            actor: caller.actor(),
+            run_id,
+            expected_checkpoint_id,
+            expected_failure_category,
+            client_action_id,
+        })
+    }
+}
+
 impl WebUiResolveGateRequest {
     pub fn into_command(
         self,
@@ -658,6 +702,35 @@ fn parse_run_id(value: Option<String>) -> Result<TurnRunId, WebUiInboundValidati
         .map(TurnRunId::from_uuid)
         .map_err(|_| {
             WebUiInboundValidationError::new("run_id", WebUiInboundValidationCode::InvalidId)
+        })
+}
+
+fn parse_checkpoint_id(
+    value: Option<String>,
+) -> Result<TurnCheckpointId, WebUiInboundValidationError> {
+    let value = required_text("expected_checkpoint_id", value, 64, TextMode::Token)?;
+    TurnCheckpointId::parse(&value).map_err(|_| {
+        WebUiInboundValidationError::new(
+            "expected_checkpoint_id",
+            WebUiInboundValidationCode::InvalidId,
+        )
+    })
+}
+
+fn parse_failure_category(value: Option<String>) -> Result<String, WebUiInboundValidationError> {
+    let value = required_text(
+        "expected_failure_category",
+        value,
+        128,
+        TextMode::Token,
+    )?;
+    SanitizedFailure::new(value)
+        .map(SanitizedFailure::into_category)
+        .map_err(|_| {
+            WebUiInboundValidationError::new(
+                "expected_failure_category",
+                WebUiInboundValidationCode::InvalidValue,
+            )
         })
 }
 

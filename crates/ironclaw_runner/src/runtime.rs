@@ -44,7 +44,8 @@ use crate::{
     },
     model_routes::ModelRouteResolver,
     planned_driver_factory::{
-        DefaultPlannedDriverRegistrationError, default_planned_run_profile_resolver,
+        DefaultPlannedDriverRegistrationError, default_planned_run_profile_registry,
+        planned_run_profile_resolver_from_registry,
         register_default_planned_driver, register_default_text_only_driver,
         register_subagent_planned_driver,
     },
@@ -60,6 +61,10 @@ use crate::{
         TurnRunSchedulerHandle, TurnRunWakeChannel,
     },
 };
+
+mod product_driver;
+pub use product_driver::ProductRunDriver;
+pub(crate) use product_driver::ProductCapabilityPolicy;
 
 /// Default number of turn-runner worker tasks spawned per runtime instance.
 ///
@@ -259,6 +264,7 @@ impl<T> RuntimeTurnStateStore for T where
 pub struct SchedulerWakeWiring {
     notifier: Arc<SchedulerTurnRunWakeNotifier>,
     channel: TurnRunWakeChannel,
+    startup_execution: Arc<crate::startup_execution::StartupExecutionLatch>,
 }
 
 impl SchedulerWakeWiring {
@@ -268,11 +274,13 @@ impl SchedulerWakeWiring {
         let (notifier, channel) = SchedulerTurnRunWakeNotifier::channel(
             TurnRunSchedulerConfig::default().wake_channel_capacity(),
         );
-        Self { notifier, channel }
+        Self { notifier, channel, startup_execution:crate::startup_execution::StartupExecutionLatch::open() }
     }
 
     /// Return a clone of the notifier so callers can register it with other
     /// services before the scheduler is started.
+    pub fn with_startup_execution(mut self,latch:Arc<crate::startup_execution::StartupExecutionLatch>)->Self {self.startup_execution=latch;self}
+
     pub fn notifier(&self) -> Arc<SchedulerTurnRunWakeNotifier> {
         Arc::clone(&self.notifier)
     }
@@ -280,7 +288,7 @@ impl SchedulerWakeWiring {
     /// Start the scheduler loop, consuming the carrier.  Returns the handle
     /// so callers can query liveness and request shutdown.
     pub(crate) fn start(self, scheduler: TurnRunScheduler) -> TurnRunSchedulerHandle {
-        scheduler.start_with_channel(self.notifier, self.channel)
+        scheduler.start_with_channel_and_startup_execution(self.notifier, self.channel,self.startup_execution)
     }
 }
 
@@ -509,7 +517,28 @@ impl Error for ProductLiveRuntimeBuildError {
 }
 
 pub fn build_product_live_planned_runtime<G>(
+    parts: DefaultPlannedRuntimeParts<G>,
+) -> Result<RebornRuntimeLoopComposition<dyn SessionThreadService, G>, ProductLiveRuntimeBuildError>
+where
+    G: HostManagedModelGateway + ?Sized + Send + Sync + 'static,
+{
+    build_product_live_runtime_with_optional_driver(parts, None)
+}
+
+/// Install a concrete host product driver before admitting turns.
+pub fn build_product_live_planned_runtime_with_driver<G>(
+    parts: DefaultPlannedRuntimeParts<G>,
+    driver: ProductRunDriver,
+) -> Result<RebornRuntimeLoopComposition<dyn SessionThreadService, G>, ProductLiveRuntimeBuildError>
+where
+    G: HostManagedModelGateway + ?Sized + Send + Sync + 'static,
+{
+    build_product_live_runtime_with_optional_driver(parts, Some(driver))
+}
+
+fn build_product_live_runtime_with_optional_driver<G>(
     mut parts: DefaultPlannedRuntimeParts<G>,
+    driver: Option<ProductRunDriver>,
 ) -> Result<RebornRuntimeLoopComposition<dyn SessionThreadService, G>, ProductLiveRuntimeBuildError>
 where
     G: HostManagedModelGateway + ?Sized + Send + Sync + 'static,
@@ -570,7 +599,7 @@ where
         .with_checkpoint_state_store(Arc::clone(&parts.checkpoint_state_store))
         .with_cancellation_factory(cancellation_factory),
     );
-    build_default_planned_runtime(parts).map_err(ProductLiveRuntimeBuildError::Runtime)
+    build_default_planned_runtime_inner(parts, driver).map_err(ProductLiveRuntimeBuildError::Runtime)
 }
 
 fn local_development_noop_safety_context() -> InstructionSafetyContext {
@@ -589,11 +618,26 @@ pub fn build_default_planned_runtime<G>(
 where
     G: HostManagedModelGateway + ?Sized + Send + Sync + 'static,
 {
-    build_default_planned_runtime_inner(parts)
+    build_default_planned_runtime_inner(parts, None)
+}
+
+/// Extend the default host with one explicitly trusted product profile.
+pub fn build_default_planned_runtime_with_driver<G>(
+    parts: DefaultPlannedRuntimeParts<G>,
+    driver: ProductRunDriver,
+) -> Result<
+    RebornRuntimeLoopComposition<dyn SessionThreadService, G>,
+    DefaultPlannedRuntimeBuildError,
+>
+where
+    G: HostManagedModelGateway + ?Sized + Send + Sync + 'static,
+{
+    build_default_planned_runtime_inner(parts, Some(driver))
 }
 
 fn build_default_planned_runtime_inner<G>(
     parts: DefaultPlannedRuntimeParts<G>,
+    product_driver: Option<ProductRunDriver>,
 ) -> Result<
     RebornRuntimeLoopComposition<dyn SessionThreadService, G>,
     DefaultPlannedRuntimeBuildError,
@@ -618,10 +662,15 @@ where
     })?;
     register_default_planned_driver(&mut registry, Arc::clone(&family_registry))?;
     register_subagent_planned_driver(&mut registry, family_registry)?;
+    let mut profile_registry = default_planned_run_profile_registry()
+        .map_err(|error| DefaultPlannedRuntimeBuildError::RunProfile(error.to_string()))?;
+    let product_capability_policy = product_driver
+        .map(|driver| driver.register(&mut registry, &mut profile_registry))
+        .transpose()?;
     let driver_registry = Arc::new(registry);
 
     let resolver = Arc::new(
-        default_planned_run_profile_resolver()
+        planned_run_profile_resolver_from_registry(profile_registry)
             .map_err(|error| DefaultPlannedRuntimeBuildError::RunProfile(error.to_string()))?,
     );
     let run_profile_resolver: Arc<dyn RunProfileResolver> = resolver;
@@ -705,7 +754,13 @@ where
         .subagent_flavor_catalog
         .clone()
         .unwrap_or_else(flavors::builtin_flavor_catalog);
-    let subagent_prompt_composer = SubagentPromptComposer::new(Arc::clone(&subagent_prompt_source));
+    // 同一宿主adapter接到spawn-start与实际child prompt，不能只接其中一端。
+    let opaque_input_port = subagent_prompt_source.opaque_input_port();
+    let subagent_prompt_composer = match opaque_input_port.clone() {
+        Some(port) => SubagentPromptComposer::new(Arc::clone(&subagent_prompt_source))
+            .with_opaque_input_port(port),
+        None => SubagentPromptComposer::new(Arc::clone(&subagent_prompt_source)),
+    };
     let spawn_decorator = Arc::new(SubagentSpawnCapabilityDecorator::new(
         SubagentSpawnDeps {
             coordinator: Arc::clone(&coordinator) as Arc<dyn ironclaw_turns::TurnCoordinator>,
@@ -722,7 +777,7 @@ where
         subagent_flavor_catalog,
         Arc::clone(&spawn_counters),
         Arc::clone(&spawn_authorizations),
-    )?);
+    )?.with_opaque_input_port(opaque_input_port));
     let mut capability_factory_builder =
         DecoratingLoopCapabilityPortFactory::new(parts.capability_factory)
             .with_decorator(spawn_decorator);
@@ -790,15 +845,19 @@ where
         parts.thread_scope,
         Arc::clone(&parts.model_gateway),
         parts.checkpoint_state_store,
-        turn_state_store,
+        Arc::clone(&turn_state_store),
         Arc::clone(&parts.loop_checkpoint_store),
         parts.milestone_sink,
         parts.config.host,
         safety_context,
     )
     .with_profiled_capability_port_factory(capability_factory, capability_surface_resolver)
+    .with_host_product_await_recovery(parts.subagent_await_edge_evidence, turn_state_store)
     .with_subagent_prompt_composer(subagent_prompt_composer)
     .with_driver_requirements(driver_registry.requirements_snapshot());
+    if let Some(policy) = product_capability_policy {
+        host_factory = host_factory.with_product_capability_policy(policy);
+    }
     if let Some(resolver) = parts.model_route_resolver {
         host_factory = host_factory.with_model_route_resolver(resolver);
     }
@@ -1009,6 +1068,7 @@ struct SubagentSpawnCapabilityDecorator {
     /// Shared counter registry keyed by the parent run id. Each decorated port
     /// obtains its parent's counter, and terminal lifecycle events remove it.
     spawn_counters: Arc<RunScopedSpawnCounterRegistry>,
+    opaque_input_port: Option<Arc<dyn ironclaw_loop_host::SubagentOpaqueInputPort>>,
 }
 
 impl SubagentSpawnCapabilityDecorator {
@@ -1031,7 +1091,13 @@ impl SubagentSpawnCapabilityDecorator {
             parameters_schema,
             spawn_authorizations,
             spawn_counters,
+            opaque_input_port: None,
         })
+    }
+
+    fn with_opaque_input_port(mut self, port: Option<Arc<dyn ironclaw_loop_host::SubagentOpaqueInputPort>>) -> Self {
+        self.opaque_input_port = port;
+        self
     }
 }
 
@@ -1045,7 +1111,7 @@ impl LoopCapabilityPortDecorator for SubagentSpawnCapabilityDecorator {
         // schema tree on every decorate() call (the schema is rendered to a
         // serde_json::Value only at the single render site in
         // spawn_tool_definition / spawn_descriptor when the model requests it).
-        Arc::new(SubagentSpawnCapabilityPort::new_with_shared_state(
+        let port = SubagentSpawnCapabilityPort::new_with_shared_state(
             inner,
             run_context.clone(),
             self.spawn_id.clone(),
@@ -1054,7 +1120,11 @@ impl LoopCapabilityPortDecorator for SubagentSpawnCapabilityDecorator {
             Arc::clone(&self.parameters_schema),
             self.spawn_authorizations.map_for(run_context.run_id),
             self.spawn_counters.counter_for(run_context.run_id),
-        ))
+        );
+        match self.opaque_input_port.clone() {
+            Some(opaque) => Arc::new(port.with_opaque_input_port(opaque)),
+            None => Arc::new(port),
+        }
     }
 }
 

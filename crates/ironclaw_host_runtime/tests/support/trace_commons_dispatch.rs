@@ -287,6 +287,7 @@ pub fn execution_context_read_only(
 /// reach the loopback mock.
 pub fn allow_all_network_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: None,
             host_pattern: "127.0.0.1".to_string(),
@@ -303,6 +304,7 @@ pub fn allow_all_network_policy() -> NetworkPolicy {
 /// reach private destinations through onboarding once the policy is enforced.
 pub fn deny_private_ip_network_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: None,
             host_pattern: "127.0.0.1".to_string(),

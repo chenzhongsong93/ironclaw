@@ -69,6 +69,9 @@ impl LlmProvider for MockLlmProvider {
             .unwrap_or_else(|| "no user message".to_string());
 
         Ok(CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: format!("Mock response to: {}", user_msg),
             input_tokens: 10,
             output_tokens: 5,
@@ -92,6 +95,9 @@ impl LlmProvider for MockLlmProvider {
         // If tools are provided, return a tool call
         if let Some(tool) = req.tools.first() {
             Ok(ToolCompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: None,
                 tool_calls: vec![ironclaw_llm::ToolCall {
                     id: "call_mock_001".to_string(),
@@ -111,6 +117,9 @@ impl LlmProvider for MockLlmProvider {
             })
         } else {
             Ok(ToolCompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: Some("No tools available".to_string()),
                 tool_calls: vec![],
                 input_tokens: 10,
@@ -154,6 +163,9 @@ impl LlmProvider for FixedModelProvider {
 
     async fn complete(&self, _req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         Ok(CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: "fixed response".to_string(),
             input_tokens: 10,
             output_tokens: 5,
@@ -169,6 +181,9 @@ impl LlmProvider for FixedModelProvider {
         _req: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
         Ok(ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: Some("fixed response".to_string()),
             tool_calls: vec![],
             input_tokens: 10,

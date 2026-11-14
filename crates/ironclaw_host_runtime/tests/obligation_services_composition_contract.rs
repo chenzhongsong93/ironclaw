@@ -43,6 +43,7 @@ async fn default_runtime_installs_configured_builtin_obligation_services() {
 
     let secret_handle = SecretHandle::new("api_token").unwrap();
     let expected_policy = NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "api.example.com".to_string(),

@@ -4914,6 +4914,7 @@ fn save_target_with_mount(path: &str, mounts: &MountView) -> RuntimeHttpSaveTarg
 
 fn sample_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "api.example.test".to_string(),
@@ -4926,6 +4927,7 @@ fn sample_policy() -> NetworkPolicy {
 
 fn caller_supplied_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "caller.example.test".to_string(),
@@ -4938,6 +4940,7 @@ fn caller_supplied_policy() -> NetworkPolicy {
 
 fn local_http_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Http),
             host_pattern: "127.0.0.1".to_string(),
@@ -4962,4 +4965,19 @@ fn single_response_server_owned(response: String) -> (String, std::thread::JoinH
         stream.write_all(response.as_bytes()).unwrap();
     });
     (format!("http://127.0.0.1:{port}/test"), handle)
+}
+
+#[tokio::test]
+async fn actual_host_egress_caller_never_drops_staged_or_request_redirect_denial() {
+    for (stored_denial,request_denial) in [(true,false),(false,true),(true,true),(false,false)] {
+        let network=RecordingNetwork::ok(NetworkHttpResponse {status:200,headers:vec![],body:b"ok".to_vec(),usage:NetworkUsage::default()});
+        let requests=network.requests.clone();let services=test_obligation_services();let scope=sample_scope();
+        let capability_id=CapabilityId::new("builtin.http").unwrap();let mut stored=sample_policy();stored.deny_redirects=stored_denial;
+        stage_policy(&services,&scope,&capability_id,stored).await;
+        let service=services.host_http_egress(network);let mut requested=sample_policy();requested.deny_redirects=request_denial;
+        service.execute(RuntimeHttpEgressRequest {runtime:RuntimeKind::FirstParty,scope,capability_id,method:NetworkMethod::Get,
+            url:"https://api.example.test/v1/items".into(),headers:vec![],body:vec![],network_policy:requested,credential_injections:vec![],
+            response_body_limit:Some(1024),save_body_to:None,timeout_ms:None}).await.unwrap();
+        let recorded=requests.lock().unwrap();assert_eq!(recorded.len(),1);assert_eq!(recorded[0].policy.deny_redirects,stored_denial||request_denial);
+    }
 }

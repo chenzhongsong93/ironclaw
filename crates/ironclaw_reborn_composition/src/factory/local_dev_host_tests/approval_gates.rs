@@ -900,6 +900,7 @@ fn shell_allowed_effects() -> Vec<EffectKind> {
 
 fn shell_network_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: None,
             host_pattern: "*".to_string(),

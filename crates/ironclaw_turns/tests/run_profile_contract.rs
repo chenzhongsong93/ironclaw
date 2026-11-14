@@ -99,6 +99,44 @@ async fn unauthorized_long_running_profile_request_rejects_before_fallback() {
 }
 
 #[tokio::test]
+async fn host_product_profile_requires_special_driver_authority_and_exact_checkpoint() {
+    use ironclaw_turns::{AgentLoopDriverDescriptor, InMemoryRunProfileRegistry};
+    use ironclaw_turns::run_profile::{CapabilitySurfaceProfileId, RunProfileDefinition};
+
+    let profile = RunProfileId::new("host-review-profile").unwrap();
+    let surface = CapabilitySurfaceProfileId::new("host-review-tools").unwrap();
+    let descriptor = AgentLoopDriverDescriptor::new("host:review", RunProfileVersion::new(2))
+        .unwrap();
+    assert!(RunProfileDefinition::host_product_driver(
+        profile.clone(), descriptor.clone(), surface.clone(),
+    ).is_err());
+    let descriptor = descriptor
+        .with_checkpoint_schema("review-checkpoint", RunProfileVersion::new(1))
+        .unwrap();
+    let mut profiles = InMemoryRunProfileRegistry::with_builtin_profiles();
+    profiles.register(RunProfileDefinition::host_product_driver(
+        profile.clone(), descriptor.clone(), surface.clone(),
+    ).unwrap()).unwrap();
+    let resolver = InMemoryRunProfileResolver::new(profiles);
+    let request = RunProfileResolutionRequest::interactive_default()
+        .with_requested_run_profile(RunProfileRequest::new(profile.as_str()).unwrap());
+    assert_eq!(
+        resolver.resolve_run_profile(request.clone()).await.unwrap_err(),
+        RunProfileResolutionError::Unauthorized {
+            dimension: PrivilegedRunProfileDimension::SpecialDriver,
+        }
+    );
+    let resolved = resolver.resolve_run_profile(
+        request.with_authority(RunProfileRequestAuthority::ProductSurface),
+    ).await.unwrap();
+    assert_eq!(resolved.profile_id, profile);
+    assert_eq!(resolved.profile_version, RunProfileVersion::new(2));
+    assert_eq!(resolved.loop_driver, descriptor);
+    assert_eq!(resolved.checkpoint_schema_id.as_str(), "review-checkpoint");
+    assert_eq!(resolved.capability_surface_profile_id, surface);
+}
+
+#[tokio::test]
 async fn authorized_long_running_profile_resolves_distinct_driver_and_budget_envelope() {
     let resolver = InMemoryRunProfileResolver::default();
     let request = RunProfileResolutionRequest::interactive_default()

@@ -308,13 +308,18 @@ async fn turn_event_payloads(
     // Downstream SSE consumers commonly stop as soon as they observe
     // `completed`/`failed`; putting TurnCost second would strand billing even
     // though both payloads share the same durable event cursor.
-    if matches!(event.kind, TurnEventKind::Completed | TurnEventKind::Failed)
+    if (matches!(event.kind, TurnEventKind::Completed | TurnEventKind::Failed)
+        || matches!(event.kind, TurnEventKind::Cancelled)
+            && event
+                .model_usage
+                .as_ref()
+                .is_some_and(|usage| usage.normalized_input_total().is_some()))
         && let Some(usage) = &event.model_usage
     {
         payloads.push(ProductOutboundPayload::TurnCost(TurnCostView {
             turn_run_id: event.run_id,
             thread_id: event.scope.thread_id.to_string(),
-            input_tokens: u64::from(usage.input_tokens),
+            input_tokens: u64::from(usage.normalized_input_total().unwrap_or(usage.input_tokens)),
             output_tokens: u64::from(usage.output_tokens),
             // No pricing table is wired in the projection layer; consumers
             // only settle on the two token fields and tolerate an empty cost.

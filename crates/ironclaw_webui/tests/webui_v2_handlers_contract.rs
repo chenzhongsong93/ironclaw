@@ -255,7 +255,6 @@ struct StubServices {
     next_thread_plan_response: Mutex<
         Option<Result<ironclaw_product_workflow::RebornGetThreadPlanResponse, RebornServicesError>>,
     >,
-    get_run_state_calls: Mutex<Vec<(WebUiAuthenticatedCaller, RebornGetRunStateRequest)>>,
     next_run_state_response: Mutex<Option<Result<RebornGetRunStateResponse, RebornServicesError>>>,
     browse_fs_calls: Mutex<Vec<RebornFsListRequest>>,
     global_auto_approve_enabled: Mutex<bool>,
@@ -265,6 +264,8 @@ struct StubServices {
     read_attachment_calls: Mutex<Vec<RebornAttachmentRequest>>,
     read_attachment_response: Mutex<Option<RebornAttachmentBytes>>,
     stream_events_calls: Mutex<Vec<RebornStreamEventsRequest>>,
+    get_run_state_calls: Mutex<Vec<(WebUiAuthenticatedCaller, RebornGetRunStateRequest)>>,
+    get_run_state_response: Mutex<Option<RebornGetRunStateResponse>>,
     cancel_run_calls: Mutex<Vec<WebUiCancelRunRequest>>,
     resolve_gate_calls: Mutex<Vec<WebUiResolveGateRequest>>,
     retry_run_calls: Mutex<Vec<WebUiRetryRunRequest>>,
@@ -784,11 +785,14 @@ impl RebornServicesApi for StubServices {
             .lock()
             .unwrap()
             .push((caller, request));
-        self.next_run_state_response
+        if let Some(response) = self.next_run_state_response.lock().expect("lock").take() {
+            return response;
+        }
+        self.get_run_state_response
             .lock()
-            .unwrap()
+            .expect("lock")
             .take()
-            .unwrap_or_else(|| Err(service_unavailable_error(true)))
+            .ok_or_else(|| service_unavailable_error(true))
     }
 
     async fn cancel_run(
@@ -2018,6 +2022,52 @@ async fn get_timeline_forwards_query_params_to_facade() {
         Some("opaque-from-browser"),
         "?cursor= must reach the facade"
     );
+}
+
+#[tokio::test]
+async fn get_run_state_forwards_authenticated_caller_and_exact_path() {
+    let services = Arc::new(StubServices::default());
+    let run_id = TurnRunId::new();
+    let run = RebornGetRunStateResponse {
+        turn_id: "turn-alpha".to_string(),
+        run_id,
+        status: TurnStatus::Completed,
+        event_cursor: EventCursor(3),
+        accepted_message_ref: ironclaw_turns::AcceptedMessageRef::new("msg:accepted")
+            .expect("accepted message ref"),
+        resolved_run_profile_id: "persisted-test-profile".to_string(),
+        resolved_run_profile_version: 2,
+        received_at: chrono::Utc::now(),
+        checkpoint_id: None,
+        gate_ref: None,
+        failure: None,
+        usage: None,
+        cost: None,
+    };
+    *services.get_run_state_response.lock().expect("lock") = Some(run.clone());
+    let router = router_with(services.clone());
+    let path = format!("/api/webchat/v2/threads/thread-alpha/runs/{run_id}");
+    let request = || {
+        Request::builder()
+            .method(Method::GET)
+            .uri(path.as_str())
+            .body(Body::empty())
+            .expect("request")
+    };
+    let response = router.clone().oneshot(request()).await.expect("oneshot");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(read_json(response).await, serde_json::to_value(run).expect("run"));
+    let missing = router.oneshot(request()).await.expect("oneshot");
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let expected = (
+        caller(),
+        RebornGetRunStateRequest {
+            thread_id: "thread-alpha".to_string(),
+            run_id: run_id.to_string(),
+        },
+    );
+    assert_eq!(*services.get_run_state_calls.lock().expect("lock"), [expected.clone(), expected]);
 }
 
 #[tokio::test]

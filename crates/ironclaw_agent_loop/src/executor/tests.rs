@@ -1704,12 +1704,18 @@ async fn cumulative_usage_counts_capability_call_and_reply_turns() {
     let result_ref = LoopResultRef::new("result:done").expect("valid");
     // Turn 1 is a capability call carrying its own usage; turn 2 is the reply.
     let calls_usage = LoopModelUsage {
+        normalization_version: None,
+        normalized_input_tokens: None,
+        cache_details_observed: None,
         input_tokens: 100,
         output_tokens: 0,
         cache_read_input_tokens: 0,
         cache_creation_input_tokens: 0,
     };
     let reply_usage = LoopModelUsage {
+        normalization_version: None,
+        normalized_input_tokens: None,
+        cache_details_observed: None,
         input_tokens: 40,
         output_tokens: 20,
         cache_read_input_tokens: 0,
@@ -1752,6 +1758,9 @@ async fn cumulative_usage_counts_capability_call_and_reply_turns() {
             assert_eq!(
                 completed.model_usage,
                 Some(LoopModelUsage {
+                    normalization_version: None,
+                    normalized_input_tokens: None,
+                    cache_details_observed: None,
                     input_tokens: 140,
                     output_tokens: 20,
                     cache_read_input_tokens: 0,

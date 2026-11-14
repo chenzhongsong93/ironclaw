@@ -1,7 +1,7 @@
 // arch-exempt: large_file, mechanical §4.3 store swap only — InMemory{CheckpointState,LoopCheckpoint}Store deleted; test helper added over FilesystemCheckpointStateStore<InMemoryBackend> (arch-simplification §4.3), plan #6168
 use std::sync::Arc;
 
-use ironclaw_host_api::{AgentId, ApprovalRequestId, TenantId, ThreadId, UserId};
+use ironclaw_host_api::{AgentId, ApprovalRequestId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_loop_host::SpawnSubagentMode;
 use ironclaw_threads::{
     AppendAssistantDraftRequest, EnsureThreadRequest, InMemorySessionThreadService, MessageContent,
@@ -1030,6 +1030,86 @@ async fn thread_checkpoint_evidence_rejects_stored_thread_scope_mismatch() {
 
     assert!(matches!(err, TurnError::InvalidRequest { .. }));
     assert!(err.to_string().contains("scope does not match"));
+}
+
+#[tokio::test]
+async fn thread_checkpoint_evidence_binds_template_project_to_turn_scope() {
+    let thread_service = Arc::new(InMemorySessionThreadService::default());
+    let tenant_id = TenantId::new("tenant").expect("valid");
+    let agent_id = AgentId::new("agent").expect("valid");
+    let project_id = ProjectId::new("project").expect("valid");
+    let thread_id = ThreadId::new("thread-project").expect("valid");
+    let owner = UserId::new("owner").expect("valid");
+    let turn_scope = TurnScope::new_with_owner(
+        tenant_id.clone(),
+        Some(agent_id.clone()),
+        Some(project_id.clone()),
+        thread_id.clone(),
+        Some(owner.clone()),
+    );
+    let actual_scope = ThreadScope {
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        project_id: Some(project_id),
+        owner_user_id: Some(owner.clone()),
+        mission_id: None,
+    };
+    thread_service
+        .ensure_thread(EnsureThreadRequest {
+            scope: actual_scope.clone(),
+            thread_id: Some(thread_id.clone()),
+            created_by_actor_id: owner.to_string(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .expect("thread");
+    let run_id = TurnRunId::new();
+    let draft = thread_service
+        .append_assistant_draft(AppendAssistantDraftRequest {
+            scope: actual_scope.clone(),
+            thread_id: thread_id.clone(),
+            turn_run_id: run_id.to_string(),
+            content: MessageContent::text("project-scoped reply"),
+        })
+        .await
+        .expect("draft");
+    thread_service
+        .finalize_assistant_message(
+            &actual_scope,
+            &thread_id,
+            draft.message_id,
+            MessageContent::text("project-scoped reply"),
+        )
+        .await
+        .expect("finalized");
+
+    // Composition stores a reusable tenant/agent template without a project;
+    // the claimed turn supplies the concrete project at evidence-read time.
+    let template_scope = ThreadScope {
+        project_id: None,
+        ..actual_scope
+    };
+    let evidence = ThreadCheckpointLoopExitEvidencePort::new_with_thread_scope(
+        thread_service,
+        Arc::new(in_memory_turn_state_store()) as Arc<dyn TurnStateStore>,
+        Arc::new(PanicLoopCheckpointStore),
+        empty_await_dependent_run_evidence(),
+        template_scope,
+    );
+    let message_ref =
+        LoopMessageRef::new(format!("msg:{}", draft.message_id)).expect("valid message ref");
+
+    assert!(evidence
+        .verify_completion_refs(CompletionEvidenceRequest {
+            scope: &turn_scope,
+            turn_id: TurnId::new(),
+            run_id,
+            reply_message_refs: &[message_ref],
+            result_refs: &[],
+        })
+        .await
+        .expect("project-scoped evidence read"));
 }
 
 #[tokio::test]

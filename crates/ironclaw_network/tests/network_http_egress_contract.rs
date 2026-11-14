@@ -93,6 +93,63 @@ async fn http_egress_forwards_timeout_to_transport() {
     assert_eq!(requests[0].timeout_ms, Some(250));
 }
 
+// 覆盖:AE-L2-109网络caller部分；真实localhost延迟，不修改默认transport或SSRF边界。
+#[tokio::test]
+async fn explicitly_bounded_transport_can_finish_after_default_thirty_seconds() {
+    for (host_limit, requested, delay, succeeds) in [
+        (
+            Duration::from_secs(60),
+            60_000,
+            Duration::from_secs(31),
+            true,
+        ),
+        (
+            Duration::from_millis(50),
+            60_000,
+            Duration::from_millis(200),
+            false,
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1];
+            stream.read_exact(&mut request).unwrap();
+            std::thread::sleep(delay);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        });
+        let egress = PolicyNetworkHttpEgress::new_with_resolver(
+            ReqwestNetworkTransport::new(host_limit),
+            StaticResolver::new(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+        );
+        let start = Instant::now();
+        let result = egress
+            .execute(NetworkHttpRequest {
+                scope: sample_scope(),
+                method: NetworkMethod::Get,
+                url: format!("http://slow.example.test:{port}/test"),
+                headers: vec![],
+                body: vec![],
+                policy: policy("slow.example.test", Some(port), false, None),
+                response_body_limit: Some(1024),
+                timeout_ms: Some(requested),
+            })
+            .await;
+        let elapsed = start.elapsed();
+        assert_eq!(result.is_ok(), succeeds);
+        if let Ok(response) = result {
+            assert_eq!(response.status, 200);
+            assert_eq!(response.body, b"ok");
+            assert!(elapsed >= Duration::from_secs(30));
+        } else {
+            assert!(elapsed < Duration::from_secs(2));
+        }
+        server.join().unwrap();
+    }
+}
+
 #[tokio::test]
 async fn http_egress_forwards_sensitive_headers_in_zeroizing_transport_carrier() {
     let transport = RecordingTransport::ok(NetworkHttpResponse {
@@ -848,6 +905,7 @@ fn policy(
     max_egress_bytes: Option<u64>,
 ) -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: None,
             host_pattern: host_pattern.to_string(),
@@ -868,4 +926,19 @@ fn sample_scope() -> ResourceScope {
         thread_id: None,
         invocation_id: InvocationId::new(),
     }
+}
+
+#[tokio::test]
+async fn typed_deny_redirect_keeps_complete_first_response_without_same_host_path_hop() {
+    let mut first=redirect_response("https://api.example.test/another-path");
+    first.body=b"redirect-body-must-survive".to_vec();first.usage=NetworkUsage {request_bytes:17,response_bytes:first.body.len() as u64,resolved_ip:Some(IpAddr::V4(Ipv4Addr::new(93,184,216,34)))};
+    let transport=ScriptedTransport::new(vec![first,ok_response("must-not-send")]);
+    let requests=transport.requests.clone();let mut allow=policy("api.example.test",Some(443),true,None);allow.deny_redirects=true;
+    let egress=PolicyNetworkHttpEgress::new_with_resolver(transport,StaticResolver::new(vec![IpAddr::V4(Ipv4Addr::new(93,184,216,34))]));
+    let response=egress.execute(NetworkHttpRequest {scope:sample_scope(),method:NetworkMethod::Get,
+        url:"https://api.example.test/exact".into(),headers:vec![],body:vec![],policy:allow,
+        response_body_limit:Some(1024),timeout_ms:None}).await.unwrap();
+    assert_eq!(response.status,302);assert_eq!(requests.lock().unwrap().len(),1);
+    assert_eq!(response.body,b"redirect-body-must-survive");assert_eq!(response.usage.request_bytes,17);assert_eq!(response.usage.response_bytes,response.body.len() as u64);assert!(response.usage.resolved_ip.is_some());
+    assert!(response.headers.iter().any(|(k,v)|k.eq_ignore_ascii_case("location")&&v.ends_with("/another-path")));
 }

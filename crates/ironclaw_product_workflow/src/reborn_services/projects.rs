@@ -109,6 +109,10 @@ pub struct RebornProjectResponse {
 /// Browser body for creating a project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RebornCreateProjectRequest {
+    /// Optional server-supplied id used by a trusted platform exporter. The
+    /// browser surface omits it and keeps the normal generated-id behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     pub name: String,
     #[serde(default)]
     pub description: String,

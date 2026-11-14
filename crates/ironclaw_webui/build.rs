@@ -27,6 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=frontend/vite.config.ts");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SKIP_FRONTEND_BUILD");
+    println!("cargo:rerun-if-env-changed=IRONCLAW_WEBUI_FRONTEND_SOURCE_DIR");
 
     // The WebChat v2 route surface + SPA bundle is folded unconditionally into
     // this crate (it is the whole reason `ironclaw_webui` exists), so the
@@ -84,11 +85,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn frontend_source_dir(manifest_dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let source = env::var_os("IRONCLAW_WEBUI_FRONTEND_SOURCE_DIR").map(PathBuf::from);
+    resolve_frontend_source_dir(manifest_dir, &source)
+}
+
+fn resolve_frontend_source_dir(
+    manifest_dir: &Path,
+    override_dir: &Option<PathBuf>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let Some(source) = override_dir.as_ref() else {
+        // 未设置override时保持原目录与既有行为，不引入全局路径或额外skip。
+        return Ok(manifest_dir.join("frontend"));
+    };
+    if !source.is_absolute() || !source.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "IRONCLAW_WEBUI_FRONTEND_SOURCE_DIR must be an existing absolute directory",
+        )
+        .into());
+    }
+    Ok(source.clone())
+}
+
 fn build_frontend_dist(
     manifest_dir: &Path,
     generated_dist_dir: &Path,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let frontend_dir = manifest_dir.join("frontend");
+    let frontend_dir = frontend_source_dir(manifest_dir)?;
+    if env::var_os("IRONCLAW_WEBUI_FRONTEND_SOURCE_DIR").is_some() {
+        // 明确跟踪外部source stage，默认原frontend触发规则仍保留。
+        for source in [
+            "index.html",
+            "package.json",
+            "pnpm-lock.yaml",
+            "pnpm-workspace.yaml",
+            "public",
+            "src",
+            "vite.config.ts",
+        ] {
+            println!(
+                "cargo:rerun-if-changed={}",
+                frontend_dir.join(source).display()
+            );
+        }
+    }
     if generated_dist_dir.exists() {
         fs::remove_dir_all(generated_dist_dir)?;
     }
@@ -221,4 +262,72 @@ fn escape_url(s: &str) -> String {
     // literal `"` or `\`. Neither appears in disk file names by
     // convention, but escape defensively.
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod frontend_source_override_tests {
+    use super::resolve_frontend_source_dir;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    struct OwnedFixture(PathBuf);
+    impl OwnedFixture {
+        fn create() -> Self {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("当前时间")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "webui-source-override-{}-{stamp}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("只创建本轮新夹具，不复用既有目录");
+            Self(path)
+        }
+    }
+    impl Drop for OwnedFixture {
+        fn drop(&mut self) {
+            // 仅本对象实际create_dir成功的精确新目录，无计算共享路径或源码目录。
+            fs::remove_dir_all(&self.0).expect("清理本轮fixture");
+        }
+    }
+
+    #[test]
+    fn default_source_preserves_manifest_frontend() {
+        let fixture = OwnedFixture::create();
+        assert_eq!(
+            resolve_frontend_source_dir(&fixture.0, &None).unwrap(),
+            fixture.0.join("frontend")
+        );
+    }
+
+    #[test]
+    fn absolute_existing_source_uses_same_production_resolver() {
+        let fixture = OwnedFixture::create();
+        let stage = fixture.0.join("独立 source stage");
+        fs::create_dir(&stage).unwrap();
+        assert!(stage.is_absolute());
+        assert_eq!(
+            resolve_frontend_source_dir(&fixture.0, &Some(stage.clone())).unwrap(),
+            stage
+        );
+    }
+
+    #[test]
+    fn relative_empty_missing_and_file_overrides_are_rejected() {
+        let fixture = OwnedFixture::create();
+        let file = fixture.0.join("不是目录.txt");
+        fs::write(&file, b"fixture-only").unwrap();
+        for bad in [
+            PathBuf::from("relative-source"),
+            PathBuf::new(),
+            fixture.0.join("missing"),
+            file,
+        ] {
+            assert!(resolve_frontend_source_dir(&fixture.0, &Some(bad)).is_err());
+        }
+    }
 }

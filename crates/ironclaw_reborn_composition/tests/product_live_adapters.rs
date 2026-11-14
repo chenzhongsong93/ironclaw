@@ -553,6 +553,7 @@ async fn local_dev_adapter_invokes_builtin_shell_through_product_live_surface() 
             allowed_effects: shell_effects.clone(),
             mounts: MountView::default(),
             network: NetworkPolicy {
+                deny_redirects: false,
                 allowed_targets: vec![NetworkTargetPattern {
                     scheme: None,
                     host_pattern: "*".to_string(),
@@ -1833,6 +1834,7 @@ fn grant_for_principal_with_effects(
 
 fn local_dev_network_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: None,
             host_pattern: "*".to_string(),

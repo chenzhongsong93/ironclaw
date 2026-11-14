@@ -50,7 +50,7 @@ use ironclaw_product_workflow::{
     RebornOperatorSetupResponse, RebornOutboundDeliveryTargetListResponse,
     RebornOutboundPreferencesResponse, RebornProjectFsListRequest, RebornProjectFsListResponse,
     RebornProjectFsReadRequest, RebornProjectFsStatRequest, RebornProjectFsStatResponse,
-    RebornProjectMemberInfo, RebornProjectResponse, RebornRemoveMemberRequest,
+    RebornProjectMemberInfo, RebornProjectResponse, RebornRecoverRunResponse, RebornRemoveMemberRequest,
     RebornResolveGateResponse, RebornRetryRunResponse, RebornServicesApi, RebornServicesError,
     RebornServicesErrorCode, RebornServicesErrorKind, RebornSetOutboundPreferencesRequest,
     RebornSetupExtensionResponse, RebornSkillActionResponse, RebornSkillContentResponse,
@@ -61,7 +61,7 @@ use ironclaw_product_workflow::{
     UpsertLlmProviderRequest, WebUiAttachmentCapabilities, WebUiAuthenticatedCaller,
     WebUiCancelRunRequest, WebUiCommandDescriptor, WebUiCreateThreadRequest,
     WebUiInboundValidationCode, WebUiInboundValidationError, WebUiListAutomationsRequest,
-    WebUiListThreadsRequest, WebUiRenameAutomationRequest, WebUiResolveGateRequest,
+    WebUiListThreadsRequest, WebUiRecoverRunRequest, WebUiRenameAutomationRequest, WebUiResolveGateRequest,
     WebUiRetryRunRequest, WebUiSendMessageRequest, WebUiSetupExtensionRequest,
     execute_runtime_read_command, webui_attachment_capabilities, webui_command_descriptors,
 };
@@ -1076,7 +1076,7 @@ fn build_sse_stream(
                 Ok(Ok(subscription)) => subscription,
                 Ok(Err(error)) => {
                     tracing::debug!(
-                        target = "ironclaw_webui_v2::sse",
+                        target: "ironclaw_webui_v2::sse",
                         error = ?error,
                         "facade rejected SSE subscription; closing stream",
                     );
@@ -1104,7 +1104,7 @@ fn build_sse_stream(
                     }
                     Ok(Some(Err(error))) => {
                         tracing::debug!(
-                            target = "ironclaw_webui_v2::sse",
+                            target: "ironclaw_webui_v2::sse",
                             error = ?error,
                             "facade rejected SSE subscription event; closing stream",
                         );
@@ -1273,6 +1273,29 @@ pub async fn retry_run(
 
 #[derive(Debug, Deserialize)]
 pub struct RetryRunPath {
+    pub thread_id: String,
+    pub run_id: String,
+}
+
+/// `POST /api/webchat/v2/threads/{thread_id}/runs/{run_id}/recover`
+///
+/// Body shape: [`WebUiRecoverRunRequest`] (path overrides body for
+/// `thread_id` and `run_id`). This route is an exact same-root redrive, not
+/// the generic retry surface.
+pub async fn recover_run(
+    State(state): State<WebUiV2State>,
+    Extension(caller): Extension<WebUiAuthenticatedCaller>,
+    Path(RecoverRunPath { thread_id, run_id }): Path<RecoverRunPath>,
+    Json(mut body): Json<WebUiRecoverRunRequest>,
+) -> Result<Json<RebornRecoverRunResponse>, WebUiV2HttpError> {
+    body.thread_id = Some(thread_id);
+    body.run_id = Some(run_id);
+    let response = state.services().recover_run(caller, body).await?;
+    Ok(Json(response))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecoverRunPath {
     pub thread_id: String,
     pub run_id: String,
 }
@@ -2831,3 +2854,5 @@ mod tests {
         );
     }
 }
+
+pub(super) mod usage_tree;

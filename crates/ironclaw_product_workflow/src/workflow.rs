@@ -1430,7 +1430,7 @@ fn push_length_prefixed_component(bytes: &mut Vec<u8>, component: &str) {
     bytes.extend_from_slice(component_bytes);
 }
 
-fn lower_hex(bytes: &[u8]) -> String {
+pub(crate) fn lower_hex(bytes: &[u8]) -> String {
     const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

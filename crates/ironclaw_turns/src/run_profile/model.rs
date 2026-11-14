@@ -218,6 +218,7 @@ pub trait LoopModelGateway: Send + Sync {
 #[async_trait]
 pub trait LoopModelProgressSink: Send + Sync {
     async fn model_text_update(&self, safe_text: String);
+    async fn provider_activity(&self) {}
 }
 
 /// Provider/model policy guard consulted before dispatching a model call.
@@ -402,6 +403,7 @@ where
 
         // Bound inactivity, rather than total response time, so a hung gateway
         // fails before lease expiry without killing a healthy long stream.
+        // Provider activity advances the watchdog without a text milestone.
         let (progress_generation, progress_updates) = tokio::sync::watch::channel(0_u64);
         let progress_sink = Arc::new(MilestoneModelProgressSink {
             milestones: self.milestones.clone(),
@@ -557,6 +559,11 @@ impl<S> LoopModelProgressSink for MilestoneModelProgressSink<S>
 where
     S: LoopHostMilestoneSink + ?Sized,
 {
+    async fn provider_activity(&self) {
+        self.progress_generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
     async fn model_text_update(&self, safe_text: String) {
         self.emitted_text.store(true, Ordering::SeqCst);
         self.progress_generation
@@ -657,6 +664,25 @@ fn should_emit_fallback_text_delta(chunk_index: usize, chunk_count: usize) -> bo
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn provider_activity_extends_idle_window_without_text() {
+        let idle = std::time::Duration::from_secs(5);
+        let (activity, updates) = tokio::sync::watch::channel(0_u64);
+        let response = async move {
+            for _ in 0..3 {
+                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                activity.send_modify(|generation| *generation += 1);
+            }
+            7
+        };
+        assert_eq!(super::await_with_progress_timeout(response, updates, idle).await, Ok(7));
+        let (_activity, updates) = tokio::sync::watch::channel(0_u64);
+        assert_eq!(
+            super::await_with_progress_timeout(std::future::pending::<()>(), updates, idle).await,
+            Err(()),
+        );
+    }
+
     use super::*;
 
     /// The primary model-call idle timeout must fire before the runner lease can

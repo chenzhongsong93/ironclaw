@@ -1232,6 +1232,7 @@ fn bounded_trimmed_string(value: &str, max_chars: usize) -> Result<String, WebAc
 
 fn exa_mcp_network_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: EXA_MCP_HOST.to_string(),

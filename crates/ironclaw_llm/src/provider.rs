@@ -374,6 +374,13 @@ impl CompletionRequest {
 /// Response from a chat completion.
 #[derive(Debug, Clone)]
 pub struct CompletionResponse {
+    /// Set only by a checked actual provider parser. One means total input
+    /// includes cache; absent means unsupported/legacy Unknown, not zero.
+    pub normalization_version: Option<u16>,
+    /// Checked total input, independent of legacy raw provider input semantics.
+    pub normalized_input_tokens: Option<u32>,
+    /// Some(false): canonical total known, SDK did not retain cache details.
+    pub cache_details_observed: Option<bool>,
     pub content: String,
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -586,6 +593,13 @@ pub fn normalized_model_override(model: Option<&str>) -> Option<&str> {
 /// Response from a completion with potential tool calls.
 #[derive(Debug, Clone)]
 pub struct ToolCompletionResponse {
+    /// Set only by a checked actual provider parser. One means total input
+    /// includes cache; absent means unsupported/legacy Unknown, not zero.
+    pub normalization_version: Option<u16>,
+    /// Checked total input, independent of legacy raw provider input semantics.
+    pub normalized_input_tokens: Option<u32>,
+    /// Some(false): canonical total known, SDK did not retain cache details.
+    pub cache_details_observed: Option<bool>,
     /// Text content (may be empty if tool calls are present).
     pub content: Option<String>,
     /// Tool calls requested by the model.
@@ -724,6 +738,8 @@ pub trait LlmProvider: Send + Sync {
 #[async_trait]
 pub trait CompletionStreamSink: Send + Sync {
     async fn text_delta(&self, delta: String);
+    /// Provider data arrived. This carries no model text or tool input.
+    async fn provider_activity(&self) {}
 
     /// Whether this sink can atomically replace text emitted by a failed
     /// streaming attempt when the replacement attempt produces its first

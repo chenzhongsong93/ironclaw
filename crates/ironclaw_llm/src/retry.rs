@@ -315,6 +315,10 @@ impl StreamingAttemptSink {
 
 #[async_trait]
 impl CompletionStreamSink for StreamingAttemptSink {
+    async fn provider_activity(&self) {
+        self.inner.provider_activity().await;
+    }
+
     async fn text_delta(&self, delta: String) {
         if !delta.is_empty() {
             self.emitted_text.store(true, Ordering::SeqCst);
@@ -605,6 +609,9 @@ mod tests {
         ) -> Result<CompletionResponse, LlmError> {
             self.stream_or_fail(sink).await?;
             Ok(CompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: "Hello".to_string(),
                 finish_reason: crate::provider::FinishReason::Stop,
                 input_tokens: 1,
@@ -632,6 +639,9 @@ mod tests {
         ) -> Result<ToolCompletionResponse, LlmError> {
             self.stream_or_fail(sink).await?;
             Ok(ToolCompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: Some("Hello".to_string()),
                 tool_calls: Vec::new(),
                 finish_reason: crate::provider::FinishReason::Stop,

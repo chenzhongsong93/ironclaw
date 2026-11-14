@@ -36,6 +36,23 @@ pub(crate) struct TriggerPollerRuntimeHandle {
 }
 
 impl TriggerPollerRuntimeHandle {
+    pub(crate) fn resident_state(&self)->crate::runtime::RebornResidentWorkerState {
+        use crate::runtime::RebornResidentWorkerState as S;
+        if self.cancel.is_cancelled(){S::Cancelled}else if self.handle.is_finished(){S::Finished}else{S::Running}
+    }
+    pub(crate) fn resident_observer(&self)->Arc<dyn Fn()->crate::runtime::RebornResidentWorkerState+Send+Sync> {
+        let cancel=self.cancel.clone();let task=self.handle.abort_handle();Arc::new(move|| {
+            use crate::runtime::RebornResidentWorkerState as S;
+            if cancel.is_cancelled(){S::Cancelled}else if task.is_finished(){S::Finished}else{S::Running}
+        })
+    }
+    #[cfg(test)] pub(crate) fn cancel_for_resident_test(&self){self.cancel.cancel();}
+    #[cfg(test)] pub(crate) async fn finished_for_resident_test()->Self {
+        let owned=Self {cancel:CancellationToken::new(),handle:tokio::spawn(async {}),post_submit_tasks:Arc::new(PostSubmitDeliveryTaskOwner::default())};
+        tokio::time::timeout(Duration::from_secs(1),async {while !owned.handle.is_finished(){tokio::task::yield_now().await;}}).await.unwrap();owned
+    }
+
+
     pub(crate) async fn shutdown(self, timeout: Duration) {
         self.cancel.cancel();
         self.join_with_timeout(timeout).await;
@@ -67,6 +84,7 @@ impl TriggerPollerRuntimeHandle {
 
 #[derive(Clone)]
 pub(crate) struct TriggerPollerCompositionDeps {
+    pub(crate) startup_execution:Arc<ironclaw_runner::startup_execution::StartupExecutionLatch>,
     pub(crate) repository: Arc<dyn TriggerRepository>,
     pub(crate) materializer: Arc<dyn TriggerPromptMaterializer>,
     pub(crate) trusted_submitter: Arc<dyn TrustedTriggerFireSubmitter>,
@@ -102,9 +120,10 @@ pub(crate) fn spawn_trigger_poller(
             fire_settlement_observer,
         },
     )?;
+    let startup_execution=deps.startup_execution;
     let task_cancel = cancel.clone();
     let handle = tokio::spawn(async move {
-        run_trigger_poller(worker, settings, task_cancel).await;
+        run_trigger_poller_with_startup_execution(worker, settings, task_cancel,startup_execution).await;
     });
     Ok(Some(TriggerPollerRuntimeHandle {
         cancel,
@@ -306,10 +325,18 @@ async fn run_trigger_poller(
     settings: TriggerPollerSettings,
     cancel: CancellationToken,
 ) {
+    run_trigger_poller_with_startup_execution(worker,settings,cancel,ironclaw_runner::startup_execution::StartupExecutionLatch::open()).await;
+}
+async fn run_trigger_poller_with_startup_execution(
+    worker:TriggerPollerWorker,settings:TriggerPollerSettings,cancel:CancellationToken,
+    startup_execution:Arc<ironclaw_runner::startup_execution::StartupExecutionLatch>,
+){
+    if !startup_execution.wait(&cancel).await||cancel.is_cancelled(){return;}
     if !sleep_or_cancel(jitter_delay(settings.startup_jitter_max), &cancel).await {
         return;
     }
     loop {
+        if cancel.is_cancelled()||!startup_execution.allows_execution(){return;}
         let now = Utc::now();
         match worker.tick_once(now).await {
             Ok(report) => {
@@ -703,5 +730,47 @@ mod tests {
             .await
             .expect("drain task should observe runtime cancellation");
         }
+    }
+}
+
+#[cfg(test)] mod resident_observer_tests {
+    use super::*;
+    #[tokio::test] async fn actual_finished_join_handle_is_not_running() {
+        let owned=TriggerPollerRuntimeHandle {cancel:CancellationToken::new(),handle:tokio::spawn(async {}),post_submit_tasks:Arc::new(PostSubmitDeliveryTaskOwner::default())};
+        tokio::time::timeout(Duration::from_secs(1),async {while !owned.handle.is_finished(){tokio::task::yield_now().await;}}).await.unwrap();
+        assert_eq!(owned.resident_state(),crate::runtime::RebornResidentWorkerState::Finished);
+        owned.join_with_timeout(Duration::from_secs(1)).await;
+    }
+}
+
+#[cfg(test)] mod startup_hold_tests {
+    use super::*;
+    use ironclaw_triggers::{TriggerRepository,InMemoryTriggerRepository,TriggerRecord,TriggerId,TriggerSchedule,TriggerState,TriggerSourceKind,TriggerFire,TriggerMaterializedPrompt,
+        TrustedTriggerSubmitRequest,TrustedTriggerFireSubmitOutcome,MissingTriggerActiveRunLookup,NoopTriggerFireSettlementObserver};
+    struct NeverMaterialize;
+    #[async_trait::async_trait] impl TriggerPromptMaterializer for NeverMaterialize {
+        async fn materialize_prompt(&self,_:TriggerFire)->Result<TriggerMaterializedPrompt,TriggerError>{panic!("closed gate consumed due trigger")}
+    }
+    struct NeverSubmit;
+    #[async_trait::async_trait] impl TrustedTriggerFireSubmitter for NeverSubmit {
+        async fn submit_trusted_trigger_fire(&self,_:TrustedTriggerSubmitRequest)->Result<TrustedTriggerFireSubmitOutcome,TriggerError>{panic!("closed gate submitted trigger")}
+    }
+    #[tokio::test]
+    async fn actual_trigger_due_record_unchanged_while_closed_and_cancel_release_ready() {
+        let repo=Arc::new(InMemoryTriggerRepository::default());let now=Utc::now();
+        let tenant=ironclaw_host_api::TenantId::new("gate-tenant").unwrap();let id=TriggerId::new();
+        let record=TriggerRecord {trigger_id:id,tenant_id:tenant.clone(),creator_user_id:ironclaw_host_api::UserId::new("gate-user").unwrap(),agent_id:None,project_id:None,
+            name:"gate-fixture".into(),source:TriggerSourceKind::Schedule,schedule:TriggerSchedule::cron("0 8 * * *").unwrap(),prompt:"gate-fixture".into(),delivery_target:None,state:TriggerState::Scheduled,
+            next_run_at:now-chrono::Duration::seconds(1),last_run_at:None,last_fired_slot:None,last_status:None,active_fire_slot:None,active_run_ref:None,created_at:now};
+        repo.upsert_trigger(record.clone()).await.unwrap();
+        let settings=TriggerPollerSettings::enabled();
+        let worker=TriggerPollerWorker::new(settings.worker.clone(),TriggerPollerWorkerDeps {repository:repo.clone(),source_provider:Arc::new(ScheduleTriggerSourceProvider),
+            materializer:Arc::new(NeverMaterialize),trusted_submitter:Arc::new(NeverSubmit),active_run_lookup:Arc::new(MissingTriggerActiveRunLookup),fire_settlement_observer:Arc::new(NoopTriggerFireSettlementObserver)}).unwrap();
+        let cancel=CancellationToken::new();let latch=ironclaw_runner::startup_execution::StartupExecutionLatch::closed();
+        let task=tokio::spawn(run_trigger_poller_with_startup_execution(worker,settings,cancel.clone(),latch.clone()));
+        for _ in 0..32{tokio::task::yield_now().await;}
+        assert_eq!(repo.get_trigger(tenant.clone(),id).await.unwrap(),Some(record.clone()));
+        cancel.cancel();latch.release();task.await.unwrap();
+        assert_eq!(repo.get_trigger(tenant,id).await.unwrap(),Some(record));
     }
 }

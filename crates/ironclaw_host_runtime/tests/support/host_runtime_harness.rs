@@ -2213,6 +2213,7 @@ pub(crate) fn sample_account() -> ResourceAccount {
 
 pub(crate) fn wasm_http_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "example.test".to_string(),

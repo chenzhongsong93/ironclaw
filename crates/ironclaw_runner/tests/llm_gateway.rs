@@ -111,6 +111,65 @@ async fn gateway_calls_llm_provider_for_allowed_model_profile() {
     assert_eq!(requests[0].messages[1].content, "hello model");
 }
 
+// CH-GATE-02: actual gateway metadata follows the thread, never a per-request nonce.
+#[tokio::test]
+async fn conversation_thread_metadata_remains_stable_across_runs() {
+    let provider = Arc::new(RecordingLlmProvider::reply("assistant response"));
+    let policy = LlmModelProfilePolicy::new()
+        .allow_model_profile(interactive_model(), Some("host-selected-model".to_string()));
+    let gateway = LlmProviderModelGateway::with_provider_identity(
+        STATIC_PROVIDER_ID, provider.clone(), policy,
+    );
+    for thread in ["thread-a", "thread-a", "thread-b"] {
+        // Keep the shared fixture's one-dispatch guard; explicitly arm each expected call.
+        *provider.response.lock().unwrap() = RecordingLlmProvider::reply("assistant response")
+            .response.into_inner().unwrap();
+        let mut value = serde_json::to_value(model_request(interactive_model())).unwrap();
+        value["thread_id"] = serde_json::json!(thread);
+        value["conversation_id"] = serde_json::json!(format!("scope-derived-{thread}"));
+        let request: HostManagedModelRequest = serde_json::from_value(value).unwrap();
+        gateway.stream_model(request).await.unwrap();
+    }
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_ne!(requests[0].metadata.get("run_id"), requests[1].metadata.get("run_id"));
+    for (request, expected) in requests.iter().zip(["thread-a", "thread-a", "thread-b"]) {
+        assert_eq!(request.metadata.get("thread_id").map(String::as_str), Some(expected));
+        assert_eq!(request.metadata.get("conversation_id"), Some(&format!("scope-derived-{expected}")));
+    }
+}
+
+// CH-COMPAT-01: legacy requests stay absent; explicit thread identity is typed and retained.
+#[test]
+fn conversation_thread_optional_field_roundtrip() {
+    let legacy = serde_json::to_value(model_request(interactive_model())).unwrap();
+    assert!(legacy.get("thread_id").is_none());
+    let parsed: HostManagedModelRequest = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(serde_json::to_value(parsed).unwrap().get("thread_id").is_none());
+    let mut present = legacy.clone();
+    present["thread_id"] = serde_json::json!("actual-thread");
+    let parsed: HostManagedModelRequest = serde_json::from_value(present).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap()["thread_id"], "actual-thread");
+    let mut invalid = legacy;
+    invalid["thread_id"] = serde_json::json!({"untrusted":"not-an-id"});
+    assert!(serde_json::from_value::<HostManagedModelRequest>(invalid).is_err());
+}
+
+// CH-DENY-01: local metadata failures must not enter the availability recovery lane.
+#[tokio::test]
+async fn conversation_thread_local_header_error_is_terminal_configuration() {
+    let provider = Arc::new(RecordingLlmProvider::reply("unused"));
+    *provider.response.lock().unwrap() = Some(Err(LlmError::InvalidRequest {
+        provider: "fixture".into(), code: "missing_request_header_metadata",
+    }));
+    let gateway = LlmProviderModelGateway::with_provider_identity(
+        STATIC_PROVIDER_ID, provider,
+        LlmModelProfilePolicy::new().allow_model_profile(interactive_model(), Some("host-selected-model".into())),
+    );
+    let error = gateway.stream_model(model_request(interactive_model())).await.unwrap_err();
+    assert_eq!(error.kind, ironclaw_loop_host::HostManagedModelErrorKind::ConfigurationError);
+}
+
 #[traced_test]
 #[tokio::test]
 async fn gateway_records_prompt_cache_break_within_a_run() {
@@ -506,6 +565,134 @@ async fn gateway_cleans_flattened_tool_history_from_tool_capable_stop_reply() {
     );
 }
 
+// 覆盖 TQH-L1-07：INFO 下真实 gateway provider 响应必须落档，随后拒绝不能抹掉响应。
+// 子进程隔离 trace 环境和 subscriber，避免测试套件并行串档。
+#[test]
+fn gateway_tool_response_trace_is_complete_at_info_before_capability_rejection() {
+    const CHILD: &str = "IRONCLAW_TEST_INFO_TOOL_TRACE_CHILD";
+    const TEST: &str =
+        "gateway_tool_response_trace_is_complete_at_info_before_capability_rejection";
+    if std::env::var_os(CHILD).is_none() {
+        let trace = tempfile::tempdir().expect("isolated trace directory");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("TIANQUAN_TRACE_DIR", trace.path())
+            .env("RUST_LOG", "info")
+            .output()
+            .expect("isolated INFO trace child");
+        assert!(
+            output.status.success(),
+            "INFO trace child failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        assert!(!tracing::enabled!(tracing::Level::DEBUG));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        runtime.block_on(async {
+            for rejected in [false, true] {
+                let original_call = ToolCall {
+                    id: "info-trace-call".into(),
+                    name: "demo__echo".into(),
+                    arguments: serde_json::json!({"message":"完整归档", "nested":{"value":7}}),
+                    reasoning: Some("fixture call reasoning".into()),
+                    signature: Some("fixture-thought-signature".into()),
+                    arguments_parse_error: None,
+                };
+                let expected_calls = serde_json::to_value(vec![original_call.clone()]).unwrap();
+                let provider = Arc::new(ToolAwareProvider::tool_response(ToolCompletionResponse {
+                    normalization_version: None,
+                    normalized_input_tokens: None,
+                    cache_details_observed: None,
+                    content: Some("fixture tool response body".into()),
+                    tool_calls: vec![original_call],
+                    input_tokens: 11,
+                    output_tokens: 13,
+                    finish_reason: FinishReason::ToolUse,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    reasoning: Some("fixture response reasoning".into()),
+                    reasoning_details: None,
+                }));
+                let gateway = LlmProviderModelGateway::with_provider_identity(
+                    STATIC_PROVIDER_ID,
+                    provider.clone(),
+                    LlmModelProfilePolicy::new().allow_model_profile(
+                        interactive_model(),
+                        Some("host-selected-model".into()),
+                    ),
+                );
+                let mut port = GatewayCapabilityPort::with_tool_surface();
+                if rejected {
+                    port = port
+                        .with_provider_tool_validation_error(AgentLoopHostErrorKind::PolicyDenied);
+                }
+                let request = model_request(interactive_model());
+                let run_id = request.run_id.to_string();
+                let turn_id = request.turn_id.to_string();
+                let result = gateway
+                    .stream_model_with_capabilities(request, Arc::new(port))
+                    .await;
+                if rejected {
+                    assert!(
+                        result.is_err(),
+                        "fixture capability rejection must remain an error"
+                    );
+                } else {
+                    assert!(
+                        result.is_ok(),
+                        "allowed tool response must remain successful"
+                    );
+                }
+                assert_eq!(provider.tool_requests.lock().unwrap().len(), 1);
+                let path =
+                    std::path::PathBuf::from(std::env::var_os("TIANQUAN_TRACE_DIR").unwrap())
+                        .join(format!("{run_id}.jsonl"));
+                let events = std::fs::read_to_string(path)
+                    .expect("real writer trace file")
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event["kind"] == "model_request")
+                        .count(),
+                    1
+                );
+                let responses = events
+                    .iter()
+                    .filter(|event| event["kind"] == "model_response")
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    responses.len(),
+                    1,
+                    "provider response must be archived at INFO before rejection"
+                );
+                assert_eq!(responses[0]["run_id"], run_id);
+                assert_eq!(responses[0]["turn_id"], turn_id);
+                assert_eq!(responses[0]["data"]["provider_id"], STATIC_PROVIDER_ID);
+                assert_eq!(responses[0]["data"]["finish_reason"], "ToolUse");
+                assert_eq!(
+                    responses[0]["data"]["content"],
+                    "fixture tool response body"
+                );
+                assert_eq!(responses[0]["data"]["tool_calls"], expected_calls);
+            }
+        });
+    });
+}
+
 #[tokio::test]
 async fn gateway_with_tool_surface_calls_complete_with_tools_and_returns_capability_calls() {
     let provider = Arc::new(ToolAwareProvider::tool_calls(vec![ToolCall {
@@ -765,6 +952,9 @@ async fn gateway_does_not_treat_plain_dotted_domain_as_unavailable_capability() 
 #[tokio::test]
 async fn gateway_rejects_empty_tool_capable_stop_response_without_text_only_retry() {
     let provider = Arc::new(ToolAwareProvider::tool_response(ToolCompletionResponse {
+        normalization_version: None,
+        normalized_input_tokens: None,
+        cache_details_observed: None,
         content: None,
         tool_calls: Vec::new(),
         input_tokens: 1,
@@ -859,6 +1049,9 @@ async fn gateway_rejects_unrecovered_textual_tool_syntax() {
 #[tokio::test]
 async fn gateway_preserves_structured_tool_calls_when_content_has_legacy_marker() {
     let provider = Arc::new(ToolAwareProvider::tool_response(ToolCompletionResponse {
+        normalization_version: None,
+        normalized_input_tokens: None,
+        cache_details_observed: None,
         content: Some(
             "Calling tool.\n[Called tool `demo__echo` with arguments: {\"message\":\"hi\"}]"
                 .to_string(),
@@ -1000,6 +1193,9 @@ fn tool_stop_reply_with_cache_read(
     cache_read_input_tokens: u32,
 ) -> ToolCompletionResponse {
     ToolCompletionResponse {
+        normalization_version: None,
+        normalized_input_tokens: None,
+        cache_details_observed: None,
         content: Some(content.to_string()),
         tool_calls: Vec::new(),
         input_tokens: 1,
@@ -1018,6 +1214,9 @@ fn malformed_args_repair_provider(
 ) -> Arc<ToolAwareProvider> {
     Arc::new(ToolAwareProvider::tool_response_sequence(vec![
         ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: None,
             tool_calls: vec![ToolCall {
                 id: "call_bad_args".to_string(),
@@ -1036,6 +1235,9 @@ fn malformed_args_repair_provider(
             reasoning_details: None,
         },
         ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: Some(final_content.to_string()),
             tool_calls: Vec::new(),
             input_tokens: 2,
@@ -1058,6 +1260,9 @@ async fn gateway_repairs_oversized_provider_tool_arguments_before_registration()
     let oversized_message = "x".repeat(ironclaw_safety::PROVIDER_ARGUMENTS_MAX_BYTES + 1024);
     let provider = Arc::new(ToolAwareProvider::tool_response_sequence(vec![
         ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: None,
             tool_calls: vec![
                 ToolCall {
@@ -1088,6 +1293,9 @@ async fn gateway_repairs_oversized_provider_tool_arguments_before_registration()
             reasoning_details: None,
         },
         ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: Some("Finished after repair.".to_string()),
             tool_calls: Vec::new(),
             input_tokens: 2,
@@ -2609,6 +2817,27 @@ async fn production_loop_model_gateway_sanitizes_provider_output_before_public_c
 }
 
 #[tokio::test]
+async fn production_loop_model_gateway_preserves_provider_policy_denial() {
+    let fixture = ThreadFixture::new().await;
+    let provider = Arc::new(RecordingLlmProvider::fail(LlmError::PolicyDenied {
+        provider: "fixture".to_owned(),
+        reason: ironclaw_llm::error::ProviderPolicyDeniedReason::PermissionDenied,
+    }));
+    let provider_gateway = Arc::new(LlmProviderModelGateway::with_provider_identity(
+        STATIC_PROVIDER_ID, provider.clone(),
+        LlmModelProfilePolicy::new().allow_model_profile(interactive_model(), Some("host-selected-model".to_string())),
+    ));
+    let model_gateway = Arc::new(ThreadBackedLoopModelGateway::new(
+        Arc::clone(&fixture.thread_service), fixture.thread_scope.clone(), provider_gateway, 16, local_development_safety_context(),
+    ));
+    let port = HostManagedLoopModelPort::new(fixture.run_context.clone(), model_gateway, Arc::new(InMemoryLoopHostMilestoneSink::default()));
+    let error = port.stream_model(production_loop_request(&fixture, None).await).await.unwrap_err();
+    assert_eq!(error.kind, AgentLoopHostErrorKind::PolicyDenied);
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    assert_eq!(error.safe_summary, "model request was denied by provider policy");
+}
+
+#[tokio::test]
 async fn production_loop_model_gateway_maps_provider_auth_and_session_to_credential_unavailable() {
     for provider_error in [
         LlmError::AuthFailed {
@@ -3433,6 +3662,8 @@ fn model_request(model_profile_id: ModelProfileId) -> HostManagedModelRequest {
         ],
         surface_version: None,
         resolved_model_route: None,
+        thread_id: None,
+        conversation_id: None,
         run_id: TurnRunId::new(),
         turn_id: TurnId::new(),
         llm_subject: None,
@@ -3494,6 +3725,9 @@ impl LlmProvider for IgnoresModelOverrideProvider {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         self.requests.lock().unwrap().push(request);
         Ok(CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: self.content.clone(),
             input_tokens: 1,
             output_tokens: 1,
@@ -3602,6 +3836,9 @@ impl LlmProvider for StreamingRecordingLlmProvider {
             sink.text_delta(delta.clone()).await;
         }
         Ok(CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: self.response_content.clone(),
             input_tokens: 1,
             output_tokens: 1,
@@ -3655,6 +3892,9 @@ impl LlmProvider for CacheUsageSequenceProvider {
             .pop_front()
             .expect("scripted cache usage for every call");
         Ok(CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: "ok".to_string(),
             input_tokens: 120_000,
             output_tokens: 10,
@@ -3718,6 +3958,9 @@ impl RecordingLlmProvider {
             model_name: model_name.to_string(),
             requests: Mutex::new(Vec::new()),
             response: Mutex::new(Some(Ok(CompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: content.to_string(),
                 input_tokens: 1,
                 output_tokens: 1,
@@ -3778,6 +4021,9 @@ impl LlmProvider for BarrierRecordingLlmProvider {
         self.requests.lock().unwrap().push(request);
         self.barrier.wait().await;
         Ok(CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: self.content.clone(),
             input_tokens: 1,
             output_tokens: 1,
@@ -3814,6 +4060,9 @@ impl ToolAwareProvider {
             tool_requests: Mutex::new(Vec::new()),
             streaming_tool_requests: Mutex::new(Vec::new()),
             plain_response: Mutex::new(Some(CompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: content.to_string(),
                 input_tokens: 1,
                 output_tokens: 1,
@@ -3828,6 +4077,9 @@ impl ToolAwareProvider {
 
     fn tool_calls(tool_calls: Vec<ToolCall>) -> Self {
         Self::tool_response(ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: None,
             tool_calls,
             input_tokens: 1,
@@ -3842,6 +4094,9 @@ impl ToolAwareProvider {
 
     fn tool_stop_reply(content: &str) -> Self {
         Self::tool_response(ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: Some(content.to_string()),
             tool_calls: Vec::new(),
             input_tokens: 1,

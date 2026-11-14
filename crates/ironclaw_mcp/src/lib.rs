@@ -1594,6 +1594,11 @@ where
         let output = match self.client.call_tool(client_request).await {
             Ok(output) => output,
             Err(error) => {
+                tracing::warn!(
+                    target: "ironclaw_mcp::client",
+                    reason = error.stable_reason(),
+                    "McpClientCallFailed"
+                );
                 return Err(release_after_failure(
                     governor,
                     reservation.id,

@@ -18,7 +18,7 @@ use ironclaw_hooks::middleware::{
 };
 use ironclaw_host_api::{CapabilityId, ExtensionId, Resolution, ResolutionBatch};
 use ironclaw_loop_host::{
-    ACTIVE_TASK_COMPACTION_SYSTEM_PROMPT, CapabilityResolveError, CapabilitySurfaceProfileFilter,
+    ACTIVE_TASK_COMPACTION_SYSTEM_PROMPT, CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileFilter,
     CapabilitySurfaceProfileResolver, EmptyLoopCapabilityPort, EmptyUserProfileSource,
     GuardedSystemInferencePort, HostIdentityContextSource, HostInputQueue, HostManagedModelGateway,
     HostQueueLoopInputPort, HostSkillContextSource, HostUserProfileSource, LoopAttachmentReadPort,
@@ -35,6 +35,7 @@ use crate::hook_gate_refs::HookGateInvocationScopePort;
 use crate::model_routes::{ModelRouteError, ModelRouteResolver, ModelSlot};
 use crate::planned_driver_factory::is_subagent_planned_run_profile;
 use crate::text_loop_driver::{TEXT_ONLY_DRIVER_ID, TEXT_ONLY_DRIVER_VERSION};
+use crate::turn_runner::{HostCreationDiagnostic, HostCreationFailure, HostCreationStage};
 
 mod config;
 mod model_gateway;
@@ -1057,6 +1058,14 @@ where
     profiled_capabilities: Option<ProfiledCapabilityHostRuntime>,
     subagent_prompt_composer: Option<SubagentPromptComposer>,
     driver_requirements: HashMap<LoopDriverRegistryKey, DriverRequirements>,
+    product_capability_policy: Option<crate::runtime::ProductCapabilityPolicy>,
+    host_product_await_recovery: Option<HostProductAwaitRecovery>,
+}
+
+#[derive(Clone)]
+struct HostProductAwaitRecovery {
+    evidence: Arc<dyn crate::loop_exit_applier::AwaitDependentRunEvidenceStore>,
+    turns: Arc<dyn TurnStateStore>,
 }
 
 /// Per-host-build callback that produces a fresh hook-gate factory bound
@@ -1123,11 +1132,22 @@ where
             profiled_capabilities: None,
             subagent_prompt_composer: None,
             driver_requirements: HashMap::new(),
+            host_product_await_recovery: None,
+            product_capability_policy: None,
         }
     }
 
     pub fn with_cancellation_factory(mut self, factory: Arc<dyn RunCancellationFactory>) -> Self {
         self.cancellation_factory = factory;
+        self
+    }
+
+    pub(crate) fn with_host_product_await_recovery(
+        mut self,
+        evidence: Arc<dyn crate::loop_exit_applier::AwaitDependentRunEvidenceStore>,
+        turns: Arc<dyn TurnStateStore>,
+    ) -> Self {
+        self.host_product_await_recovery = Some(HostProductAwaitRecovery { evidence, turns });
         self
     }
 
@@ -1471,20 +1491,54 @@ where
         capabilities: Arc<dyn LoopCapabilityPort>,
         surface_resolver: Arc<dyn CapabilitySurfaceProfileResolver>,
     ) -> Result<RebornLoopDriverHost, RebornLoopDriverHostError> {
+        let mut stage = HostCreationStage::ContextScope;
+        self.build_profiled_host_with_stage(request, capabilities, surface_resolver, &mut stage)
+            .await
+    }
+
+    pub(crate) fn with_product_capability_policy(
+        mut self,
+        policy: crate::runtime::ProductCapabilityPolicy,
+    ) -> Self {
+        self.product_capability_policy = Some(policy);
+        self
+    }
+
+    async fn build_profiled_host_with_stage(
+        &self,
+        request: RebornLoopDriverHostRequest,
+        capabilities: Arc<dyn LoopCapabilityPort>,
+        surface_resolver: Arc<dyn CapabilitySurfaceProfileResolver>,
+        stage: &mut HostCreationStage,
+    ) -> Result<RebornLoopDriverHost, RebornLoopDriverHostError> {
+        *stage = HostCreationStage::ContextScope;
         validate_claimed_run_context(&request.claimed_run, &request.loop_run_context)?;
         validate_thread_scope(
             &self.effective_thread_scope(&request.loop_run_context),
             &request.loop_run_context,
         )?;
-        let allow_set = Arc::new(
+        *stage = HostCreationStage::SurfaceResolve;
+        let allow_set = if let Some(policy) = self
+            .product_capability_policy
+            .as_ref()
+            .filter(|policy| policy.applies_to(&request.claimed_run))
+        {
+            let ids = policy.capabilities(&request.claimed_run).ok_or_else(|| {
+                capability_resolve_error_to_host_error(CapabilityResolveError::unavailable(
+                    "host product capability binding is unproven",
+                ))
+            })?;
+            CapabilityAllowSet::allowlist(ids)
+        } else {
             surface_resolver
-                .resolve(&request.loop_run_context)
+                .resolve_for_capabilities(&request.loop_run_context, capabilities.as_ref())
                 .await
-                .map_err(capability_resolve_error_to_host_error)?,
+                .map_err(capability_resolve_error_to_host_error)?
+        };
+        let capabilities: Arc<dyn LoopCapabilityPort> = Arc::new(
+            CapabilitySurfaceProfileFilter::new(capabilities, Arc::new(allow_set)),
         );
-        let capabilities: Arc<dyn LoopCapabilityPort> =
-            Arc::new(CapabilitySurfaceProfileFilter::new(capabilities, allow_set));
-        self.build_text_only_host_with_capabilities(request, capabilities)
+        self.build_host_with_stage(request, capabilities, stage)
             .await
     }
 
@@ -1493,6 +1547,18 @@ where
         request: RebornLoopDriverHostRequest,
         capabilities: Arc<dyn LoopCapabilityPort>,
     ) -> Result<RebornLoopDriverHost, RebornLoopDriverHostError> {
+        let mut stage = HostCreationStage::ContextScope;
+        self.build_host_with_stage(request, capabilities, &mut stage)
+            .await
+    }
+
+    async fn build_host_with_stage(
+        &self,
+        request: RebornLoopDriverHostRequest,
+        capabilities: Arc<dyn LoopCapabilityPort>,
+        stage: &mut HostCreationStage,
+    ) -> Result<RebornLoopDriverHost, RebornLoopDriverHostError> {
+        *stage = HostCreationStage::ContextScope;
         validate_claimed_run_context(&request.claimed_run, &request.loop_run_context)?;
         // Resolve the per-caller thread scope once; every thread read/write
         // port below uses it so a logged-in user's turn touches only their
@@ -1501,7 +1567,25 @@ where
         validate_thread_scope(&effective_scope, &request.loop_run_context)?;
 
         let max_messages = self.config.max_messages.max(1);
-        let run_context = self.attach_model_route_snapshot(request.loop_run_context)?;
+        *stage = HostCreationStage::ModelRoute;
+        let run_context = request.loop_run_context;
+        let driver_key =
+            LoopDriverRegistryKey::from_descriptor(&run_context.resolved_run_profile.loop_driver)
+                .map_err(|reason| RebornLoopDriverHostError::InvalidRequest { reason })?;
+        let model_unsupported = self
+            .driver_requirements
+            .get(&driver_key)
+            .is_some_and(|requirements| requirements.model == RequirementLevel::Unsupported);
+        let run_context = if model_unsupported {
+            if run_context.resolved_model_route.is_some() {
+                return Err(RebornLoopDriverHostError::InvalidRequest {
+                    reason: "model-free driver has a persisted model route".to_string(),
+                });
+            }
+            run_context
+        } else {
+            self.attach_model_route_snapshot(run_context)?
+        };
 
         // Kick off advisory communication-context fetches only for origins that
         // can use delivery/channel context. WebUI chat renders its origin without
@@ -1573,6 +1657,7 @@ where
         // depending on the closure capturing the right context (which
         // would silently misattribute across reuses — henrypark133
         // Critical #4).
+        *stage = HostCreationStage::HookDispatcher;
         let dispatcher_started_at = ironclaw_observability::live_latency_started_at();
         let per_build_dispatcher = match (
             self.hook_dispatcher_builder_factory.as_ref(),
@@ -1595,6 +1680,7 @@ where
         };
         trace_host_factory_latency_ok("dispatcher_setup", &run_context, dispatcher_started_at);
 
+        *stage = HostCreationStage::EventSubscription;
         let event_subscription_started_at = ironclaw_observability::live_latency_started_at();
         let event_subscription = match (
             per_build_dispatcher.as_ref(),
@@ -1683,6 +1769,7 @@ where
                 hooked
             };
         }
+        *stage = HostCreationStage::VisibleCapabilities;
         let visible_surface_started_at = ironclaw_observability::live_latency_started_at();
         let visible_surface_result = capabilities
             .visible_capabilities(VisibleCapabilityRequest)
@@ -1800,6 +1887,7 @@ where
             );
         }
         trace_host_factory_latency_ok("prompt_ports", &run_context, prompt_ports_started_at);
+        *stage = HostCreationStage::SubagentPrompt;
         if is_subagent_planned_run_profile(&run_context) {
             let Some(composer) = self.subagent_prompt_composer.clone() else {
                 return Err(RebornLoopDriverHostError::InvalidRequest {
@@ -1910,6 +1998,7 @@ where
             Arc::clone(&self.milestone_sink),
         ));
         let compaction = self.build_compaction_ports(&run_context);
+        *stage = HostCreationStage::Cancellation;
         let cancellation_started_at = ironclaw_observability::live_latency_started_at();
         let cancellation_handle_result = cancellation_handle_fetch
             .await
@@ -1947,6 +2036,7 @@ where
             prompt,
             input,
             model,
+            model_unsupported,
             checkpoint,
             capabilities,
             surface_state,
@@ -1954,6 +2044,7 @@ where
             progress,
             compaction,
             cancellation,
+            host_product_await_recovery: self.host_product_await_recovery.clone(),
             _event_subscription: event_subscription,
         })
     }
@@ -2027,6 +2118,7 @@ pub struct RebornLoopDriverHost {
     prompt: Arc<dyn LoopPromptPort>,
     input: Arc<dyn LoopInputPort>,
     model: Arc<dyn LoopModelPort>,
+    model_unsupported: bool,
     checkpoint: Arc<dyn LoopCheckpointPort>,
     capabilities: Arc<dyn LoopCapabilityPort>,
     surface_state: Arc<CapabilitySurfaceState>,
@@ -2034,6 +2126,7 @@ pub struct RebornLoopDriverHost {
     progress: Arc<dyn LoopProgressPort>,
     compaction: Arc<dyn LoopCompactionPort>,
     cancellation: Arc<dyn LoopCancellationPort>,
+    host_product_await_recovery: Option<HostProductAwaitRecovery>,
     _event_subscription: Option<EventTriggeredHookSubscriptionHandle>,
 }
 
@@ -2068,6 +2161,43 @@ impl LoopCancellationPort for RebornLoopDriverHost {
 
 #[async_trait]
 impl LoopContextPort for RebornLoopDriverHost {
+    async fn recover_host_product_await(
+        &self,
+    ) -> Result<Option<ironclaw_turns::run_profile::HostProductAwait>, AgentLoopHostError> {
+        use ironclaw_turns::{GetRunStateRequest, PrivilegedRunProfileDimension};
+        let unavailable = || AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Unavailable, "original host product await edge is unproven",
+        );
+        let parent = &self.run_context;
+        if !parent.resolved_run_profile.provenance.effective_privileges
+            .contains(&PrivilegedRunProfileDimension::SpecialDriver)
+            || !parent.actor().is_some_and(|actor| parent.scope.explicit_owner_user_id() == Some(&actor.user_id))
+        {
+            return Err(unavailable());
+        }
+        let recovery = self.host_product_await_recovery.as_ref().ok_or_else(unavailable)?;
+        let Some(edge) = recovery.evidence.recover_host_product_edge(parent).await.map_err(|_| unavailable())? else {
+            return Ok(None);
+        };
+        let child = recovery.turns.get_run_state(GetRunStateRequest {
+            scope: edge.child_scope.clone(), run_id: edge.child_run_id,
+        }).await.map_err(|_| unavailable())?;
+        if child.scope != edge.child_scope || child.run_id != edge.child_run_id
+            || child.actor != parent.actor
+            || child.resolved_run_profile_id != parent.resolved_run_profile.profile_id
+            || child.resolved_run_profile_version != parent.resolved_run_profile.profile_version
+            || child.source_binding_ref != edge.source_binding_ref
+            || child.reply_target_binding_ref != edge.reply_target_binding_ref
+        {
+            return Err(unavailable());
+        }
+        Ok(Some(edge.binding))
+    }
+
+    async fn read_host_product_command(&self) -> Result<String, AgentLoopHostError> {
+        self.context.read_host_product_command().await
+    }
+
     async fn load_loop_context(
         &self,
         request: LoopContextRequest,
@@ -2107,6 +2237,12 @@ impl LoopModelPort for RebornLoopDriverHost {
         &self,
         request: LoopModelRequest,
     ) -> Result<LoopModelResponse, AgentLoopHostError> {
+        if self.model_unsupported {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::PolicyDenied,
+                "driver does not support model inference",
+            ));
+        }
         self.model.stream_model(request).await
     }
 }
@@ -2227,6 +2363,9 @@ impl LoopCompactionPort for RebornLoopDriverHost {
         &self,
         request: LoopCompactionRequest,
     ) -> Result<LoopCompactionOutcome, LoopCompactionError> {
+        if self.model_unsupported {
+            return Err(LoopCompactionError::UnsupportedMode);
+        }
         self.compaction.compact_loop_context(request).await
     }
 }
@@ -2321,6 +2460,34 @@ where
         Box<dyn ironclaw_turns::run_profile::AgentLoopDriverHost + Send + Sync>,
         crate::turn_runner::HostFactoryError,
     > {
+        self.create_host_once(claimed)
+            .await
+            .map_err(HostCreationFailure::into_legacy_error)
+    }
+
+    async fn create_host_with_diagnostics(
+        &self,
+        claimed: &ClaimedTurnRun,
+    ) -> Result<
+        Box<dyn ironclaw_turns::run_profile::AgentLoopDriverHost + Send + Sync>,
+        HostCreationFailure,
+    > {
+        self.create_host_once(claimed).await
+    }
+}
+
+impl<S, G> RebornLoopDriverHostFactory<S, G>
+where
+    S: SessionThreadService + ?Sized + Send + Sync + 'static,
+    G: HostManagedModelGateway + ?Sized + Send + Sync + 'static,
+{
+    async fn create_host_once(
+        &self,
+        claimed: &ClaimedTurnRun,
+    ) -> Result<
+        Box<dyn ironclaw_turns::run_profile::AgentLoopDriverHost + Send + Sync>,
+        HostCreationFailure,
+    > {
         let mut loop_run_context = LoopRunContext::new(
             claimed.state.scope.clone(),
             claimed.state.turn_id,
@@ -2342,41 +2509,95 @@ where
             claimed_run: claimed.clone(),
             loop_run_context,
         };
-        let capability_requirement = self.capability_requirement(claimed)?;
+        let capability_requirement = self.capability_requirement(claimed).map_err(|error| {
+            HostCreationFailure::with_diagnostic(
+                error,
+                HostCreationDiagnostic::new(
+                    HostCreationStage::DriverRequirements,
+                    AgentLoopHostErrorKind::Invalid,
+                ),
+            )
+        })?;
+        let mut stage = HostCreationStage::ContextScope;
         let host_result = if capability_requirement.requires_profiled_capabilities() {
             let Some(profiled) = self.profiled_capabilities.as_ref() else {
-                return Err(crate::turn_runner::HostFactoryError::new(
-                    "profiled capability port factory is required for capability-required driver host",
+                return Err(HostCreationFailure::with_diagnostic(
+                    crate::turn_runner::HostFactoryError::new(
+                        "profiled capability port factory is required for capability-required driver host",
+                    ),
+                    HostCreationDiagnostic::new(
+                        HostCreationStage::CapabilityFactory,
+                        AgentLoopHostErrorKind::Unavailable,
+                    ),
                 ));
             };
             let capabilities = profiled
                 .capability_factory
                 .create_capability_port(&request.loop_run_context)
                 .await
-                .map_err(|error| crate::turn_runner::HostFactoryError::new(error.safe_summary))?;
-            self.build_text_only_host_with_profiled_capabilities(
+                .map_err(|error| {
+                    // Backend summaries remain private even when a lower seam labels them safe.
+                    tracing::warn!(
+                        component = "reborn_loop_host_factory",
+                        operation = "create_capability_port",
+                        error_kind = error.kind.as_str(),
+                        stage = HostCreationStage::CapabilityPort.as_str(),
+                        tenant_id = %request.loop_run_context.scope.tenant_id,
+                        agent_id = request
+                            .loop_run_context
+                            .scope
+                            .agent_id
+                            .as_ref()
+                            .map(|id| id.as_str())
+                            .unwrap_or(""),
+                        project_id = request
+                            .loop_run_context
+                            .scope
+                            .project_id
+                            .as_ref()
+                            .map(|id| id.as_str())
+                            .unwrap_or(""),
+                        thread_id = %request.loop_run_context.thread_id,
+                        run_id = %request.loop_run_context.run_id,
+                        "profiled capability port creation failed"
+                    );
+                    HostCreationFailure::with_diagnostic(
+                        crate::turn_runner::HostFactoryError::new(error.safe_summary),
+                        HostCreationDiagnostic::new(HostCreationStage::CapabilityPort, error.kind),
+                    )
+                })?;
+            self.build_profiled_host_with_stage(
                 request,
                 capabilities,
                 Arc::clone(&profiled.surface_resolver),
+                &mut stage,
             )
             .await
         } else {
-            self.build_text_only_host(request).await
+            self.build_host_with_stage(request, Arc::new(EmptyLoopCapabilityPort), &mut stage)
+                .await
         };
         host_result
             .map(|host| {
                 Box::new(host)
                     as Box<dyn ironclaw_turns::run_profile::AgentLoopDriverHost + Send + Sync>
             })
-            .map_err(|error| crate::turn_runner::HostFactoryError::new(error.to_string()))
+            .map_err(|error| {
+                let kind = match error {
+                    RebornLoopDriverHostError::ScopeMismatch { .. } => {
+                        AgentLoopHostErrorKind::ScopeMismatch
+                    }
+                    RebornLoopDriverHostError::InvalidRequest { .. } => {
+                        AgentLoopHostErrorKind::Invalid
+                    }
+                };
+                HostCreationFailure::with_diagnostic(
+                    crate::turn_runner::HostFactoryError::new(error.to_string()),
+                    HostCreationDiagnostic::new(stage, kind),
+                )
+            })
     }
-}
 
-impl<S, G> RebornLoopDriverHostFactory<S, G>
-where
-    S: SessionThreadService + ?Sized + Send + Sync + 'static,
-    G: HostManagedModelGateway + ?Sized + Send + Sync + 'static,
-{
     fn capability_requirement(
         &self,
         claimed: &ClaimedTurnRun,

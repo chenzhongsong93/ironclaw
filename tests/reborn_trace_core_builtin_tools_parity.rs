@@ -284,6 +284,7 @@ async fn live_items(State(state): State<LiveHttpState>, headers: HeaderMap) -> i
 
 fn live_http_network_policy(port: u16) -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Http),
             host_pattern: "127.0.0.1".to_string(),

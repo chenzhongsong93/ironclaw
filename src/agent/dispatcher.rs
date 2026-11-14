@@ -1934,6 +1934,9 @@ mod tests {
             _request: CompletionRequest,
         ) -> Result<CompletionResponse, crate::error::LlmError> {
             Ok(CompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: "ok".to_string(),
                 input_tokens: 0,
                 output_tokens: 0,
@@ -1949,6 +1952,9 @@ mod tests {
             _request: ToolCompletionRequest,
         ) -> Result<ToolCompletionResponse, crate::error::LlmError> {
             Ok(ToolCompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: Some("ok".to_string()),
                 tool_calls: Vec::new(),
                 input_tokens: 0,
@@ -1979,6 +1985,9 @@ mod tests {
             _request: CompletionRequest,
         ) -> Result<CompletionResponse, crate::error::LlmError> {
             Ok(CompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: "done".to_string(),
                 input_tokens: 12,
                 output_tokens: 3,
@@ -1994,6 +2003,9 @@ mod tests {
             _request: ToolCompletionRequest,
         ) -> Result<ToolCompletionResponse, crate::error::LlmError> {
             Ok(ToolCompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: Some("done".to_string()),
                 tool_calls: Vec::new(),
                 input_tokens: 12,
@@ -2024,6 +2036,9 @@ mod tests {
             _request: CompletionRequest,
         ) -> Result<CompletionResponse, crate::error::LlmError> {
             Ok(CompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: "ok".to_string(),
                 input_tokens: 0,
                 output_tokens: 0,
@@ -2040,6 +2055,9 @@ mod tests {
         ) -> Result<ToolCompletionResponse, crate::error::LlmError> {
             if request.tools.is_empty() {
                 return Ok(ToolCompletionResponse {
+                    normalization_version: None,
+                    normalized_input_tokens: None,
+                    cache_details_observed: None,
                     content: Some("ok".to_string()),
                     tool_calls: Vec::new(),
                     input_tokens: 0,
@@ -2053,6 +2071,9 @@ mod tests {
             }
 
             Ok(ToolCompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: None,
                 tool_calls: vec![
                     ToolCall {
@@ -3168,6 +3189,9 @@ mod tests {
             _request: CompletionRequest,
         ) -> Result<CompletionResponse, crate::error::LlmError> {
             Ok(CompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: "forced text response".to_string(),
                 input_tokens: 0,
                 output_tokens: 5,
@@ -3185,6 +3209,9 @@ mod tests {
             if request.tools.is_empty() {
                 // No tools = force_text mode; return text.
                 return Ok(ToolCompletionResponse {
+                    normalization_version: None,
+                    normalized_input_tokens: None,
+                    cache_details_observed: None,
                     content: Some("forced text response".to_string()),
                     tool_calls: Vec::new(),
                     input_tokens: 0,
@@ -3198,6 +3225,9 @@ mod tests {
             }
             // Tools available: always call one.
             Ok(ToolCompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: None,
                 tool_calls: vec![ToolCall {
                     id: ironclaw_llm::generate_tool_call_id(0, 0),
@@ -3492,6 +3522,9 @@ mod tests {
             _request: CompletionRequest,
         ) -> Result<CompletionResponse, crate::error::LlmError> {
             Ok(CompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: "forced text".to_string(),
                 input_tokens: 0,
                 output_tokens: 2,
@@ -3508,6 +3541,9 @@ mod tests {
         ) -> Result<ToolCompletionResponse, crate::error::LlmError> {
             if request.tools.is_empty() {
                 return Ok(ToolCompletionResponse {
+                    normalization_version: None,
+                    normalized_input_tokens: None,
+                    cache_details_observed: None,
                     content: Some("forced text".to_string()),
                     tool_calls: Vec::new(),
                     input_tokens: 0,
@@ -3521,6 +3557,9 @@ mod tests {
             }
             // Always call a tool that does not exist in the registry.
             Ok(ToolCompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: None,
                 tool_calls: vec![ToolCall {
                     id: ironclaw_llm::generate_tool_call_id(0, 0),
@@ -3561,6 +3600,9 @@ mod tests {
             _request: CompletionRequest,
         ) -> Result<CompletionResponse, crate::error::LlmError> {
             Ok(CompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: "ok".to_string(),
                 input_tokens: 0,
                 output_tokens: 1,
@@ -3581,6 +3623,9 @@ mod tests {
                 .expect("recording tools mutex poisoned")
                 .push(names);
             Ok(ToolCompletionResponse {
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
                 content: Some("ok".to_string()),
                 tool_calls: Vec::new(),
                 input_tokens: 0,

@@ -934,6 +934,24 @@ pub trait LoopContextPort: Send + Sync {
         &self,
         request: LoopContextRequest,
     ) -> Result<LoopContextBundle, AgentLoopHostError>;
+
+    /// Read only the accepted input of the current privileged product run.
+    /// Drivers receive bounded data and cannot supply a different message id.
+    async fn read_host_product_command(&self) -> Result<String, AgentLoopHostError> {
+        Err(unsupported_host_method("read_host_product_command"))
+    }
+
+    /// Locate the already submitted dependent run after a protected product
+    /// driver crashes between its side effect and its blocking checkpoint.
+    async fn recover_host_product_await(&self) -> Result<Option<HostProductAwait>, AgentLoopHostError> {
+        Err(unsupported_host_method("recover_host_product_await"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostProductAwait {
+    pub gate_ref: LoopGateRef,
+    pub result_ref: LoopResultRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1303,11 +1321,22 @@ pub struct LoopModelResponse {
 /// reservation estimate.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopModelUsage {
+    /// Some(1): the actual producer normalized total input to include cache;
+    /// None is legacy/unsupported/overflow Unknown, including an actual Some(0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalization_version: Option<u16>,
+    /// Canonical total input sidecar; original four provider counters stay intact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_input_tokens: Option<u32>,
+    /// Some(false): canonical total known, SDK did not retain cache details.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_details_observed: Option<bool>,
     pub input_tokens: u32,
     pub output_tokens: u32,
     /// Tokens read from the provider's server-side prompt cache (e.g. Anthropic
-    /// cache reads). A subset of `input_tokens`, billed at a discount. Zero when
-    /// caching is unsupported or on a cache miss.
+    /// cache reads). This ORIGINAL raw counter is provider-dependent; Anthropic
+    /// reports an independent bucket, while OpenAI reports a prompt subset.
+    /// Historical zero is not evidence that a cache counter was present.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub cache_read_input_tokens: u32,
     /// Tokens written to the provider's server-side prompt cache. Zero when
@@ -1321,8 +1350,48 @@ fn is_zero_u32(value: &u32) -> bool {
 }
 
 impl LoopModelUsage {
+    /// Structural V1 validation only; no caller/lineage or billing authority.
+    pub fn normalized_input_total(&self) -> Option<u32> {
+        let total = self.normalized_input_tokens?;
+        let cache =
+            u64::from(self.cache_read_input_tokens) + u64::from(self.cache_creation_input_tokens);
+        (self.normalization_version == Some(1)
+            && total >= self.input_tokens
+            && u64::from(total) >= cache
+            && u64::from(total) <= u64::from(self.input_tokens) + cache)
+            .then_some(total)
+    }
     /// Accumulate another call's usage into this running per-run total.
     pub fn add_assign(&mut self, other: &LoopModelUsage) {
+        let normalized = self
+            .normalized_input_total()
+            .zip(other.normalized_input_total())
+            .and_then(|(a, b)| a.checked_add(b));
+        let exact = normalized.is_some()
+            && self.normalization_version == Some(1)
+            && other.normalization_version == Some(1)
+            && self.input_tokens.checked_add(other.input_tokens).is_some()
+            && self
+                .output_tokens
+                .checked_add(other.output_tokens)
+                .is_some()
+            && self
+                .cache_read_input_tokens
+                .checked_add(other.cache_read_input_tokens)
+                .is_some()
+            && self
+                .cache_creation_input_tokens
+                .checked_add(other.cache_creation_input_tokens)
+                .is_some();
+        self.cache_details_observed = if exact {
+            self.cache_details_observed
+                .zip(other.cache_details_observed)
+                .map(|(a, b)| a && b)
+        } else {
+            None
+        };
+        self.normalization_version = exact.then_some(1);
+        self.normalized_input_tokens = if exact { normalized } else { None };
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
         self.cache_read_input_tokens = self
@@ -1333,9 +1402,9 @@ impl LoopModelUsage {
             .saturating_add(other.cache_creation_input_tokens);
     }
 
-    /// Total billable tokens (input + output). Cache tokens are already counted
-    /// within `input_tokens` by every provider that reports them, so they are
-    /// not added again here.
+    /// Legacy raw projection retained for compatibility. Trusted new billing
+    /// consumes only versioned normalized_input_tokens, never guesses raw cache
+    /// semantics or rewrites historical counters.
     pub fn total_tokens(&self) -> u32 {
         self.input_tokens.saturating_add(self.output_tokens)
     }
@@ -2693,3 +2762,64 @@ mod tests {
 }
 
 // arch-exempt: large_file, pre-existing large file minimally touched for the §5.3 Stage 2a-i replay-payload move (field/store wiring + tests), plan #6175
+
+#[cfg(test)]
+mod normalized_usage_sidecar_tests {
+    use super::*;
+    #[test]
+    fn legacy_four_counters_roundtrip_without_upgrade_or_price_change() {
+        let raw = serde_json::json!({"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":7,"cache_creation_input_tokens":100});
+        let old: LoopModelUsage = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(old.normalization_version, None);
+        assert_eq!(old.normalized_input_tokens, None);
+        assert_eq!(serde_json::to_value(old).unwrap(), raw);
+    }
+    #[test]
+    fn checked_sidecar_overflow_and_unknown_mixture_never_become_known() {
+        let known = LoopModelUsage {
+            normalization_version: Some(1),
+            normalized_input_tokens: Some(109),
+            cache_details_observed: Some(true),
+            input_tokens: 2,
+            output_tokens: 3,
+            cache_read_input_tokens: 7,
+            cache_creation_input_tokens: 100,
+        };
+        let mut sum = known;
+        sum.add_assign(&known);
+        assert_eq!(sum.normalized_input_tokens, Some(218));
+        assert_eq!(
+            (
+                sum.input_tokens,
+                sum.output_tokens,
+                sum.cache_read_input_tokens,
+                sum.cache_creation_input_tokens
+            ),
+            (4, 6, 14, 200)
+        );
+        let mut old_zero = LoopModelUsage::default();
+        old_zero.add_assign(&known);
+        assert_eq!(
+            (
+                old_zero.normalization_version,
+                old_zero.normalized_input_tokens
+            ),
+            (None, None)
+        );
+        let mut overflow = LoopModelUsage {
+            normalization_version: Some(1),
+            normalized_input_tokens: Some(u32::MAX),
+            cache_details_observed: Some(true),
+            input_tokens: u32::MAX,
+            ..Default::default()
+        };
+        overflow.add_assign(&known);
+        assert_eq!(
+            (
+                overflow.normalization_version,
+                overflow.normalized_input_tokens
+            ),
+            (None, None)
+        );
+    }
+}

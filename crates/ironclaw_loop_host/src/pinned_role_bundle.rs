@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 
 const MAX_CATALOG_BYTES: usize = 256 * 1024;
 const MAX_ROLE_CAPABILITIES: usize = 256;
+const MAX_ROLE_INTERNAL_CAPABILITIES: usize = 256;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PinnedRoleBundleSpec<'a> {
@@ -59,6 +60,10 @@ struct RoleEntry {
     sha256: String,
     bytes: usize,
     allowed_capabilities: Vec<String>,
+    /// Product-authored server-only metadata. The generic host validates its
+    /// shape but never merges these ids into the provider-visible tool allowlist.
+    #[serde(default)]
+    allowed_internal_capabilities: Vec<String>,
 }
 
 impl PinnedRoleBundle {
@@ -102,6 +107,21 @@ impl PinnedRoleBundle {
             }
             if entry.allowed_capabilities.len() > MAX_ROLE_CAPABILITIES {
                 return Err(format!("too many role capabilities: {}", entry.kind));
+            }
+            if entry.allowed_internal_capabilities.len() > MAX_ROLE_INTERNAL_CAPABILITIES {
+                return Err(format!(
+                    "too many role internal capabilities: {}",
+                    entry.kind
+                ));
+            }
+            let mut internal_ids = BTreeSet::new();
+            for id in &entry.allowed_internal_capabilities {
+                if id.trim().is_empty() || !internal_ids.insert(id.as_str()) {
+                    return Err(format!(
+                        "invalid or duplicate role internal capability: {}",
+                        entry.kind
+                    ));
+                }
             }
             let role_path = format!("directions/{}.md", entry.kind);
             let material = MaterialEntry {

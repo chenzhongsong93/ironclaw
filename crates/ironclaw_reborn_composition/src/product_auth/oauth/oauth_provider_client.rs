@@ -909,6 +909,7 @@ pub(crate) fn oauth_endpoint_host(endpoint: &str) -> Result<String, AuthProductE
 
 pub(crate) fn oauth_network_policy(token_host: &str, response_body_limit: u64) -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: token_host.to_string(),

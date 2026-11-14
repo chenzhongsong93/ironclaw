@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 /// failed child. The value is deliberately longer than the runner's normal
 /// model-request and lease windows; it only governs the edge-before-child-submit
 /// crash window, never an existing queued/running child.
+#[cfg(any(feature = "filesystem-goal-store", test))]
 pub(crate) const DEFAULT_AWAIT_EDGE_DEADLINE_SECONDS: i64 = 15 * 60;
 
 /// CAS state machine (§2): `Open -> Settled -> Drained`, `Open -> Abandoned`.
@@ -179,6 +180,7 @@ pub struct AwaitEdge {
 }
 
 impl AwaitEdge {
+    #[cfg(any(feature = "filesystem-goal-store", test))]
     pub(crate) fn effective_deadline(&self) -> DateTime<Utc> {
         self.deadline.unwrap_or_else(|| {
             self.created_at + chrono::Duration::seconds(DEFAULT_AWAIT_EDGE_DEADLINE_SECONDS)
@@ -216,6 +218,7 @@ pub enum AwaitEdgeStoreError {
     Backend { reason: String },
 }
 
+#[cfg(any(feature = "filesystem-goal-store", test))]
 pub(crate) fn map_await_edge_error(
     error: AwaitEdgeStoreError,
 ) -> ironclaw_turns::run_profile::AgentLoopHostError {
@@ -232,6 +235,7 @@ pub(crate) fn map_await_edge_error(
 /// unrelated to await-edge's own filesystem gate (`filesystem-goal-store`);
 /// threading a cross-feature dependency for a 4-line pure function is worse
 /// than the duplication.
+#[cfg(any(feature = "filesystem-goal-store", test))]
 fn optional_axis_path(value: Option<&str>) -> String {
     match value {
         Some(value) => format!("some/{value}"),
@@ -242,6 +246,7 @@ fn optional_axis_path(value: Option<&str>) -> String {
 /// §4.2's canonical await-edge path, scope-relative (the mount rewrites
 /// tenant/user; the agent/project axes are ordinary path segments beneath
 /// it, per §4.5a).
+#[cfg(any(feature = "filesystem-goal-store", test))]
 pub(crate) fn edge_path(
     agent_id: Option<&str>,
     project_id: Option<&str>,
@@ -261,6 +266,7 @@ pub(crate) fn edge_path(
 /// The directory holding every child edge for one parent run — the natural
 /// listing unit `list_parents_with_unclosed_edges` (§4.3) and D3's
 /// gate-group listing both use.
+#[cfg(any(feature = "filesystem-goal-store", test))]
 pub(crate) fn edge_dir_for_parent(
     agent_id: Option<&str>,
     project_id: Option<&str>,
@@ -282,6 +288,7 @@ pub(crate) fn edge_dir_for_parent(
 /// project axis values (not a full `TurnScope`) so callers that only have
 /// those two values in hand (e.g. a decoded [`roster::RosterKey`]) don't
 /// need to fabricate an unrelated `ThreadId` just to build a `TurnScope`.
+#[cfg(any(feature = "filesystem-goal-store", test))]
 pub(crate) fn edge_scope_root(
     agent_id: Option<&str>,
     project_id: Option<&str>,

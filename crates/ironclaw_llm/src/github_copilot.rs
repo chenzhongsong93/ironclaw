@@ -266,6 +266,9 @@ impl LlmProvider for GithubCopilotProvider {
         };
 
         Ok(CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: content.unwrap_or_default(),
             finish_reason,
             input_tokens: response
@@ -352,6 +355,9 @@ impl LlmProvider for GithubCopilotProvider {
         };
 
         Ok(ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content,
             tool_calls,
             finish_reason,

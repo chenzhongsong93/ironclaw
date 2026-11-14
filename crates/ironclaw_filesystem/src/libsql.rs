@@ -951,6 +951,46 @@ impl RootFilesystem for LibSqlRootFilesystem {
         self.tail_bounded(path, from, usize::MAX).await
     }
 
+    async fn complete_event_prefix(&self, path: &VirtualPath, max_records: usize, max_bytes: usize, max_record_bytes: usize)
+        -> Result<Option<crate::CompleteEventPrefix>, FilesystemError>
+    {
+        if max_records==0 || max_records>100_000 || max_bytes>64*1024*1024 || max_record_bytes>8*1024*1024 {
+            return Err(FilesystemError::Backend {path:path.clone(),operation:FilesystemOperation::Tail,reason:"invalid complete-prefix budget".to_string()});
+        }
+        let conn=self.connect().await?;
+        let mut rows=conn.query(COMPLETE_EVENT_PREFIX_SQL,libsql::params![path.as_str(),max_records as i64,max_bytes as i64,max_record_bytes as i64]).await
+            .map_err(|e|libsql_db_error(path.clone(),FilesystemOperation::Tail,e))?;
+        let mut records=Vec::new();let mut metadata=None;
+        while let Some(r)=rows.next().await.map_err(|e|libsql_db_error(path.clone(),FilesystemOperation::Tail,e))? {
+            let count:i64=r.get(0).map_err(|e|libsql_db_error(path.clone(),FilesystemOperation::Tail,e))?;
+            let bytes:i64=r.get(1).map_err(|e|libsql_db_error(path.clone(),FilesystemOperation::Tail,e))?;
+            let largest:i64=r.get(2).map_err(|e|libsql_db_error(path.clone(),FilesystemOperation::Tail,e))?;
+            if count==0 {return Ok(None);}
+            if count<0||bytes<0||count>max_records as i64||bytes>max_bytes as i64||largest>max_record_bytes as i64 {
+                return Err(FilesystemError::Backend {path:path.clone(),operation:FilesystemOperation::Tail,reason:"complete-prefix budget exceeded".to_string()});
+            }
+            let head:i64=r.get(3).map_err(|e|libsql_db_error(path.clone(),FilesystemOperation::Tail,e))?;
+            if metadata.is_some_and(|m|m!=(count,bytes,head)) {return Err(FilesystemError::Backend {path:path.clone(),operation:FilesystemOperation::Tail,reason:"prefix stats changed".to_string()});}
+            metadata=Some((count,bytes,head));
+            let raw:i64=r.get(4).map_err(|e|libsql_db_error(path.clone(),FilesystemOperation::Tail,e))?;
+            let payload:Vec<u8>=r.get(5).map_err(|e|libsql_db_error(path.clone(),FilesystemOperation::Tail,e))?;
+            records.push(EventRecord {seq:seq_no_from_i64(path,raw,FilesystemOperation::Tail)?,payload});
+        }
+        let (count,bytes,head)=metadata.ok_or_else(||FilesystemError::Backend {path:path.clone(),operation:FilesystemOperation::Tail,reason:"missing prefix stats".to_string()})?;
+        crate::CompleteEventPrefix::from_atomic_rows(path,count as usize,bytes as usize,
+            seq_no_from_i64(path,head,FilesystemOperation::Tail)?,records).map(Some)
+    }
+
+    async fn event_log_generation(&self, path: &VirtualPath) -> Result<Option<String>,FilesystemError> {
+        let conn=self.connect().await?;
+        let mut rows=conn.query("SELECT seq,CASE WHEN length(payload)<=8388608 THEN payload ELSE NULL END FROM root_filesystem_events WHERE path=?1 ORDER BY seq ASC LIMIT 1",libsql::params![path.as_str()]).await.map_err(|e|libsql_db_error(path.clone(),FilesystemOperation::Tail,e))?;
+        let Some(row)=rows.next().await.map_err(|e|libsql_db_error(path.clone(),FilesystemOperation::Tail,e))? else{return Ok(None)};
+        let raw:i64=row.get(0).map_err(|e|libsql_db_error(path.clone(),FilesystemOperation::Tail,e))?;
+        let payload:Option<Vec<u8>>=row.get(1).map_err(|e|libsql_db_error(path.clone(),FilesystemOperation::Tail,e))?;
+        let payload=payload.ok_or_else(||FilesystemError::Backend {path:path.clone(),operation:FilesystemOperation::Tail,reason:"generation first record byte budget exceeded".to_string()})?;
+        Ok(Some(crate::CompleteEventPrefix::generation_from_first(&EventRecord {seq:seq_no_from_i64(path,raw,FilesystemOperation::Tail)?,payload})))
+    }
+
     async fn tail_bounded(
         &self,
         path: &VirtualPath,
@@ -2452,3 +2492,5 @@ mod tests {
         assert!(fs.get(&path).await.unwrap().is_none());
     }
 }
+
+const COMPLETE_EVENT_PREFIX_SQL: &str = include_str!("complete-prefix-libsql.sql");

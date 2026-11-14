@@ -3199,6 +3199,20 @@ async fn turn_runner_worker_fails_when_real_host_factory_rejects_claimed_scope()
     }
     scheduler_handle.shutdown().await;
 
+    // HFP01-R2: real factory/executor/scheduler durable path; no new API symbols.
+    let failed = turn_store
+        .get_run_state(GetRunStateRequest {
+            scope: fixture.context.scope.clone(),
+            run_id,
+        })
+        .await
+        .expect("original failed state readback");
+    let failure = failed.failure.expect("factory failure recorded by scheduler");
+    assert_eq!(failure.category(), "host_creation_failed");
+    assert_eq!(
+        failure.detail(),
+        Some("host-safe.host-create.context-scope.scope-mismatch")
+    );
     assert!(fixture.gateway.requests().is_empty());
     let history = fixture
         .thread_service
@@ -3267,6 +3281,66 @@ async fn text_only_host_factory_create_host_uses_claimed_model_route_snapshot() 
         host.run_context().resolved_model_route,
         Some(persisted_snapshot)
     );
+}
+
+#[tokio::test]
+async fn model_free_driver_host_rejects_inference_and_persisted_route() {
+    let fixture = HostFixture::new("thread-host-model-free", "deterministic run").await;
+    let mut requirements = DriverRequirements::all_optional();
+    requirements.model = RequirementLevel::Unsupported;
+    let resolver = Arc::new(
+        StaticModelRouteResolver::new(ModelRoutePolicy::new(
+            ModelSelectionMode::DeveloperAnyConfigured,
+        ))
+        .with_route(
+            ModelSlot::Default,
+            ModelRoute::new("openrouter", "anthropic/claude-sonnet-4").unwrap(),
+        ),
+    );
+    let factory = fixture
+        .factory()
+        .with_driver_requirements(driver_requirements_for(
+            &fixture.claimed.resolved_run_profile.loop_driver,
+            requirements,
+        ))
+        .with_model_route_resolver(resolver);
+
+    let host = factory.create_host(&fixture.claimed).await.unwrap();
+    assert!(host.run_context().resolved_model_route.is_none());
+    let error = host
+        .stream_model(LoopModelRequest {
+            inline_messages: Vec::new(),
+            messages: Vec::new(),
+            surface_version: None,
+            model_preference: None,
+            capability_view: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, AgentLoopHostErrorKind::PolicyDenied);
+    let error = host
+        .compact_loop_context(LoopCompactionRequest {
+            task_id: SystemInferenceTaskId::new(),
+            thread_id: fixture.thread_id.clone(),
+            last_compacted_through_seq: None,
+            drop_through_seq: 1,
+            preserve_tail_tokens: 8_000,
+            mode: LoopCompactionMode::Fresh,
+            deadline_ms: 1_000,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error, LoopCompactionError::UnsupportedMode);
+
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_model_route = Some(LoopModelRouteSnapshot::new(
+        "openrouter",
+        "anthropic/claude-sonnet-4",
+        "config:v1",
+        "auth:v1",
+    ));
+    assert!(factory.create_host(&claimed).await.is_err());
+    assert!(fixture.gateway.requests().is_empty());
 }
 
 #[tokio::test]
@@ -3601,7 +3675,7 @@ async fn real_tianquan_worldsmith_bundle_reaches_final_model_request() {
         PinnedRoleBundleSpec {
             schema_version: "soul-catalog/1",
             bundle_id: "novel-studio-souls",
-            version: "1.0.0",
+            version: "1.0.1",
             marker: "SOUL-BUNDLE",
             expected_roles: KINDS,
             max_material_bytes: 24 * 1024,
@@ -3668,7 +3742,7 @@ async fn real_tianquan_novelist_bundle_reaches_novelist_profile_final_request() 
         PinnedRoleBundleSpec {
             schema_version: "soul-catalog/1",
             bundle_id: "novel-studio-souls",
-            version: "1.0.0",
+            version: "1.0.1",
             marker: "SOUL-BUNDLE",
             expected_roles: KINDS,
             max_material_bytes: 24 * 1024,
@@ -3696,7 +3770,7 @@ async fn real_tianquan_novelist_bundle_reaches_novelist_profile_final_request() 
             && message.content.contains(&role.direction_markdown)
             && message
                 .content
-                .contains("SOUL-BUNDLE novel-studio-souls/1.0.0")
+                .contains("SOUL-BUNDLE novel-studio-souls/1.0.1")
             && message.content.contains("roleSha256=")
     }));
     assert!(request.messages.iter().any(|message| {
@@ -3736,7 +3810,7 @@ async fn real_tianquan_all_roles_final_requests_apply_pinned_role_hash_and_allow
         PinnedRoleBundleSpec {
             schema_version: "soul-catalog/1",
             bundle_id: "novel-studio-souls",
-            version: "1.0.0",
+            version: "1.0.1",
             marker: "SOUL-BUNDLE",
             expected_roles: KINDS,
             max_material_bytes: 24 * 1024,
@@ -3781,7 +3855,7 @@ async fn real_tianquan_all_roles_final_requests_apply_pinned_role_hash_and_allow
                     && message.content.contains(&role.direction_markdown)
                     && message
                         .content
-                        .contains("SOUL-BUNDLE novel-studio-souls/1.0.0")
+                        .contains("SOUL-BUNDLE novel-studio-souls/1.0.1")
                     && message.content.contains("roleSha256=")
                     && message.content.contains(&format!("kind={kind}"))
             }),
@@ -3794,11 +3868,23 @@ async fn real_tianquan_all_roles_final_requests_apply_pinned_role_hash_and_allow
 
         let mut expected_tools = role.allowed_capabilities.clone();
         expected_tools.insert(CapabilityId::new("ironclaw.loop.capability_info").unwrap());
+        let captured_tools = tools.into_iter().collect::<BTreeSet<_>>();
         assert_eq!(
-            tools.into_iter().collect::<BTreeSet<_>>(),
-            expected_tools,
+            captured_tools, expected_tools,
             "final tools for {kind} must equal the pinned role allowlist plus host introspection"
         );
+        let quality_gate = CapabilityId::new("tianquan-graph.run_quality_gates").unwrap();
+        assert_eq!(
+            captured_tools.contains(&quality_gate),
+            *kind == "auditor",
+            "only auditor may receive the quality-gate capability in its final request"
+        );
+        if *kind == "event-simulator" {
+            assert!(
+                !captured_tools.contains(&CapabilityId::new("action.evaluate").unwrap()),
+                "server-only action.evaluate must not become a provider tool"
+            );
+        }
     }
 }
 
@@ -9968,3 +10054,6 @@ impl LoopModelBudgetAccountant for RejectingSystemInferenceBudgetAccountant {
         panic!("post_model_work must not run when pre_model_work rejects")
     }
 }
+
+#[path = "loop_driver_host/host_creation_diagnostic.rs"]
+mod host_creation_diagnostic;

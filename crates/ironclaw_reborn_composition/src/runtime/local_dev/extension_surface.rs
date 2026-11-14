@@ -17,14 +17,14 @@ use ironclaw_first_party_extensions::{
 use ironclaw_product_workflow::ProductWorkflowError;
 
 #[derive(Clone, Default)]
-pub(in crate::runtime) struct ExtensionCapabilitySurfaceSource {
+pub(crate) struct ExtensionCapabilitySurfaceSource {
     extension_management: Option<Arc<RebornLocalExtensionManagementPort>>,
     #[cfg(test)]
     static_surface: Option<ExtensionCapabilitySurface>,
 }
 
 impl ExtensionCapabilitySurfaceSource {
-    pub(in crate::runtime) fn new(
+    pub(crate) fn new(
         extension_management: Option<Arc<RebornLocalExtensionManagementPort>>,
     ) -> Self {
         Self {
@@ -34,15 +34,17 @@ impl ExtensionCapabilitySurfaceSource {
         }
     }
 
+    pub(crate) fn management(&self)->Option<Arc<RebornLocalExtensionManagementPort>> {self.extension_management.clone()}
+
     #[cfg(test)]
-    pub(in crate::runtime) fn from_surface(surface: ExtensionCapabilitySurface) -> Self {
+    pub(crate) fn from_surface(surface: ExtensionCapabilitySurface) -> Self {
         Self {
             extension_management: None,
             static_surface: Some(surface),
         }
     }
 
-    pub(in crate::runtime) async fn snapshot(
+    pub(crate) async fn snapshot(
         &self,
     ) -> Result<ExtensionCapabilitySurface, ProductWorkflowError> {
         #[cfg(test)]
@@ -57,13 +59,13 @@ impl ExtensionCapabilitySurfaceSource {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(in crate::runtime) struct ExtensionCapabilitySurface {
+pub(crate) struct ExtensionCapabilitySurface {
     active_capabilities: Vec<ActiveExtensionCapability>,
 }
 
 impl ExtensionCapabilitySurface {
     #[cfg(test)]
-    pub(in crate::runtime) fn from_active_capabilities(
+    pub(crate) fn from_active_capabilities(
         active_capabilities: Vec<ActiveExtensionCapability>,
     ) -> Self {
         Self {
@@ -87,7 +89,7 @@ impl ExtensionCapabilitySurface {
     /// authorization reuses the grants minted here, so a capability filtered
     /// out is both invisible in the surface AND denied at dispatch — grant
     /// absence fails closed with no separate preflight.
-    pub(in crate::runtime) fn grants(
+    pub(crate) fn grants(
         &self,
         grantee: &ExtensionId,
         caller: &ironclaw_host_api::UserId,
@@ -105,7 +107,7 @@ impl ExtensionCapabilitySurface {
             .collect()
     }
 
-    pub(in crate::runtime) fn capability(
+    pub(crate) fn capability(
         &self,
         capability_id: &CapabilityId,
     ) -> Option<&ActiveExtensionCapability> {
@@ -225,6 +227,7 @@ fn extension_network_policy(capability: &ActiveExtensionCapability) -> NetworkPo
     // still caught by the effect-based obligation gate and fails as misconfigured.)
     let has_egress_targets = !targets.is_empty();
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: targets,
         deny_private_ip_ranges: has_egress_targets,
         max_egress_bytes: is_web_access_exa_mcp.then_some(NETWORK_EGRESS_LIMIT),

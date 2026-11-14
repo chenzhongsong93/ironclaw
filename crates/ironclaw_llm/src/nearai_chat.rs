@@ -819,6 +819,9 @@ impl LlmProvider for NearAiChatProvider {
         emit_context_shadow_usage(input_tokens, output_tokens, cached_tokens);
 
         Ok(CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content,
             finish_reason,
             input_tokens,
@@ -874,6 +877,9 @@ impl LlmProvider for NearAiChatProvider {
         );
 
         Ok(CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content,
             finish_reason: response.finish_reason,
             input_tokens: response.input_tokens,
@@ -987,6 +993,9 @@ impl LlmProvider for NearAiChatProvider {
         emit_context_shadow_usage(input_tokens, output_tokens, cached_tokens);
 
         Ok(ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content,
             tool_calls,
             finish_reason,
@@ -1060,6 +1069,9 @@ impl LlmProvider for NearAiChatProvider {
         );
 
         Ok(ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content,
             tool_calls: response.tool_calls,
             finish_reason,

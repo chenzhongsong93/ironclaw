@@ -946,6 +946,7 @@ fn sample_scope(invocation_id: InvocationId) -> ResourceScope {
 
 fn sample_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "api.example.test".to_string(),
@@ -958,6 +959,7 @@ fn sample_policy() -> NetworkPolicy {
 
 fn caller_supplied_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "caller.example.test".to_string(),

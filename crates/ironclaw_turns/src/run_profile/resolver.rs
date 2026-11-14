@@ -206,6 +206,32 @@ pub struct RunProfileDefinition {
 }
 
 impl RunProfileDefinition {
+    /// Bind a host product profile to a concrete, checkpointable driver.
+    /// Adapter hints cannot select it without SpecialDriver authority.
+    pub fn host_product_driver(
+        profile_id: RunProfileId,
+        loop_driver: AgentLoopDriverDescriptor,
+        capability_surface_profile_id: CapabilitySurfaceProfileId,
+    ) -> Result<Self, RunProfileRegistryError> {
+        let (Some(schema), Some(version)) = (
+            loop_driver.checkpoint_schema_id.clone(),
+            loop_driver.checkpoint_schema_version,
+        ) else {
+            return Err(RunProfileRegistryError::InvalidProfile {
+                reason: "host product driver must declare its checkpoint schema and version".into(),
+            });
+        };
+        let mut definition = Self::interactive_like(
+            profile_id,
+            loop_driver,
+            schema,
+            version,
+            capability_surface_profile_id,
+        );
+        definition.required_privileges = vec![PrivilegedRunProfileDimension::SpecialDriver];
+        Ok(definition)
+    }
+
     pub fn interactive_like(
         profile_id: RunProfileId,
         loop_driver: AgentLoopDriverDescriptor,

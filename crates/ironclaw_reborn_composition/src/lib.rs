@@ -56,6 +56,12 @@ mod readiness;
 mod root;
 mod runtime;
 mod runtime_input;
+mod production_execution_surface;
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+mod production_lifecycle;
+pub use production_execution_surface::{RebornProductionBoundPorts,RebornProductionSurfaceContext,
+    RebornProductionContextSources,RebornProductionExecutionSurface,
+    RebornProductionExecutionSurfaceFactory};
 mod runtime_profile_approval_policy;
 mod support;
 #[cfg(feature = "test-support")]
@@ -109,6 +115,11 @@ pub use ironclaw_product_workflow::{
     LifecycleProductResponse, LifecycleSearchExtensionSummary,
 };
 pub use ironclaw_runner::runtime::DEFAULT_TURN_RUNNER_WORKER_COUNT;
+/// In-process driver configuration for the TianQuan required Gateway.
+pub use ironclaw_runner::{
+    driver_registry::{DriverRequirements, RequirementLevel},
+    runtime::ProductRunDriver,
+};
 // Re-exported for `ironclaw_reborn_cli` (`runtime/mod.rs` turn-failure display):
 // the CLI consumes composition as its facade and must not grow a direct
 // `ironclaw_runner` edge for one summary helper. All other run-failure
@@ -208,9 +219,11 @@ pub use root::profile::{RebornCompositionProfile, RebornCompositionProfileParseE
 #[cfg(any(test, feature = "test-support"))]
 pub use runtime::RebornTurnDriveOutcome;
 pub use runtime::{
+    RebornRequesterRuntimeProtocolSnapshot, RebornResidentWorkerState,
     AssistantReply, ConversationId, RebornRuntime, RebornRuntimeError, RebornSkillActivation,
     RebornSkillActivationMode, RebornSkillAsset, RebornSkillBundle, RebornSkillExecutionPlan,
     RebornSkillExecutionResult, RebornSkillSourceKind, build_reborn_runtime,
+    build_reborn_runtime_with_opaque_input_backend, build_reborn_runtime_with_product_driver,
 };
 pub use runtime_input::{
     CredentialRefreshSettings, DEFAULT_TURN_RUNNER_HEARTBEAT_INTERVAL,
@@ -700,10 +713,10 @@ fn invocation_mount_view_for_segments(
     grants.push(MountGrant::new(
         MountAlias::new("/tenant-shared")?,
         VirtualPath::new(format!("/tenants/{tenant_id}/shared"))?,
-        // Broad tenant-shared storage gets read + write + list, but NOT delete:
-        // no tenant-shared consumer other than the identity store needs to
-        // remove records, so withholding delete here keeps the blast radius of
-        // a compromised writer from spanning every tenant-shared subtree.
+        // Broad tenant-shared storage gets read + write + list, but NOT delete.
+        // Host-only stores such as the project repository use private subtree
+        // views for deletion, so a compromised general writer cannot delete
+        // records across every tenant-shared subtree.
         MountPermissions::read_write(),
     ));
     grants.push(MountGrant::new(
@@ -730,6 +743,20 @@ fn invocation_mount_view_for_segments(
         ));
     }
     MountView::new(grants)
+}
+
+/// Project repository control-plane authority; never use for agent filesystem IO.
+/// Keep delete on this private subtree rather than the broad tenant-shared grant.
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
+pub(crate) fn project_repository_mount_view(
+    scope: &ResourceScope,
+) -> Result<MountView, ironclaw_host_api::HostApiError> {
+    let tenant_id = resource_scope_path_segment(scope.tenant_id.as_str());
+    MountView::new(vec![MountGrant::new(
+        MountAlias::new("/tenant-shared/reborn-projects")?,
+        VirtualPath::new(format!("/tenants/{tenant_id}/shared/reborn-projects"))?,
+        MountPermissions::read_write_list_delete(),
+    )])
 }
 
 pub(crate) fn slack_host_state_mount_view(
@@ -1037,6 +1064,52 @@ mod mount_view_tests {
             resolved.as_str(),
             &format!("/tenants/{}/shared/foo", scope.tenant_id.as_str())
         );
+    }
+
+    // 覆盖:TianQuan TEST-SPEC-novel-studio-atomic-evolution §4 AE-L1-167。
+    #[test]
+    fn project_repository_mount_view_grants_delete_only_to_project_records() {
+        for scope in [
+            sample_scope(),
+            other_tenant_scope(),
+            ResourceScope::system(),
+        ] {
+            let view = project_repository_mount_view(&scope).unwrap();
+            let tenant = resource_scope_path_segment(scope.tenant_id.as_str());
+            for suffix in ["records/project.json", "members/project/user.json"] {
+                let path =
+                    ScopedPath::new(format!("/tenant-shared/reborn-projects/{suffix}")).unwrap();
+                let (resolved, grant) = view.resolve_with_grant(&path).unwrap();
+                assert_eq!(grant.alias.as_str(), "/tenant-shared/reborn-projects");
+                assert_eq!(
+                    grant.permissions,
+                    MountPermissions::read_write_list_delete()
+                );
+                assert_eq!(
+                    resolved.as_str(),
+                    format!("/tenants/{tenant}/shared/reborn-projects/{suffix}")
+                );
+                let general = invocation_mount_view(&scope).unwrap();
+                assert!(
+                    !general
+                        .resolve_with_grant(&path)
+                        .unwrap()
+                        .1
+                        .permissions
+                        .delete
+                );
+            }
+            for path in [
+                "/tenant-shared/other.json",
+                "/tenant-shared/reborn-projects-other/record.json",
+                "/tenant-shared/reborn-identity/user.json",
+                "/tenant-shared/slack-channel-routes/team.json",
+                "/engine/threads/thread.json",
+                "/workspace/file.txt",
+            ] {
+                assert!(view.resolve(&ScopedPath::new(path).unwrap()).is_err());
+            }
+        }
     }
 
     #[test]
@@ -1421,3 +1494,24 @@ mod gate_record_production_mount_tests {
         assert_eq!(store.load(&scope_b, gate_ref).await.unwrap(), None);
     }
 }
+
+mod runtime_skill_bundle;
+pub use runtime_skill_bundle::RebornRuntimeSkillBundle;
+
+mod operator_host_bundle;
+pub use operator_host_bundle::RebornHostExtensionBundle;
+
+/// Read-only compiled protocol information; does not establish a live host or grant egress authority.
+pub fn reborn_requester_egress_protocol_version()->&'static str {
+    ironclaw_network::host_http_egress_protocol_version()
+}
+
+mod requester_protocol_export;
+/// Print read-only native protocol information before a host loads configuration or starts a runtime.
+/// `host_package_version` comes from the caller's compiled Cargo package constant, never model/HTTP input.
+/// This query does not claim source provenance, readiness, tenant authority, or complete qualification.
+pub fn print_reborn_requester_egress_protocol(host_package_version:&'static str)->Result<(),&'static str> {
+    requester_protocol_export::print(host_package_version)
+}
+
+mod operator_late_admission;

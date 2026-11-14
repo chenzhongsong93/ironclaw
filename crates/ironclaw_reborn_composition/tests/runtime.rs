@@ -48,6 +48,165 @@ async fn runtime_composition_test_guard() -> tokio::sync::MutexGuard<'static, ()
     RUNTIME_COMPOSITION_TEST_LOCK.lock().await
 }
 
+// 覆盖:TianQuan TEST-SPEC-novel-studio-atomic-evolution §4 AE-L2-120。
+// 经真实durable factory装配，不以FakeRepo或宽权限fixed view替代caller。
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn project_repository_delete_caller_preserves_acl_and_tenant_isolation() {
+    let _guard = runtime_composition_test_guard().await;
+    let root = tempfile::tempdir().unwrap();
+    let services = ironclaw_reborn_composition::build_reborn_services(RebornBuildInput::local_dev(
+        "project-delete-host",
+        root.path().join("local-dev"),
+    ))
+    .await
+    .unwrap();
+    let service = services.local_dev_project_service_for_test().unwrap();
+    for tenant in ["project-tenant-a", "project-tenant-b"] {
+        create_delete_test_project(service.as_ref(), tenant).await;
+    }
+    service
+        .add_member(
+            project_delete_caller("project-tenant-a", "owner"),
+            ironclaw_product_workflow::RebornAddMemberRequest {
+                project_id: "same-project".into(),
+                user_id: "editor".into(),
+                role: ironclaw_product_workflow::RebornProjectRole::Editor,
+            },
+        )
+        .await
+        .unwrap();
+    assert_project_delete_acl_rejections(service.as_ref()).await;
+    service
+        .delete_project(
+            project_delete_caller("project-tenant-a", "owner"),
+            ironclaw_product_workflow::RebornDeleteProjectRequest {
+                project_id: "same-project".into(),
+            },
+        )
+        .await
+        .expect("Owner必须能通过durable project repository删除记录与成员");
+    assert_project_delete_readback(service.as_ref()).await;
+}
+
+#[cfg(feature = "libsql")]
+fn project_delete_caller(tenant: &str, user: &str) -> ironclaw_product_workflow::ProjectCaller {
+    ironclaw_product_workflow::ProjectCaller {
+        tenant_id: TenantId::new(tenant).unwrap(),
+        user_id: UserId::new(user).unwrap(),
+    }
+}
+
+#[cfg(feature = "libsql")]
+async fn create_delete_test_project(
+    service: &dyn ironclaw_product_workflow::ProjectService,
+    tenant: &str,
+) {
+    service
+        .create_project(
+            project_delete_caller(tenant, "owner"),
+            ironclaw_product_workflow::RebornCreateProjectRequest {
+                project_id: Some("same-project".into()),
+                name: "Delete caller".into(),
+                description: String::new(),
+                icon: None,
+                color: None,
+                metadata: None,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+#[cfg(feature = "libsql")]
+async fn assert_project_delete_acl_rejections(
+    service: &dyn ironclaw_product_workflow::ProjectService,
+) {
+    use ironclaw_product_workflow::{ProjectServiceError, RebornDeleteProjectRequest};
+    for (tenant, user, expected) in [
+        ("project-tenant-a", "editor", ProjectServiceError::Denied),
+        (
+            "project-tenant-a",
+            "outsider",
+            ProjectServiceError::NotFound,
+        ),
+        ("project-tenant-c", "owner", ProjectServiceError::NotFound),
+    ] {
+        let error = service
+            .delete_project(
+                project_delete_caller(tenant, user),
+                RebornDeleteProjectRequest {
+                    project_id: "same-project".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, expected);
+    }
+}
+
+#[cfg(feature = "libsql")]
+async fn assert_project_delete_readback(service: &dyn ironclaw_product_workflow::ProjectService) {
+    use ironclaw_product_workflow::{
+        ProjectServiceError, RebornDeleteProjectRequest, RebornGetProjectRequest,
+        RebornListMembersRequest,
+    };
+    let request = || RebornGetProjectRequest {
+        project_id: "same-project".into(),
+    };
+    assert_eq!(
+        service
+            .get_project(
+                project_delete_caller("project-tenant-a", "owner"),
+                request()
+            )
+            .await
+            .unwrap_err(),
+        ProjectServiceError::NotFound
+    );
+    service
+        .get_project(
+            project_delete_caller("project-tenant-b", "owner"),
+            request(),
+        )
+        .await
+        .expect("另一tenant同ID项目必须保留");
+    create_delete_test_project(service, "project-tenant-a").await;
+    assert!(
+        service
+            .list_members(
+                project_delete_caller("project-tenant-a", "owner"),
+                RebornListMembersRequest {
+                    project_id: "same-project".into(),
+                },
+            )
+            .await
+            .unwrap()
+            .members
+            .is_empty()
+    );
+    assert_eq!(
+        service
+            .get_project(
+                project_delete_caller("project-tenant-a", "editor"),
+                request()
+            )
+            .await
+            .unwrap_err(),
+        ProjectServiceError::NotFound,
+        "删除后同ID重建不能复活旧active member"
+    );
+    service
+        .delete_project(
+            project_delete_caller("project-tenant-a", "owner"),
+            RebornDeleteProjectRequest {
+                project_id: "same-project".into(),
+            },
+        )
+        .await
+        .expect("无成员项目亦可删除");
+}
+
 #[tokio::test]
 async fn runtime_rejects_disabled_profile_before_local_substrate_lookup() {
     let input =

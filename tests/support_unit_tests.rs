@@ -2240,6 +2240,8 @@ mod reborn_support_tests {
             messages,
             surface_version: None,
             resolved_model_route: None,
+            thread_id: None,
+            conversation_id: None,
             run_id: TurnRunId::new(),
             turn_id: TurnId::new(),
             llm_subject: None,
@@ -2405,6 +2407,7 @@ mod reborn_support_tests {
         max_egress_bytes: Option<u64>,
     ) -> NetworkPolicy {
         NetworkPolicy {
+            deny_redirects: false,
             allowed_targets: vec![NetworkTargetPattern {
                 scheme: None,
                 host_pattern: host_pattern.to_string(),

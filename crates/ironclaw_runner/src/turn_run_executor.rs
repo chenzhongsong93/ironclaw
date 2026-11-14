@@ -110,7 +110,7 @@ fn unknown_failure_error() -> &'static TurnRunExecutorError {
 /// stripped of the heartbeat/cancel variants that are now owned by the scheduler.
 enum DriverInvocationError {
     DriverNotFound { reason: String },
-    HostCreationFailed { reason: String },
+    HostCreationFailed(crate::turn_runner::HostCreationFailure),
     RouteSnapshotPersistenceFailed(ironclaw_turns::TurnError),
     DriverError(AgentLoopDriverError),
 }
@@ -119,7 +119,7 @@ impl std::fmt::Display for DriverInvocationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DriverNotFound { reason } => write!(f, "driver not found: {reason}"),
-            Self::HostCreationFailed { reason } => write!(f, "host creation failed: {reason}"),
+            Self::HostCreationFailed(error) => write!(f, "host creation failed: {error}"),
             Self::RouteSnapshotPersistenceFailed(err) => {
                 write!(f, "route snapshot persistence failed: {err}")
             }
@@ -195,12 +195,30 @@ impl TurnRunExecutor for RebornTurnRunExecutor {
                     DriverInvocationError::DriverError(AgentLoopDriverError::Failed {
                         reason_kind,
                         detail,
+                    }) if reason_kind == crate::failure_categories::HOST_STAGE_UNAVAILABLE_CAPABILITY_CATEGORY => {
+                        let diagnostic = detail.as_deref().and_then(|code| {
+                            ironclaw_turns::run_profile::HostSafeDiagnostic::parse(&format!("diag:{code}"))
+                        });
+                        sanitized_failure(crate::failure_categories::HOST_STAGE_UNAVAILABLE_CAPABILITY_CATEGORY)
+                            .map(|failure| match diagnostic {
+                                Some(diagnostic) => failure.with_detail(diagnostic.detail_code()),
+                                None => failure,
+                            })
+                    }
+                    DriverInvocationError::DriverError(AgentLoopDriverError::Failed {
+                        reason_kind,
+                        detail,
                     }) => sanitized_driver_failure(reason_kind, detail.as_deref()),
                     DriverInvocationError::DriverNotFound { .. } => {
                         sanitized_failure("driver_not_found")
                     }
-                    DriverInvocationError::HostCreationFailed { .. } => {
-                        sanitized_failure("host_creation_failed")
+                    DriverInvocationError::HostCreationFailed(error) => {
+                        sanitized_failure("host_creation_failed").map(|failure| {
+                            match error.diagnostic() {
+                                Some(diagnostic) => failure.with_detail(diagnostic.detail_code()),
+                                None => failure,
+                            }
+                        })
                     }
                     DriverInvocationError::RouteSnapshotPersistenceFailed(_) => {
                         sanitized_failure("route_snapshot_persistence_failed")
@@ -259,20 +277,18 @@ impl RebornTurnRunExecutor {
         );
 
         let host_started_at = live_latency_started_at();
-        let host = match self.host_factory.create_host(claimed).await {
+        let host = match self
+            .host_factory
+            .create_host_with_diagnostics(claimed)
+            .await
+        {
             Ok(host) => {
                 trace_executor_latency_ok("create_loop_host", claimed, host_started_at);
                 host
             }
             Err(err) => {
                 trace_executor_latency_error("create_loop_host", claimed, host_started_at, &err);
-                // Use the error's full `Display` (`err.to_string()`) rather than a single
-                // field, so whatever context the host factory embedded in its message
-                // survives into `reason` (HostFactoryError is a flat message with no
-                // `source()` chain of its own).
-                return Err(DriverInvocationError::HostCreationFailed {
-                    reason: err.to_string(),
-                });
+                return Err(DriverInvocationError::HostCreationFailed(err));
             }
         };
         let route_snapshot_started_at = live_latency_started_at();
@@ -1853,6 +1869,142 @@ mod tests {
                 super::should_compact_trace(status),
                 "terminal {status:?} runs should be compressed"
             );
+        }
+    }
+
+    async fn actual_host_safe_diagnostic_failure(code: &str) -> ironclaw_turns::SanitizedFailure {
+        let error =
+            ironclaw_agent_loop::executor::AgentLoopExecutorError::HostUnavailableWithDiagnostics {
+                stage: ironclaw_agent_loop::executor::HostStage::Capability,
+                kind: ironclaw_turns::run_profile::AgentLoopHostErrorKind::Unavailable,
+                safe_summary: ironclaw_turns::run_profile::LoopSafeSummary::new(
+                    "SECRETsentinel summary",
+                )
+                .expect("existing safe summary grammar"),
+                reason_kind: None,
+                diagnostic_ref: Some(
+                    ironclaw_turns::LoopDiagnosticRef::new(format!("diag:host-safe.{code}"))
+                        .expect("existing diagnostic ref grammar"),
+                ),
+                detail: Some("SECRETsentinel raw detail".to_string()),
+            };
+        let mapped = crate::planned_driver::map_executor_error(error);
+        let executor = make_executor_with_failing_driver(mapped);
+        let transitions = Arc::new(RecordingTransitionPort::default());
+        let claimed = test_claimed_run();
+        let run_id = claimed.state.run_id;
+        let runner_id = claimed.runner_id;
+        let lease_token = claimed.lease_token;
+        let returned = executor
+            .execute_claimed_run(
+                claimed,
+                transitions.clone() as Arc<dyn TurnRunTransitionPort>,
+            )
+            .await
+            .expect_err("host capability failure must remain terminal");
+        assert_eq!(
+            returned.failure_category(),
+            "host_stage_unavailable_capability"
+        );
+        assert_eq!(
+            transitions.fail_run_call_count(),
+            0,
+            "executor does not impersonate scheduler"
+        );
+        transitions
+            .record_runner_failure(ironclaw_turns::runner::RecordRunnerFailureRequest {
+                run_id,
+                runner_id,
+                lease_token,
+                failure: returned.failure().clone(),
+            })
+            .await
+            .expect("existing transition records scheduler failure");
+        let requests = transitions
+            .fail_run_calls
+            .lock()
+            .expect("recorded request lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].run_id, run_id);
+        assert_eq!(requests[0].runner_id, runner_id);
+        assert_eq!(requests[0].lease_token, lease_token);
+        assert_eq!(requests[0].failure, *returned.failure());
+        requests[0].failure.clone()
+    }
+
+    #[tokio::test]
+    async fn host_safe_diagnostic_caller_preserves_only_canonical_code_and_public_projection_strips_it()
+     {
+        for code in [
+            "context-state.read-failed",
+            "context-record.read-failed",
+            "context-record.missing",
+            "context-match.mismatch",
+            "signing.failed",
+            "http.send-failed",
+            "response.too-large",
+            "response.invalid-json",
+            "response.unexpected-outcome",
+            "response.invalid-record",
+            "http.status-100",
+            "http.status-199",
+            "http.status-300",
+            "http.status-399",
+            "http.status-400",
+            "http.status-403",
+            "http.status-499",
+            "http.status-500",
+            "http.status-503",
+            "http.status-599",
+        ] {
+            let failure = actual_host_safe_diagnostic_failure(code).await;
+            assert_eq!(
+                failure.detail(),
+                Some(format!("host-safe.{code}").as_str()),
+                "real mapped/recorded failure lost {code}"
+            );
+            assert!(
+                !failure
+                    .detail()
+                    .unwrap_or_default()
+                    .contains("SECRETsentinel")
+            );
+            let public = failure.public_projection();
+            assert_eq!(public.category(), "host_stage_unavailable_capability");
+            assert_eq!(public.detail(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn host_safe_diagnostic_caller_rejects_secret_unknown_and_noncanonical_codes() {
+        for code in [
+            "unknown.missing",
+            "context-state.missing",
+            "context-record.mismatch",
+            "context-match.read-failed",
+            "signing.read-failed",
+            "response.missing",
+            "http.status-99",
+            "http.status-600",
+            "http.status-200",
+            "http.status-204",
+            "http.status-299",
+            "http.status-0403",
+            "http.status-403.0",
+            "http.status-403.extra",
+            "http.status-403-SECRETsentinel",
+            "context-match.mismatch.SECRETsentinel",
+            "Context-match.mismatch",
+            "context-match.MISMATCH",
+            "context-record.missing-extra",
+        ] {
+            let failure = actual_host_safe_diagnostic_failure(code).await;
+            assert_eq!(
+                failure.detail(),
+                None,
+                "invalid code must not reach failure detail: {code}"
+            );
+            assert_eq!(failure.public_projection().detail(), None);
         }
     }
 }

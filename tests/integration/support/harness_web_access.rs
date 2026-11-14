@@ -105,6 +105,7 @@ pub(super) fn web_access_first_party_trust_policy() -> HarnessResult<HostTrustPo
 /// re-declared here rather than imported.
 pub(super) fn exa_mcp_test_network_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: EXA_MCP_HOST.to_string(),

@@ -6,6 +6,7 @@ use super::{body_limit_kib, descriptor, mutation_policy, mutation_rate_limit};
 pub const WEBUI_V2_ROUTE_CANCEL_RUN: &str = "webui.v2.cancel_run";
 pub const WEBUI_V2_ROUTE_RESOLVE_GATE: &str = "webui.v2.resolve_gate";
 pub const WEBUI_V2_ROUTE_RETRY_RUN: &str = "webui.v2.retry_run";
+pub const WEBUI_V2_ROUTE_RECOVER_RUN: &str = "webui.v2.recover_run";
 
 pub const WEBUI_V2_PATTERN_CANCEL_RUN: &str =
     "/api/webchat/v2/threads/{thread_id}/runs/{run_id}/cancel";
@@ -13,6 +14,8 @@ pub const WEBUI_V2_PATTERN_RESOLVE_GATE: &str =
     "/api/webchat/v2/threads/{thread_id}/runs/{run_id}/gates/{gate_ref}/resolve";
 pub const WEBUI_V2_PATTERN_RETRY_RUN: &str =
     "/api/webchat/v2/threads/{thread_id}/runs/{run_id}/retry";
+pub const WEBUI_V2_PATTERN_RECOVER_RUN: &str =
+    "/api/webchat/v2/threads/{thread_id}/runs/{run_id}/recover";
 
 pub(super) fn cancel_run_descriptor() -> IngressRouteDescriptor {
     run_action_descriptor(WEBUI_V2_ROUTE_CANCEL_RUN, WEBUI_V2_PATTERN_CANCEL_RUN)
@@ -24,6 +27,10 @@ pub(super) fn resolve_gate_descriptor() -> IngressRouteDescriptor {
 
 pub(super) fn retry_run_descriptor() -> IngressRouteDescriptor {
     run_action_descriptor(WEBUI_V2_ROUTE_RETRY_RUN, WEBUI_V2_PATTERN_RETRY_RUN)
+}
+
+pub(super) fn recover_run_descriptor() -> IngressRouteDescriptor {
+    run_action_descriptor(WEBUI_V2_ROUTE_RECOVER_RUN, WEBUI_V2_PATTERN_RECOVER_RUN)
 }
 
 fn run_action_descriptor(route_id: &str, pattern: &str) -> IngressRouteDescriptor {

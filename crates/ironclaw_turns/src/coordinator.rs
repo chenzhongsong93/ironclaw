@@ -57,13 +57,17 @@ fn trace_coordinator_latency_error<E: ?Sized>(
 
 use crate::{
     AdmissionRejection, CancelRunRequest, CancelRunResponse, GetRunStateRequest,
-    InMemoryRunProfileResolver, ResumeTurnRequest, ResumeTurnResponse, RetryTurnRequest,
-    RetryTurnResponse, RunProfileResolver, SubmitChildRunRequest, SubmitTurnRequest,
+    InMemoryRunProfileResolver, RecoverTurnRequest, ResumeTurnRequest, ResumeTurnResponse,
+    RetryTurnRequest, RetryTurnResponse, RunProfileId, RunProfileVersion, RunProfileResolver,
+    SubmitChildRunRequest, SubmitTurnRequest,
     SubmitTurnResponse, TurnCapacityResource, TurnError, TurnRunId, TurnRunState, TurnScope,
     TurnSpawnTreeStateStore, TurnStateStore, TurnStatus,
     events::EventCursor,
     lifecycle::{LifecyclePublicationErrorPort, NoopLifecyclePublicationErrorPort},
 };
+
+mod product_profile;
+use product_profile::ProductProfileResolver;
 
 pub trait TurnAdmissionPolicy: Send + Sync {
     fn check_submit(&self, request: &SubmitTurnRequest) -> Result<(), AdmissionRejection>;
@@ -144,12 +148,37 @@ pub trait TurnCoordinator: Send + Sync {
         request: SubmitTurnRequest,
     ) -> Result<SubmitTurnResponse, TurnError>;
 
+    /// Submit a root after a host product service has authorized its exact driver
+    /// profile. Public message adapters must continue to use `submit_turn`.
+    async fn submit_product_profile_turn(
+        &self,
+        _request: SubmitTurnRequest,
+        _profile_id: RunProfileId,
+        _profile_version: RunProfileVersion,
+    ) -> Result<SubmitTurnResponse, TurnError> {
+        Err(TurnError::Unauthorized)
+    }
+
+    async fn product_profile_ready(&self, _profile: &RunProfileId, _version: RunProfileVersion) -> bool {
+        false
+    }
+
     async fn resume_turn(
         &self,
         request: ResumeTurnRequest,
     ) -> Result<ResumeTurnResponse, TurnError>;
 
     async fn retry_turn(&self, request: RetryTurnRequest) -> Result<RetryTurnResponse, TurnError>;
+
+    /// Re-drive one exact failed special-driver root without changing its run id.
+    async fn recover_turn(
+        &self,
+        request: RecoverTurnRequest,
+    ) -> Result<ResumeTurnResponse, TurnError> {
+        Err(TurnError::RunNotRetryable {
+            run_id: request.run_id,
+        })
+    }
 
     async fn cancel_run(&self, request: CancelRunRequest) -> Result<CancelRunResponse, TurnError>;
 
@@ -164,6 +193,16 @@ pub trait TurnSpawnTreePort: Send + Sync {
         &self,
         request: SubmitChildRunRequest,
     ) -> Result<SubmitTurnResponse, TurnError>;
+
+    /// Derive a child with the same protected profile as its durable parent.
+    async fn submit_product_profile_child(
+        &self,
+        _request: SubmitChildRunRequest,
+        _profile: RunProfileId,
+        _version: RunProfileVersion,
+    ) -> Result<SubmitTurnResponse, TurnError> {
+        Err(TurnError::Unauthorized)
+    }
 }
 
 pub struct DefaultTurnCoordinator<S: ?Sized> {
@@ -313,33 +352,14 @@ fn deferred_publication_error(
     }
 }
 
-#[async_trait]
-impl<S> TurnCoordinator for DefaultTurnCoordinator<S>
+impl<S> DefaultTurnCoordinator<S>
 where
-    S: TurnStateStore + ?Sized + 'static,
+    S: TurnStateStore + ?Sized,
 {
-    async fn prepare_turn(&self, scope: TurnScope) -> Result<TurnRunId, TurnError> {
-        let run_id = TurnRunId::new();
-        self.record_prepared_run_id(run_id, scope)?;
-        Ok(run_id)
-    }
-
-    async fn reserve_prepared_turn_id(
-        &self,
-        scope: TurnScope,
-        run_id: TurnRunId,
-    ) -> Result<(), TurnError> {
-        self.record_prepared_run_id(run_id, scope)
-    }
-
-    async fn abort_prepared_turn(&self, run_id: TurnRunId) -> Result<(), TurnError> {
-        self.consume_prepared_run_id(run_id);
-        Ok(())
-    }
-
-    async fn submit_turn(
+    async fn submit_bound_turn(
         &self,
         request: SubmitTurnRequest,
+        product_profile: Option<&ProductProfileResolver<'_>>,
     ) -> Result<SubmitTurnResponse, TurnError> {
         let started_at = live_latency_started_at();
         // If the caller passed a run id that came out of prepare_turn, verify
@@ -357,12 +377,25 @@ where
             return Err(TurnError::Unauthorized);
         }
         let scope = request.scope.clone();
+        let expected_product = product_profile.map(|profile| {
+            (
+                profile,
+                request.requested_run_id,
+                request.accepted_message_ref.clone(),
+                request.source_binding_ref.clone(),
+                request.reply_target_binding_ref.clone(),
+            )
+        });
+        let resolver: &dyn RunProfileResolver = match product_profile {
+            Some(profile) => profile,
+            None => self.run_profile_resolver.as_ref(),
+        };
         let response = match self
             .store
             .submit_turn(
                 request,
                 self.admission_policy.as_ref(),
-                self.run_profile_resolver.as_ref(),
+                resolver,
             )
             .await
         {
@@ -401,6 +434,27 @@ where
             resolved_run_profile_version = resolved_run_profile_version.as_u64(),
             "turn coordinator accepted turn with resolved run profile"
         );
+        if let Some((profile, expected_run, accepted_message, source, reply_target)) = expected_product {
+            let state = self.store.get_run_state(GetRunStateRequest {
+                scope: scope.clone(),
+                run_id: *run_id,
+            }).await?;
+            if expected_run != Some(*run_id)
+                || resolved_run_profile_id != &profile.id
+                || resolved_run_profile_version != &profile.version
+                || state.scope != scope
+                || state.run_id != *run_id
+                || state.resolved_run_profile_id != profile.id
+                || state.resolved_run_profile_version != profile.version
+                || state.accepted_message_ref != accepted_message
+                || state.source_binding_ref != source
+                || state.reply_target_binding_ref != reply_target
+            {
+                return Err(TurnError::Conflict {
+                    reason: "stored host product submission does not match the requested identity".into(),
+                });
+            }
+        }
         let wake_started_at = live_latency_started_at();
         notify_queued_run_best_effort(
             self.wake_notifier.as_ref(),
@@ -412,6 +466,87 @@ where
             submit_event_cursor(&response),
         )?;
         Ok(response)
+    }
+}
+
+#[async_trait]
+impl<S> TurnCoordinator for DefaultTurnCoordinator<S>
+where
+    S: TurnStateStore + ?Sized + 'static,
+{
+    async fn prepare_turn(&self, scope: TurnScope) -> Result<TurnRunId, TurnError> {
+        let run_id = TurnRunId::new();
+        self.record_prepared_run_id(run_id, scope)?;
+        Ok(run_id)
+    }
+
+    async fn reserve_prepared_turn_id(
+        &self,
+        scope: TurnScope,
+        run_id: TurnRunId,
+    ) -> Result<(), TurnError> {
+        self.record_prepared_run_id(run_id, scope)
+    }
+
+    async fn abort_prepared_turn(&self, run_id: TurnRunId) -> Result<(), TurnError> {
+        self.consume_prepared_run_id(run_id);
+        Ok(())
+    }
+
+    async fn submit_turn(
+        &self,
+        request: SubmitTurnRequest,
+    ) -> Result<SubmitTurnResponse, TurnError> {
+        self.submit_bound_turn(request, None).await
+    }
+
+    async fn submit_product_profile_turn(
+        &self,
+        request: SubmitTurnRequest,
+        profile_id: RunProfileId,
+        profile_version: RunProfileVersion,
+    ) -> Result<SubmitTurnResponse, TurnError> {
+        if request.requested_run_id.is_none()
+            || request.parent_run_id.is_some()
+            || request.subagent_depth != 0
+            || request.spawn_tree_root_run_id.is_some()
+            || request.requested_run_profile.as_ref().map(|profile| profile.as_str())
+                != Some(profile_id.as_str())
+        {
+            return Err(TurnError::InvalidRequest {
+                reason: "host product submission requires a root run and exact selected profile".into(),
+            });
+        }
+        let resolver = ProductProfileResolver {
+            inner: self.run_profile_resolver.as_ref(),
+            id: profile_id,
+            version: profile_version,
+        };
+        self.submit_bound_turn(request, Some(&resolver)).await
+    }
+
+    async fn product_profile_ready(&self, profile: &RunProfileId, version: RunProfileVersion) -> bool {
+        use crate::{
+            RunProfileRequest,
+            run_profile::{PrivilegedRunProfileDimension, RunProfileRequestAuthority, RunProfileResolutionRequest},
+        };
+        let Ok(requested) = RunProfileRequest::new(profile.as_str()) else {
+            return false;
+        };
+        ProductProfileResolver {
+            inner: self.run_profile_resolver.as_ref(),
+            id: profile.clone(),
+            version,
+        }
+        .resolve_run_profile(
+            RunProfileResolutionRequest::interactive_default()
+                .with_requested_run_profile(requested)
+                .with_authority(RunProfileRequestAuthority::ProductSurface),
+        )
+        .await
+        .is_ok_and(|resolved| {
+            resolved.provenance.effective_privileges.contains(&PrivilegedRunProfileDimension::SpecialDriver)
+        })
     }
 
     async fn resume_turn(
@@ -462,6 +597,20 @@ where
         notify_queued_run_best_effort(
             self.wake_notifier.as_ref(),
             retry_wake(scope.clone(), &response),
+        );
+        deferred_publication_error(self.publication_error_port.as_ref(), response.event_cursor)?;
+        Ok(response)
+    }
+
+    async fn recover_turn(
+        &self,
+        request: RecoverTurnRequest,
+    ) -> Result<ResumeTurnResponse, TurnError> {
+        let scope = request.scope.clone();
+        let response = self.store.recover_turn(request).await?;
+        notify_queued_run_best_effort(
+            self.wake_notifier.as_ref(),
+            resume_wake(scope.clone(), &response),
         );
         deferred_publication_error(self.publication_error_port.as_ref(), response.event_cursor)?;
         Ok(response)
@@ -522,23 +671,37 @@ where
     }
 }
 
-#[async_trait]
-impl<S> TurnSpawnTreePort for DefaultTurnCoordinator<S>
+impl<S> DefaultTurnCoordinator<S>
 where
-    S: TurnSpawnTreeStateStore + ?Sized + 'static,
+    S: TurnSpawnTreeStateStore + ?Sized,
 {
-    async fn submit_child_run(
+    async fn submit_child_with_resolver(
         &self,
         request: SubmitChildRunRequest,
+        product_profile: Option<&ProductProfileResolver<'_>>,
     ) -> Result<SubmitTurnResponse, TurnError> {
         let started_at = live_latency_started_at();
         let child_scope = request.child_scope.clone();
+        let expected = product_profile.map(|profile| {
+            (
+                profile,
+                request.requested_run_id,
+                request.actor.clone(),
+                request.accepted_message_ref.clone(),
+                request.source_binding_ref.clone(),
+                request.reply_target_binding_ref.clone(),
+            )
+        });
+        let resolver: &dyn RunProfileResolver = match product_profile {
+            Some(profile) => profile,
+            None => self.run_profile_resolver.as_ref(),
+        };
         let response = match self
             .store
             .submit_child_turn(
                 request,
                 self.admission_policy.as_ref(),
-                self.run_profile_resolver.as_ref(),
+                resolver,
             )
             .await
         {
@@ -564,6 +727,26 @@ where
             }
         };
         let SubmitTurnResponse::Accepted { run_id, .. } = &response;
+        if let Some((profile, expected_run, actor, accepted_message, source, reply_target)) = expected {
+            let state = self.store.get_run_state(GetRunStateRequest {
+                scope: child_scope.clone(),
+                run_id: *run_id,
+            }).await?;
+            if expected_run != Some(*run_id)
+                || state.scope != child_scope
+                || state.run_id != *run_id
+                || state.actor.as_ref() != Some(&actor)
+                || state.resolved_run_profile_id != profile.id
+                || state.resolved_run_profile_version != profile.version
+                || state.accepted_message_ref != accepted_message
+                || state.source_binding_ref != source
+                || state.reply_target_binding_ref != reply_target
+            {
+                return Err(TurnError::Conflict {
+                    reason: "stored protected child submission does not match the requested identity".into(),
+                });
+            }
+        }
         let wake_started_at = live_latency_started_at();
         notify_queued_run_best_effort(
             self.wake_notifier.as_ref(),
@@ -580,6 +763,55 @@ where
             submit_event_cursor(&response),
         )?;
         Ok(response)
+    }
+}
+
+#[async_trait]
+impl<S> TurnSpawnTreePort for DefaultTurnCoordinator<S>
+where
+    S: TurnSpawnTreeStateStore + ?Sized + 'static,
+{
+    async fn submit_child_run(
+        &self,
+        request: SubmitChildRunRequest,
+    ) -> Result<SubmitTurnResponse, TurnError> {
+        self.submit_child_with_resolver(request, None).await
+    }
+
+    async fn submit_product_profile_child(
+        &self,
+        mut request: SubmitChildRunRequest,
+        profile: RunProfileId,
+        version: RunProfileVersion,
+    ) -> Result<SubmitTurnResponse, TurnError> {
+        if request.requested_run_id.is_none()
+            || request.requested_run_profile.as_ref().map(|hint| hint.as_str()) != Some(profile.as_str())
+            || request.parent_scope.explicit_owner_user_id() != Some(&request.actor.user_id)
+            || request.child_scope.explicit_owner_user_id() != Some(&request.actor.user_id)
+            || !self.product_profile_ready(&profile, version).await
+        {
+            return Err(TurnError::Unauthorized);
+        }
+        let parent = self.store.get_run_state(GetRunStateRequest {
+            scope: request.parent_scope.clone(),
+            run_id: request.parent_run_id,
+        }).await?;
+        if parent.status != TurnStatus::Running
+            || parent.scope != request.parent_scope
+            || parent.run_id != request.parent_run_id
+            || parent.actor.as_ref() != Some(&request.actor)
+            || parent.resolved_run_profile_id != profile
+            || parent.resolved_run_profile_version != version
+        {
+            return Err(TurnError::Unauthorized);
+        }
+        request.spawn_tree_descendant_cap = request.spawn_tree_descendant_cap.min(1);
+        let resolver = ProductProfileResolver {
+            inner: self.run_profile_resolver.as_ref(),
+            id: profile,
+            version,
+        };
+        self.submit_child_with_resolver(request, Some(&resolver)).await
     }
 }
 
@@ -611,6 +843,21 @@ where
         self.as_ref().submit_turn(request).await
     }
 
+    async fn submit_product_profile_turn(
+        &self,
+        request: SubmitTurnRequest,
+        profile_id: RunProfileId,
+        profile_version: RunProfileVersion,
+    ) -> Result<SubmitTurnResponse, TurnError> {
+        self.as_ref()
+            .submit_product_profile_turn(request, profile_id, profile_version)
+            .await
+    }
+
+    async fn product_profile_ready(&self, profile: &RunProfileId, version: RunProfileVersion) -> bool {
+        self.as_ref().product_profile_ready(profile, version).await
+    }
+
     async fn resume_turn(
         &self,
         request: ResumeTurnRequest,
@@ -620,6 +867,13 @@ where
 
     async fn retry_turn(&self, request: RetryTurnRequest) -> Result<RetryTurnResponse, TurnError> {
         self.as_ref().retry_turn(request).await
+    }
+
+    async fn recover_turn(
+        &self,
+        request: RecoverTurnRequest,
+    ) -> Result<ResumeTurnResponse, TurnError> {
+        self.as_ref().recover_turn(request).await
     }
 
     async fn cancel_run(&self, request: CancelRunRequest) -> Result<CancelRunResponse, TurnError> {
@@ -642,4 +896,14 @@ where
     ) -> Result<SubmitTurnResponse, TurnError> {
         self.as_ref().submit_child_run(request).await
     }
+    async fn submit_product_profile_child(
+        &self,
+        request: SubmitChildRunRequest,
+        profile: RunProfileId,
+        version: RunProfileVersion,
+    ) -> Result<SubmitTurnResponse, TurnError> {
+        self.as_ref().submit_product_profile_child(request, profile, version).await
+    }
+
 }
+

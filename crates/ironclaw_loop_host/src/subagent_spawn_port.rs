@@ -334,6 +334,14 @@ pub trait SubagentDefinitionResolver: Send + Sync {
         kind: &SubagentKindId,
     ) -> Result<Option<SubagentDefinition>, AgentLoopHostError>;
 
+    async fn resolve_kind_for_run(
+        &self,
+        kind: &SubagentKindId,
+        _parent: &LoopRunContext,
+    ) -> Result<Option<SubagentDefinition>, AgentLoopHostError> {
+        self.resolve_kind(kind).await
+    }
+
     async fn definition_of_run(
         &self,
         _run_id: TurnRunId,
@@ -403,6 +411,7 @@ pub struct SubagentSpawnCapabilityPort {
     /// input_ref payload 含 run_id(capability_port.rs:3193),天然按 run 隔离,共享 map 不会混。
     spawn_authorizations: Arc<Mutex<HashMap<CapabilityInputRef, CapabilityActivityId>>>,
     spawned_this_turn: Arc<AtomicU32>,
+    opaque_input_port: Option<Arc<dyn crate::SubagentOpaqueInputPort>>,
 }
 
 struct SpawnContext {
@@ -649,7 +658,13 @@ impl SubagentSpawnCapabilityPort {
             parameters_schema,
             spawn_authorizations,
             spawned_this_turn,
+            opaque_input_port: None,
         }
+    }
+
+    pub fn with_opaque_input_port(mut self, port: Arc<dyn crate::SubagentOpaqueInputPort>) -> Self {
+        self.opaque_input_port = Some(port);
+        self
     }
 
     fn is_spawn(&self, capability_id: &CapabilityId) -> bool {
@@ -926,7 +941,7 @@ impl SubagentSpawnCapabilityPort {
         let resolved = self
             .deps
             .definition_resolver
-            .resolve_kind(&args.subagent_kind)
+            .resolve_kind_for_run(&args.subagent_kind, &self.run_context)
             .await?;
         let Some(definition) = resolved else {
             return Ok(spawn_rejected("unknown_subagent_kind"));
@@ -1127,6 +1142,17 @@ impl SubagentSpawnCapabilityPort {
             subagent_kind: definition.subagent_kind.clone(),
             mode,
         });
+        if let Some(port) = &self.opaque_input_port {
+            // 原child ID已分配；绑定在submit前完成。不从模型task/handoff读取issuer。
+            // adapter必须拥有已派发原transport，cancel/期限不能丢原记录；缺料/未知不得降级None。
+            port.bind_before_submit(crate::HostSpawnInputFacts {
+                parent_context: &self.run_context,
+                child_run_id,
+                child_thread_id: &child_thread_id,
+                registered_kind: definition.subagent_kind.as_str(),
+            })
+            .await?;
+        }
         let child_thread = self
             .deps
             .thread_service
@@ -1187,6 +1213,9 @@ impl SubagentSpawnCapabilityPort {
             .await?;
         compensation.edge_written = Some((child_turn_scope.clone(), child_run_id));
 
+        let source_binding_ref = source_binding_ref(self.run_context.run_id, child_run_id)?;
+        let reply_target_binding_ref =
+            reply_target_binding_ref(self.run_context.run_id, child_run_id)?;
         let accepted = self
             .deps
             .thread_service
@@ -1194,8 +1223,8 @@ impl SubagentSpawnCapabilityPort {
                 scope: child_scope.clone(),
                 thread_id: child_thread.thread_id.clone(),
                 actor_id: actor.user_id.as_str().to_string(),
-                source_binding_id: Some(format!("subagent-source:{child_run_id}")),
-                reply_target_binding_id: Some(format!("subagent-reply:{child_run_id}")),
+                source_binding_id: Some(source_binding_ref.as_str().to_string()),
+                reply_target_binding_id: Some(reply_target_binding_ref.as_str().to_string()),
                 external_event_id: Some(format!("subagent-spawn:{child_run_id}")),
                 content: MessageContent::text(sanitize_model_visible_text(child_initial_message(
                     &args,
@@ -1204,44 +1233,58 @@ impl SubagentSpawnCapabilityPort {
             .await
             .map_err(map_thread_error)?;
         let accepted_message_ref = accepted_message_ref(accepted.message_id)?;
-        let source_binding_ref = source_binding_ref(self.run_context.run_id, child_run_id)?;
-        let reply_target_binding_ref =
-            reply_target_binding_ref(self.run_context.run_id, child_run_id)?;
         let idempotency_key = idempotency_key(self.run_context.run_id, child_run_id)?;
 
-        let SubmitTurnResponse::Accepted {
-            turn_id, run_id, ..
-        } = self
-            .deps
-            .child_runs
-            .submit_child_run(SubmitChildRunRequest {
-                parent_scope: self.run_context.scope.clone(),
-                parent_run_id: self.run_context.run_id,
-                child_scope: child_turn_scope.clone(),
-                actor: actor.clone(),
-                accepted_message_ref,
-                source_binding_ref,
-                reply_target_binding_ref,
-                requested_run_profile: Some(definition.requested_run_profile),
-                idempotency_key,
-                received_at: Utc::now(),
-                requested_run_id: Some(child_run_id),
-                spawn_tree_descendant_cap: self.limits.max_tree_descendants,
-            })
-            .await
-            .map_err(map_turn_error)?;
-        compensation.submitted_child_tree = Some((self.run_context.scope.clone(), tree_root));
-        compensation.submitted_child_run = Some((child_turn_scope.clone(), actor.clone(), run_id));
+        let parent_profile = &self.run_context.resolved_run_profile;
+        let inherit_protected_profile = definition.requested_run_profile.as_str()
+            == parent_profile.profile_id.as_str()
+            && parent_profile.provenance.effective_privileges.contains(
+                &ironclaw_turns::run_profile::PrivilegedRunProfileDimension::SpecialDriver,
+            );
+        let request = SubmitChildRunRequest {
+            parent_scope: self.run_context.scope.clone(),
+            parent_run_id: self.run_context.run_id,
+            child_scope: child_turn_scope.clone(),
+            actor: actor.clone(),
+            accepted_message_ref,
+            source_binding_ref,
+            reply_target_binding_ref,
+            requested_run_profile: Some(definition.requested_run_profile),
+            idempotency_key,
+            received_at: Utc::now(),
+            requested_run_id: Some(child_run_id),
+            spawn_tree_descendant_cap: self.limits.max_tree_descendants,
+        };
+        // The provenance row must exist before the child runtime can invoke
+        // the reviewer capability, otherwise the child observes NotActive.
         self.deps
             .await_edge_writer
             .record_child_submitted(
                 &child_turn_scope,
                 self.run_context.run_id,
-                run_id,
+                child_run_id,
                 &definition.subagent_kind,
                 Utc::now(),
             )
             .await;
+
+        let response = if inherit_protected_profile {
+            self.deps
+                .child_runs
+                .submit_product_profile_child(
+                    request,
+                    parent_profile.profile_id.clone(),
+                    parent_profile.profile_version,
+                )
+                .await
+        } else {
+            self.deps.child_runs.submit_child_run(request).await
+        };
+        let SubmitTurnResponse::Accepted {
+            turn_id, run_id, ..
+        } = response.map_err(map_turn_error)?;
+        compensation.submitted_child_tree = Some((self.run_context.scope.clone(), tree_root));
+        compensation.submitted_child_run = Some((child_turn_scope.clone(), actor.clone(), run_id));
         if let Err(error) = self
             .deps
             .thread_service

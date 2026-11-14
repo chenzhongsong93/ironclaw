@@ -10,6 +10,7 @@ use ironclaw_network::{
 async fn network_policy_allows_exact_scoped_target_without_executing_io() {
     let scope = sample_scope("tenant-a", "user-a");
     let policy = NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![pattern(
             Some(NetworkScheme::Https),
             "api.example.test",
@@ -39,6 +40,7 @@ async fn network_policy_allows_exact_scoped_target_without_executing_io() {
 #[tokio::test]
 async fn network_policy_supports_one_label_wildcard_hosts_only() {
     let enforcer = StaticNetworkPolicyEnforcer::new(NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![pattern(Some(NetworkScheme::Https), "*.example.test", None)],
         deny_private_ip_ranges: true,
         max_egress_bytes: Some(1024),
@@ -94,6 +96,7 @@ fn network_target_matching_supports_one_label_wildcard_hosts_only() {
 #[tokio::test]
 async fn network_policy_supports_any_host_wildcard_with_private_ip_guard() {
     let enforcer = StaticNetworkPolicyEnforcer::new(NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![pattern(None, "*", None)],
         deny_private_ip_ranges: true,
         max_egress_bytes: Some(1024),
@@ -148,6 +151,7 @@ fn network_target_for_url_normalizes_default_ports() {
 #[tokio::test]
 async fn network_policy_denies_scheme_host_port_and_egress_mismatches() {
     let enforcer = StaticNetworkPolicyEnforcer::new(NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![pattern(
             Some(NetworkScheme::Https),
             "api.example.test",
@@ -207,6 +211,7 @@ async fn network_policy_denies_scheme_host_port_and_egress_mismatches() {
 async fn network_policy_denies_non_public_literal_ips_allowed_by_host_contract() {
     for host in ["100.64.0.1", "2001:db8::1"] {
         let enforcer = StaticNetworkPolicyEnforcer::new(NetworkPolicy {
+            deny_redirects: false,
             allowed_targets: vec![pattern(Some(NetworkScheme::Http), host, None)],
             deny_private_ip_ranges: true,
             max_egress_bytes: Some(1024),
@@ -232,6 +237,7 @@ async fn network_policy_denies_non_public_literal_ips_allowed_by_host_contract()
 async fn network_policy_denies_ipv4_mapped_private_ipv6_literals() {
     for host in ["::ffff:127.0.0.1", "::ffff:10.0.0.1"] {
         let enforcer = StaticNetworkPolicyEnforcer::new(NetworkPolicy {
+            deny_redirects: false,
             allowed_targets: vec![pattern(Some(NetworkScheme::Http), host, None)],
             deny_private_ip_ranges: true,
             max_egress_bytes: Some(1024),
@@ -253,6 +259,7 @@ async fn network_policy_denies_ipv4_mapped_private_ipv6_literals() {
 
     let public_mapped_host = "::ffff:8.8.8.8";
     let enforcer = StaticNetworkPolicyEnforcer::new(NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![pattern(Some(NetworkScheme::Http), public_mapped_host, None)],
         deny_private_ip_ranges: true,
         max_egress_bytes: Some(1024),
@@ -271,6 +278,7 @@ async fn network_policy_denies_ipv4_mapped_private_ipv6_literals() {
 #[tokio::test]
 async fn network_policy_requires_egress_estimate_when_limit_is_configured() {
     let enforcer = StaticNetworkPolicyEnforcer::new(NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![pattern(
             Some(NetworkScheme::Https),
             "api.example.test",

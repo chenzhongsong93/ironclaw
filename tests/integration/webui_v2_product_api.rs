@@ -17,13 +17,13 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::StatusCode;
-use axum::http::{Method, Request};
+use axum::http::{HeaderMap, HeaderValue, Method, Request};
 use chrono::{DateTime, Utc};
 use ironclaw_events::InMemoryDurableEventLog;
 use ironclaw_extensions::ExtensionInstallationStore;
 use ironclaw_filesystem::{CompositeRootFilesystem, LibSqlRootFilesystem};
 use ironclaw_host_api::{
-    AgentId, CapabilityId, EffectKind, ExtensionId, PermissionMode, TenantId, UserId,
+    AgentId, CapabilityId, EffectKind, ExtensionId, PermissionMode, ProjectId, TenantId, UserId,
 };
 use ironclaw_product_adapters::ProductOutboundPayload;
 use ironclaw_product_workflow::{
@@ -32,19 +32,22 @@ use ironclaw_product_workflow::{
 };
 use ironclaw_reborn_composition::test_support::BudgetTestGateway;
 use ironclaw_reborn_composition::{
-    RebornBuildInput, RebornRuntimeIdentity, RebornRuntimeInput, build_reborn_runtime,
-    build_webui_services, local_dev_runtime_policy,
+    RebornBuildInput, RebornReadiness, RebornRuntimeIdentity, RebornRuntimeInput,
+    RebornWebuiBundle, build_reborn_runtime, build_webui_services, local_dev_runtime_policy,
 };
-use ironclaw_turns::{ReplyTargetBindingRef, TurnEventProjectionSource, TurnStatus};
-use ironclaw_webui::webui_v2::{
-    DEFAULT_SSE_MAX_CONCURRENT_PER_CALLER, WebUiV2Capabilities, WebUiV2State, webui_v2_router,
+use ironclaw_turns::{ReplyTargetBindingRef, TurnEventProjectionSource, TurnRunId, TurnStatus};
+use ironclaw_webui::{
+    WebuiAuthentication, WebuiAuthenticator, WebuiServeConfig, webui_v2_app,
+    webui_v2::{
+        DEFAULT_SSE_MAX_CONCURRENT_PER_CALLER, WebUiV2Capabilities, WebUiV2State, webui_v2_router,
+    },
 };
 use reborn_support::builder::{RebornIntegrationHarness, StorageMode};
 use reborn_support::group::RebornIntegrationGroup;
 use reborn_support::reply::RebornScriptedReply;
 use reborn_support::session_thread::RebornThreadHarness;
 use reborn_support::webui_mount::{get_json, mount_webui_v2_router, post_json, webui_caller_for};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::tempdir;
 use tower::ServiceExt;
 
@@ -166,6 +169,301 @@ async fn thread_history_cold_get_after_in_memory_reopen() {
     );
 }
 
+const PROJECT_SCOPE_OWNER_TOKEN: &str = "project-scope-owner-token";
+const PROJECT_SCOPE_FOREIGN_OWNER_TOKEN: &str = "project-scope-foreign-owner-token";
+
+struct ProjectScopeTokenAuthenticator {
+    owner_user: UserId,
+    foreign_owner_user: UserId,
+}
+
+#[async_trait::async_trait]
+impl WebuiAuthenticator for ProjectScopeTokenAuthenticator {
+    async fn authenticate(&self, token: &str) -> Option<WebuiAuthentication> {
+        match token {
+            PROJECT_SCOPE_OWNER_TOKEN => {
+                Some(WebuiAuthentication::operator(self.owner_user.clone()))
+            }
+            PROJECT_SCOPE_FOREIGN_OWNER_TOKEN => {
+                Some(WebuiAuthentication::operator(self.foreign_owner_user.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    fn mounts_operator_webui_config_routes(&self) -> bool {
+        true
+    }
+}
+
+fn project_scoped_webui_app(
+    services: Arc<dyn RebornServicesApi>,
+    authenticator: Arc<ProjectScopeTokenAuthenticator>,
+    tenant_id: &TenantId,
+    agent_id: &AgentId,
+    project_id: Option<&ProjectId>,
+) -> Router {
+    let mut config = WebuiServeConfig::new(
+        tenant_id.clone(),
+        authenticator,
+        vec![HeaderValue::from_static("http://localhost:3000")],
+    )
+        .with_default_agent_id(agent_id.clone());
+    if let Some(project_id) = project_id {
+        config = config.with_default_project_id(project_id.clone());
+    }
+    webui_v2_app(
+        RebornWebuiBundle {
+            api: services,
+            product_auth: None,
+            readiness: RebornReadiness::disabled(),
+        },
+        config,
+    )
+    .expect("webui v2 app")
+}
+
+async fn authenticated_v2_raw(
+    app: Router,
+    method: Method,
+    path: &str,
+    bearer_token: &str,
+    body: Option<Value>,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("authorization", format!("Bearer {bearer_token}"));
+    if body.is_some() {
+        builder = builder.header("content-type", "application/json");
+    }
+    let request = builder
+        .body(body.map_or_else(Body::empty, |value| Body::from(value.to_string())))
+        .expect("request");
+    let response = app.oneshot(request).await.expect("oneshot");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    (status, headers, bytes.to_vec())
+}
+
+async fn authenticated_v2_json(
+    app: Router,
+    method: Method,
+    path: &str,
+    bearer_token: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let (status, _headers, bytes) =
+        authenticated_v2_raw(app, method, path, bearer_token, body).await;
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).expect("json response")
+    };
+    (status, value)
+}
+
+/// C-S09: the real composed WebUI ceiling (bearer auth, host-owned agent/project
+/// scope, WebUI v2 router), the real RebornServices ownership facade, and the
+/// real turn coordinator must agree before a parked run can be cancelled.
+#[tokio::test]
+async fn project_scoped_cancel_from_http_reaches_real_coordinator_without_widening_owner() {
+    let gate = reborn_support::scripted_provider::ParkingModelGate::new();
+    let h = RebornIntegrationHarness::test_default()
+        .park_model(gate.clone())
+        .script([RebornScriptedReply::text("cancelled run must not finalize")])
+        .build()
+        .await
+        .expect("harness builds");
+
+    let run_id = h
+        .submit_turn_async("hold this run for project-scoped cancellation")
+        .await
+        .expect("turn submitted");
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate.wait_until_parked())
+        .await
+        .expect("model call parks before timeout");
+
+    let tenant_id = h.binding.tenant_id.clone();
+    let agent_id = h.binding.agent_id.clone().expect("harness agent binding");
+    let project_id = h.binding.project_id.clone().expect("harness project binding");
+    let owner_user = h
+        .binding
+        .subject_user_id
+        .clone()
+        .unwrap_or_else(|| h.binding.actor_user_id.clone());
+    let foreign_owner_user = UserId::new("user-foreign-owner").expect("foreign owner");
+    let foreign_project = ProjectId::new("project-foreign-scope").expect("foreign project");
+    let authenticator = Arc::new(ProjectScopeTokenAuthenticator {
+        owner_user,
+        foreign_owner_user,
+    });
+    let services: Arc<dyn RebornServicesApi> = Arc::new(RebornServices::new(
+        h.thread_harness.service.clone(),
+        h.coordinator.clone(),
+    ));
+    let owner_app = project_scoped_webui_app(
+        services.clone(),
+        authenticator.clone(),
+        &tenant_id,
+        &agent_id,
+        Some(&project_id),
+    );
+    let wrong_project_app = project_scoped_webui_app(
+        services.clone(),
+        authenticator.clone(),
+        &tenant_id,
+        &agent_id,
+        Some(&foreign_project),
+    );
+    let unscoped_app = project_scoped_webui_app(
+        services.clone(),
+        authenticator.clone(),
+        &tenant_id,
+        &agent_id,
+        None,
+    );
+    let foreign_owner_app = project_scoped_webui_app(
+        services,
+        authenticator,
+        &tenant_id,
+        &agent_id,
+        Some(&project_id),
+    );
+    let run_state_path = format!(
+        "/api/webchat/v2/threads/{}/runs/{}",
+        h.binding.thread_id.as_str(),
+        run_id
+    );
+    let cancel_path = format!("{run_state_path}/cancel");
+    let cancel_action_id = TurnRunId::new().to_string();
+    let cancel_body = json!({
+        "client_action_id": cancel_action_id,
+        "reason": "user_requested"
+    });
+
+    let (status, body) = authenticated_v2_json(
+        owner_app.clone(),
+        Method::GET,
+        &run_state_path,
+        PROJECT_SCOPE_OWNER_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "owner GET body: {body}");
+    assert_eq!(body["status"], "Running");
+
+    let missing_cancel_path = format!(
+        "/api/webchat/v2/threads/{}/runs/{}/cancel",
+        h.binding.thread_id.as_str(),
+        TurnRunId::new()
+    );
+    let (probe_status, probe_headers, probe_bytes) = authenticated_v2_raw(
+        owner_app.clone(),
+        Method::POST,
+        &missing_cancel_path,
+        PROJECT_SCOPE_OWNER_TOKEN,
+        Some(cancel_body.clone()),
+    )
+    .await;
+    let probe_body = if probe_bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&probe_bytes).expect("json response")
+    };
+    assert_eq!(
+        probe_status,
+        StatusCode::NOT_FOUND,
+        "owner cancel route probe body: {probe_body}; headers={probe_headers:?}; path={missing_cancel_path}"
+    );
+
+    let denied_cases = [
+        (
+            wrong_project_app.clone(),
+            PROJECT_SCOPE_OWNER_TOKEN,
+            "wrong project",
+        ),
+        (
+            unscoped_app.clone(),
+            PROJECT_SCOPE_OWNER_TOKEN,
+            "missing project",
+        ),
+        (
+            foreign_owner_app.clone(),
+            PROJECT_SCOPE_FOREIGN_OWNER_TOKEN,
+            "foreign owner",
+        ),
+    ];
+    for (app, token, label) in denied_cases {
+        let (status, headers, bytes) = authenticated_v2_raw(
+            app.clone(),
+            Method::POST,
+            &cancel_path,
+            token,
+            Some(cancel_body.clone()),
+        )
+        .await;
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).expect("json response")
+        };
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{label} cancel body: {body}; headers={headers:?}"
+        );
+        let (status, body) = authenticated_v2_json(app, Method::GET, &run_state_path, token, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{label} GET body: {body}");
+    }
+
+    let (status, body) = authenticated_v2_json(
+        owner_app.clone(),
+        Method::GET,
+        &run_state_path,
+        PROJECT_SCOPE_OWNER_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "post-denial owner GET body: {body}");
+    assert_eq!(body["status"], "Running");
+
+    let (status, body) = authenticated_v2_json(
+        owner_app.clone(),
+        Method::POST,
+        &cancel_path,
+        PROJECT_SCOPE_OWNER_TOKEN,
+        Some(cancel_body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "owner cancel body: {body}");
+    assert!(
+        matches!(
+            body["status"].as_str(),
+            Some("CancelRequested") | Some("Cancelled")
+        ),
+        "owner cancel body: {body}"
+    );
+
+    gate.release();
+    h.wait_for_status(run_id, TurnStatus::Cancelled)
+        .await
+        .expect("parked run reaches Cancelled after release");
+
+    let (status, body) = authenticated_v2_json(
+        owner_app,
+        Method::GET,
+        &run_state_path,
+        PROJECT_SCOPE_OWNER_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "final owner GET body: {body}");
+    assert_eq!(body["status"], "Cancelled");
+}
 /// Hand-rolled double: single read-only method, no logic worth exercising
 /// via a production impl (no enabler needed).
 struct TestOperatorToolCatalog;

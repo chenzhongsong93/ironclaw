@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use ironclaw_extensions::{
     ExtensionPackage, ExtensionRegistry, ExtensionRuntime, SharedExtensionRegistry,
-    package_with_discovered_hosted_mcp_tools,
+    package_with_discovered_hosted_mcp_tools, package_with_discovered_loopback_http_mcp_tools,
+    is_host_bundled_loopback_http_mcp_package,
 };
 use ironclaw_host_api::{ResourceScope, RuntimeHttpEgress};
 use ironclaw_mcp::{McpClient, McpClientRequest, McpHostHttpClient, McpRuntimeHttpAdapter};
@@ -20,13 +21,41 @@ pub(crate) async fn discover_hosted_mcp_package(
     scope: ResourceScope,
     runtime_http_egress: Arc<dyn RuntimeHttpEgress>,
 ) -> Result<ExtensionPackage, HostedMcpDiscoveryError> {
+    discover_hosted_mcp_package_with_admission(package,scope,runtime_http_egress,None).await
+}
+
+pub(crate) fn root_loopback_package_declared(package: &ExtensionPackage) -> bool {
+    match &package.manifest.runtime {
+        ExtensionRuntime::Mcp { url: Some(url), .. } => is_host_bundled_loopback_http_mcp_package(package, url),
+        _ => false,
+    }
+}
+
+pub(crate) fn root_loopback_package_admitted(
+    package: &ExtensionPackage,
+    tenant: Option<&ironclaw_host_api::TenantId>,
+    store: Option<&crate::operator_late_admission::OperatorLateAdmissionStore>,
+) -> bool {
+    let Some(store) = store else { return false; };
+    let Some((binding, signer)) = store.discovery(&package.id) else { return false; };
+    tenant.is_none_or(|tenant| binding.tenant() == tenant)
+        && store.old_binding_valid(&binding)
+        && signer.is_configured() && signer.provider_id() == binding.provider()
+        && signer.audience() == Some(binding.audience())
+        && is_host_bundled_loopback_http_mcp_package(package, binding.audience())
+        && binding.endpoint_for(package, binding.audience()).is_some()
+}
+
+pub(crate) async fn discover_hosted_mcp_package_with_admission(package:&ExtensionPackage,scope:ResourceScope,runtime_http_egress:Arc<dyn RuntimeHttpEgress>,store:Option<Arc<crate::operator_late_admission::OperatorLateAdmissionStore>>)->Result<ExtensionPackage,HostedMcpDiscoveryError> {
+    let tenant = scope.tenant_id.clone();
+    let root_loopback = root_loopback_package_admitted(package, Some(&tenant), store.as_deref());
     let (transport, command, args, url) = match &package.manifest.runtime {
         ExtensionRuntime::Mcp {
             transport,
             command,
             args,
             url,
-        } if is_hosted_http_mcp_package(package) => (
+        } if is_hosted_http_mcp_package(package) || root_loopback => (
             transport.clone(),
             command.clone(),
             args.clone(),
@@ -56,10 +85,16 @@ pub(crate) async fn discover_hosted_mcp_package(
                 package.id
             ))
         })?;
-    let client = McpHostHttpClient::new(
-        McpRuntimeHttpAdapter::new(runtime_http_egress),
-        RegistryMcpEgressPlanner::new(registry),
-    );
+    let mut planner=RegistryMcpEgressPlanner::new(registry);
+    let mut discovery_url = url.clone();
+    let actual_signer=if let Some(store)=store.clone() {
+        let (binding,signer)=store.discovery(&package.id).ok_or_else(||HostedMcpDiscoveryError::Permanent("sameRuntimeDiscoveryAdmissionMissing".into()))?;
+        if binding.tenant()!=&scope.tenant_id||binding.endpoint_for(package,url.as_deref().unwrap_or("")).is_none(){return Err(HostedMcpDiscoveryError::Permanent("sameRuntimeDiscoveryPackageMismatch".into()));}
+        discovery_url = Some(planner.for_root_discovery(binding,store).ok_or_else(||HostedMcpDiscoveryError::Permanent("sameRuntimeDiscoveryCatalogUrlRejected".into()))?);
+        Some(signer)
+    }else{None};
+    let client=McpHostHttpClient::new(McpRuntimeHttpAdapter::new(runtime_http_egress),planner);
+    let client=if let Some(signer)=actual_signer{client.with_trusted_context_signer(signer)}else{client};
     let output = client
         .discover_tools(McpClientRequest {
             provider: package.id.clone(),
@@ -68,7 +103,7 @@ pub(crate) async fn discover_hosted_mcp_package(
             transport,
             command,
             args,
-            url,
+            url: discovery_url,
             input: serde_json::Value::Null,
             max_output_bytes: MCP_RESPONSE_BODY_LIMIT,
             trusted_context: None,
@@ -81,8 +116,16 @@ pub(crate) async fn discover_hosted_mcp_package(
             package.id
         )));
     }
-    package_with_discovered_hosted_mcp_tools(package, &output.tools)
-        .map_err(|error| HostedMcpDiscoveryError::Permanent(error.to_string()))
+    if root_loopback {
+        if !root_loopback_package_admitted(package, Some(&tenant), store.as_deref()) {
+            return Err(HostedMcpDiscoveryError::Permanent("sameRuntimeLoopbackDiscoveryBindingChanged".into()));
+        }
+        package_with_discovered_loopback_http_mcp_tools(package, &output.tools, url.as_deref().unwrap_or(""))
+            .map_err(|error| HostedMcpDiscoveryError::Permanent(error.to_string()))
+    } else {
+        package_with_discovered_hosted_mcp_tools(package, &output.tools)
+            .map_err(|error| HostedMcpDiscoveryError::Permanent(error.to_string()))
+    }
 }
 
 pub(crate) use ironclaw_extensions::is_hosted_http_mcp_package;

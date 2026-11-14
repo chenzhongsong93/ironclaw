@@ -738,6 +738,42 @@ impl RootFilesystem for PostgresRootFilesystem {
         self.tail_bounded(path, from, usize::MAX).await
     }
 
+    async fn complete_event_prefix(&self, path: &VirtualPath, max_records: usize, max_bytes: usize, max_record_bytes: usize)
+        -> Result<Option<crate::CompleteEventPrefix>, FilesystemError>
+    {
+        if max_records==0 || max_records>100_000 || max_bytes>64*1024*1024 || max_record_bytes>8*1024*1024 {
+            return Err(backend_error(path.clone(),FilesystemOperation::Tail,"invalid complete-prefix budget"));
+        }
+        let client=self.client().await?;
+        let record_cap=max_records as i64; let byte_cap=max_bytes as i64;let row_cap=max_record_bytes as i64;
+        let rows=cached_query(&client, COMPLETE_EVENT_PREFIX_SQL, &[&path.as_str(),&record_cap,&byte_cap,&row_cap]).await
+            .map_err(|e|db_error(path.clone(),FilesystemOperation::Tail,e))?;
+        let stats=rows.first().ok_or_else(||backend_error(path.clone(),FilesystemOperation::Tail,"missing prefix stats"))?;
+        let count:i64=stats.get("n");let bytes:i64=stats.get("bytes");let largest:i64=stats.get("largest");
+        if count==0 {return Ok(None);}
+        if count<0 || bytes<0 || count>record_cap || bytes>byte_cap || largest>row_cap {
+            return Err(backend_error(path.clone(),FilesystemOperation::Tail,"complete-prefix budget exceeded"));
+        }
+        let head:i64=stats.get("h");
+        let records=rows.into_iter().map(|r|{
+            let raw:i64=r.get("seq");let payload:Vec<u8>=r.get("payload");
+            Ok(EventRecord {seq:seq_no_from_i64(path,raw,FilesystemOperation::Tail)?,payload})
+        }).collect::<Result<Vec<_>,FilesystemError>>()?;
+        crate::CompleteEventPrefix::from_atomic_rows(path,count as usize,bytes as usize,
+            seq_no_from_i64(path,head,FilesystemOperation::Tail)?,records).map(Some)
+    }
+
+    async fn event_log_generation(&self, path: &VirtualPath) -> Result<Option<String>,FilesystemError> {
+        let client=self.client().await?;
+        let row=cached_query_opt(&client,
+            "SELECT id, CASE WHEN octet_length(payload)<=8388608 THEN payload ELSE NULL END AS payload FROM root_filesystem_events WHERE path=$1 ORDER BY id ASC LIMIT 1",
+            &[&path.as_str()]).await.map_err(|e|db_error(path.clone(),FilesystemOperation::Tail,e))?;
+        let Some(row)=row else{return Ok(None)};
+        let raw:i64=row.get("id");let payload:Option<Vec<u8>>=row.get("payload");
+        let payload=payload.ok_or_else(||backend_error(path.clone(),FilesystemOperation::Tail,"generation first record byte budget exceeded"))?;
+        Ok(Some(crate::CompleteEventPrefix::generation_from_first(&EventRecord {seq:seq_no_from_i64(path,raw,FilesystemOperation::Tail)?,payload})))
+    }
+
     async fn tail_bounded(
         &self,
         path: &VirtualPath,
@@ -2277,3 +2313,5 @@ mod tests {
         );
     }
 }
+
+const COMPLETE_EVENT_PREFIX_SQL: &str = include_str!("complete-prefix-postgres.sql");

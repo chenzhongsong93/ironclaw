@@ -459,6 +459,7 @@ fn constraint_terms(
 
 pub(crate) fn dev_wildcard_network_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: None,
             host_pattern: "*".to_string(),

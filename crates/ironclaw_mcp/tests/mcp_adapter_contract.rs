@@ -2281,6 +2281,7 @@ fn sample_scope_for_user(user_id: &str) -> ResourceScope {
 
 fn mcp_http_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "mcp.example.test".to_string(),

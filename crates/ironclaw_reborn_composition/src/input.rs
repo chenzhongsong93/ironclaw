@@ -188,6 +188,8 @@ pub struct RebornBuildInput {
     /// is the one that does.
     pub(crate) deployment: DeploymentConfig,
     pub(crate) owner_id: String,
+    pub(crate) host_extension_bundles: Vec<Arc<crate::RebornHostExtensionBundle>>,
+    pub(crate) private_startup_admission_hold: bool,
     pub(crate) local_runtime_identity: Option<RebornLocalRuntimeIdentity>,
     pub(crate) storage: RebornStorageInput,
     pub(crate) production_trust_policy: Option<Arc<HostTrustPolicy>>,
@@ -280,6 +282,27 @@ pub(crate) enum RebornStorageInput {
 }
 
 impl RebornBuildInput {
+    /// Root-installed high-level bundles. Nonempty input is supported only in explicit Production.
+    /// Trusted host bootstrap only. Holds existing work without changing its state.
+    pub fn with_private_startup_admission_hold(mut self)->Result<Self,crate::RebornBuildError> {
+        if !matches!(self.profile(),crate::RebornCompositionProfile::Production|crate::RebornCompositionProfile::HostedSingleTenant) {
+            return Err(crate::RebornBuildError::InvalidConfig {reason:"startupAdmissionRequiresProductionOrHostedSingleTenant".into()});
+        }
+        self.private_startup_admission_hold=true;Ok(self)
+    }
+    pub fn with_host_extension_bundles(mut self,bundles:Vec<crate::RebornHostExtensionBundle>)->Result<Self,crate::RebornBuildError> {
+        validate_host_bundle_profile(self.profile(),!bundles.is_empty())?;
+        crate::operator_host_bundle::validate_operator_bundle_set(&bundles).map_err(|e|crate::RebornBuildError::InvalidConfig{reason:e.to_string()})?;
+        self.host_extension_bundles=bundles.into_iter().map(Arc::new).collect();self.validate_host_bundle_profile()?;Ok(self)
+    }
+    pub(crate) fn validate_host_bundle_profile(&self)->Result<(),crate::RebornBuildError> {
+        validate_host_bundle_profile(self.profile(),!self.host_extension_bundles.is_empty())?;
+        if let Some(identity)=self.local_runtime_identity.as_ref() {
+            crate::operator_host_bundle::validate_operator_runtime_tenant(&self.host_extension_bundles,&identity.tenant_id)
+                .map_err(|_|crate::RebornBuildError::InvalidConfig{reason:"hostBundleValidatedRuntimeTenantMismatch".into()})?;
+        }Ok(())
+    }
+
     /// Selected composition profile — a display/telemetry label. Behaviour
     /// comes from [`RebornBuildInput::deployment`].
     pub fn profile(&self) -> RebornCompositionProfile {
@@ -880,6 +903,8 @@ impl RebornBuildInput {
         Self {
             deployment,
             owner_id: owner_id.into(),
+            host_extension_bundles: Vec::new(),
+            private_startup_admission_hold:false,
             local_runtime_identity: None,
             storage,
             production_trust_policy: None,
@@ -1201,5 +1226,25 @@ mod tests {
             RebornBuildInput::disabled("test-owner").with_product_auth_ports(product_auth.clone());
 
         assert!(input.product_auth_ports.is_some());
+    }
+}
+
+fn validate_host_bundle_profile(profile:RebornCompositionProfile,nonempty:bool)->Result<(),crate::RebornBuildError> {
+    if nonempty&&profile!=RebornCompositionProfile::Production {
+        return Err(crate::RebornBuildError::InvalidConfig{reason:"operator HostBundle requires explicit Production profile".into()});
+    } Ok(())
+}
+#[cfg(test)] mod host_bundle_profile_tests {
+    #[test] fn unsupported_profile_is_not_silently_local_enabled() {
+        let input=super::RebornBuildInput::disabled("owner");
+        assert!(super::validate_host_bundle_profile(input.profile(),true).is_err());
+        assert!(super::validate_host_bundle_profile(input.profile(),false).is_ok());
+        assert!(super::validate_host_bundle_profile(crate::RebornCompositionProfile::Production,true).is_ok());
+    }
+    #[test] fn private_startup_admission_hold_is_scoped_to_production_and_hosted_single_tenant() {
+        let hosted=super::RebornBuildInput::local_dev_with_profile(crate::RebornCompositionProfile::HostedSingleTenant,"owner",std::path::PathBuf::from("fixture"));
+        assert!(hosted.with_private_startup_admission_hold().is_ok());
+        let local=super::RebornBuildInput::local_dev_with_profile(crate::RebornCompositionProfile::LocalDev,"owner",std::path::PathBuf::from("fixture"));
+        assert!(local.with_private_startup_admission_hold().is_err());
     }
 }

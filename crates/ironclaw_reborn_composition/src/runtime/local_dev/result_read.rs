@@ -67,7 +67,7 @@ pub(crate) fn wrap_result_read_capability_for_test(
 #[cfg(feature = "test-support")]
 pub(crate) const RESULT_READ_CAPABILITY_ID_FOR_TEST: &str = RESULT_READ_CAPABILITY_ID;
 
-pub(super) const RESULT_READ_CAPABILITY_ID: &str = "builtin.result_read";
+pub(in crate::runtime) const RESULT_READ_CAPABILITY_ID: &str = "builtin.result_read";
 const RESULT_READ_PROVIDER_TOOL_NAME: &str = "builtin__result_read";
 const RESULT_READ_MIN_BYTES: u64 = 4;
 const RESULT_READ_MAX_BYTES: u64 = TOOL_RESULT_RECORD_READ_MAX_BYTES as u64;

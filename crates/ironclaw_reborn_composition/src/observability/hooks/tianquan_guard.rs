@@ -70,6 +70,7 @@ use ironclaw_hooks::sink::{
     ObserverHook, ObserverSink, PrivilegedBeforeCapabilityHook, PrivilegedGateSink,
 };
 
+use ironclaw_host_api::TenantId;
 use ironclaw_turns::CapabilityActivityId;
 
 use crate::error::RebornBuildError;
@@ -93,7 +94,11 @@ pub(crate) const PENDING_SPAWN_WINDOW: Duration = Duration::from_secs(300);
 /// work (e.g. one quick check) while preventing shell-as-MCP-bypass.
 pub(crate) const SHELL_LIMIT: u32 = 3;
 
-/// Per-guard cap on **consecutive** invocations of the same capability (any
+/// Maximum ordinary activity decisions retained per guard. Never evict: an
+/// evicted denial could otherwise become a fresh, permitted invocation.
+const REPEAT_ACTIVITY_CAPACITY: usize = 4096;
+
+/// Per-guard cap on **consecutive** independent activities of the same capability (any
 /// capability, including MCP tools such as `tianquan-graph.run_skill_verify`).
 /// The Nth consecutive call (and later) is denied. Tuned to let an LLM do a
 /// legitimate bounded retry (e.g. 2-3 verify passes) while cutting the
@@ -127,7 +132,33 @@ const REASON_DUPLICATE_SPAWN: &str = "已 spawn,等 resume 不要重复 spawn";
 const REASON_SHELL_RATE_LIMITED: &str = "builtin.shell 调用过多,用 MCP 工具而非 shell";
 const REASON_TIANQUAN_FILE_WRITE_DISABLED: &str =
     "天权生产 profile 已关闭任意文件写入,请使用 Artifact API/MCP";
-const REASON_REPEAT_CALL: &str = "同工具连续调用过多,勿空转重试:conforms 稳定则 advance_stage(to=approve) 进 committer,或 L7 完成切 loop:prose spawn_subagent 进 L8;真问题请报告而非重复调用";
+const REASON_REPEAT_CALL: &str = "同工具连续调用已达上限，请核对实际错误和任务进度；不要重复相同调用，不要把调用完成当作任务成功。";
+
+/// Only this guard's contribution, never an authorization or dispatch result.
+#[derive(Debug, Clone)]
+struct RepeatActivityDecision {
+    tenant_id: TenantId,
+    capability_name: String,
+    /// Middleware hashes capability + input-ref, not resolved argument content.
+    arguments_digest: [u8; 32],
+    denied_reason: Option<&'static str>,
+}
+
+impl RepeatActivityDecision {
+    fn matches(&self, ctx: &BeforeCapabilityHookContext) -> bool {
+        self.tenant_id == ctx.tenant_id
+            && self.capability_name == ctx.capability_name
+            && self.arguments_digest == ctx.arguments_digest
+    }
+
+    fn contribute(&self, sink: &mut dyn PrivilegedGateSink) {
+        if let Some(reason) = self.denied_reason {
+            sink.deny(reason);
+        } else {
+            sink.pass();
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SpawnDispatchState {
@@ -166,12 +197,13 @@ struct TianquanGuardState {
     /// such as `tianquan-graph.run_skill_verify` (hook covers all capability
     /// kinds via `HookedLoopCapabilityPort`). Special-cased capabilities
     /// (spawn/result_read/shell) do not increment these counters, but every
-    /// invocation still replaces `last_capability` so it interrupts an
-    /// ordinary capability's consecutive-call sequence.
+    /// special invocation still replaces `last_capability`. Ordinary replays
+    /// neither increment these counters nor interrupt the sequence.
     repeat_calls: HashMap<String, u32>,
-    /// The last capability invocation evaluated, including special
-    /// capabilities and denials. Used to detect *consecutive* vs
-    /// *interleaved* ordinary calls. `None` before the first evaluation.
+    /// Bounded, non-evicting identity/decision records for ordinary activities.
+    repeat_activities: HashMap<CapabilityActivityId, RepeatActivityDecision>,
+    /// Last new ordinary activity or special capability evaluation, including
+    /// denials. Replays and invalid/over-capacity identities leave it unchanged.
     last_capability: Option<String>,
 }
 
@@ -182,8 +214,26 @@ impl TianquanGuardState {
             spawn_count: 0,
             shell_count: 0,
             repeat_calls: HashMap::new(),
+            repeat_activities: HashMap::new(),
             last_capability: None,
         }
+    }
+
+    fn remember_repeat_decision(
+        &mut self,
+        activity_id: CapabilityActivityId,
+        ctx: &BeforeCapabilityHookContext,
+        denied_reason: Option<&'static str>,
+    ) {
+        self.repeat_activities.insert(
+            activity_id,
+            RepeatActivityDecision {
+                tenant_id: ctx.tenant_id.clone(),
+                capability_name: ctx.capability_name.clone(),
+                arguments_digest: ctx.arguments_digest,
+                denied_reason,
+            },
+        );
     }
 
     /// Expire a stale in-flight/waiting spawn if the bounded backstop elapsed.
@@ -305,11 +355,38 @@ impl PrivilegedBeforeCapabilityHook for TianquanBuiltinGuard {
                 return;
             }
         };
+        // Check recorded identities before classifying: an ordinary activity
+        // must not escape its decision by changing into a special capability.
+        if let Some(previous) = ctx
+            .activity_id
+            .and_then(|id| state.repeat_activities.get(&id))
+        {
+            if previous.matches(ctx) {
+                previous.contribute(sink);
+            } else {
+                sink.deny("tianquan guard capability activity identity mismatch");
+            }
+            return;
+        }
+        let ordinary_activity = if matches!(
+            ctx.capability_name.as_str(),
+            CAPABILITY_SPAWN_SUBAGENT | CAPABILITY_RESULT_READ | CAPABILITY_SHELL
+        ) {
+            None
+        } else {
+            let Some(activity_id) = ctx.activity_id else {
+                sink.deny("tianquan guard requires capability activity identity");
+                return;
+            };
+            if state.repeat_activities.len() >= REPEAT_ACTIVITY_CAPACITY {
+                sink.deny("tianquan guard capability activity capacity exceeded");
+                return;
+            }
+            Some(activity_id)
+        };
         state.expire_spawn_dispatch(now);
-        // Every invocation, including a special capability rejected by its
-        // dedicated rule, breaks an ordinary capability's repeat sequence.
-        // Preserve the prior value for the ordinary-capability calculation
-        // below, then record this invocation before any early return.
+        // Only new ordinary activities and special evaluations break the
+        // sequence. Keep spawn/result_read/shell's existing evaluation semantics.
         let repeats_previous_capability =
             state.last_capability.as_deref() == Some(ctx.capability_name.as_str());
         state.last_capability = Some(ctx.capability_name.clone());
@@ -326,6 +403,13 @@ impl PrivilegedBeforeCapabilityHook for TianquanBuiltinGuard {
                     | CAPABILITY_SHELL
             )
         {
+            if let Some(activity_id) = ordinary_activity {
+                state.remember_repeat_decision(
+                    activity_id,
+                    ctx,
+                    Some(REASON_TIANQUAN_FILE_WRITE_DISABLED),
+                );
+            }
             drop(state);
             sink.deny(REASON_TIANQUAN_FILE_WRITE_DISABLED);
             return;
@@ -399,6 +483,13 @@ impl PrivilegedBeforeCapabilityHook for TianquanBuiltinGuard {
                     1
                 };
                 state.repeat_calls.insert(cap_name.clone(), count);
+                if let Some(activity_id) = ordinary_activity {
+                    state.remember_repeat_decision(
+                        activity_id,
+                        ctx,
+                        (count >= REPEAT_CALL_LIMIT).then_some(REASON_REPEAT_CALL),
+                    );
+                }
                 if count >= REPEAT_CALL_LIMIT {
                     let detail = format!(
                         "{cap_name} 已连续调用 {count} 次未推进(上限 {REPEAT_CALL_LIMIT} 次)"
@@ -493,12 +584,14 @@ mod tests {
     /// observability without reaching across the crate boundary.
     struct CapturingSink {
         outcome: CapturedOutcome,
+        reason: Option<&'static str>,
     }
 
     impl CapturingSink {
         fn new() -> Self {
             Self {
                 outcome: CapturedOutcome::Unset,
+                reason: None,
             }
         }
     }
@@ -516,8 +609,9 @@ mod tests {
         fn allow(&mut self) {
             self.outcome = CapturedOutcome::Allowed;
         }
-        fn deny(&mut self, _reason: &'static str) {
+        fn deny(&mut self, reason: &'static str) {
             self.outcome = CapturedOutcome::Denied;
+            self.reason = Some(reason);
         }
         fn pause_approval(&mut self, _reason: &'static str) {
             self.outcome = CapturedOutcome::PausedApproval;
@@ -538,10 +632,7 @@ mod tests {
         ctx_for_tenant("tianquan-test", capability_name)
     }
 
-    fn ctx_for_tenant(
-        tenant: &str,
-        capability_name: &str,
-    ) -> BeforeCapabilityHookContext {
+    fn ctx_for_tenant(tenant: &str, capability_name: &str) -> BeforeCapabilityHookContext {
         BeforeCapabilityHookContext::new_unresolved(
             TenantId::new(tenant.to_string()).expect("valid tenant"),
             capability_name.to_string(),
@@ -625,7 +716,10 @@ mod tests {
             CAPABILITY_APPLY_PATCH,
             CAPABILITY_SHELL,
         ] {
-            assert_denied(evaluate(&guard, &ctx_for_tenant(TIANQUAN_TENANT_ID, capability)));
+            assert_denied(evaluate(
+                &guard,
+                &ctx_for_tenant(TIANQUAN_TENANT_ID, capability),
+            ));
         }
     }
 
@@ -641,7 +735,10 @@ mod tests {
             CAPABILITY_APPLY_PATCH,
             CAPABILITY_SHELL,
         ] {
-            assert_passed(evaluate(&guard, &ctx_for_tenant("other-tenant", capability)));
+            assert_passed(evaluate(
+                &guard,
+                &ctx_for_tenant("other-tenant", capability),
+            ));
         }
     }
 
@@ -928,6 +1025,25 @@ mod tests {
         assert_denied(over);
     }
 
+    // 覆盖：TianQuan TEST-SPEC AE-L1-163；通用限额不得指示领域审批。
+    #[test]
+    fn repeat_call_denial_keeps_limit_without_novel_phase_advice() {
+        let guard = TianquanBuiltinGuard::new();
+        for _ in 0..REPEAT_CALL_LIMIT - 1 {
+            assert_passed(evaluate(&guard, &ctx_for("example.review")));
+        }
+        let mut sink = CapturingSink::new();
+        futures::executor::block_on(guard.evaluate(&ctx_for("example.review"), &mut sink));
+        assert_eq!(sink.outcome, CapturedOutcome::Denied);
+        let reason = sink.reason.expect("limit denial has a reason");
+        for forbidden in ["advance_stage", "committer", "L7", "L8", "approve"] {
+            assert!(
+                !reason.contains(forbidden),
+                "domain advice leaked: {forbidden}"
+            );
+        }
+    }
+
     #[test]
     fn repeat_call_resets_on_interleaved_capability() {
         // Interleaving any *different* capability resets the consecutive
@@ -1012,6 +1128,150 @@ mod tests {
         // A fresh tool after the shell storm starts its counter at 1.
         let outcome = evaluate(&guard, &ctx_for("tianquan-graph.get_layer_stage"));
         assert_passed(outcome);
+    }
+
+    // 覆盖：TianQuan TEST-SPEC AE-L1-168；重放不计数，拒绝不能经交错复活。
+    #[test]
+    fn repeat_activity_replay_keeps_decision_and_order() {
+        let guard = TianquanBuiltinGuard::new();
+        let first = ctx_for("example.review");
+        for _ in 0..20 {
+            assert_passed(evaluate(&guard, &first));
+        }
+        for _ in 1..REPEAT_CALL_LIMIT - 1 {
+            assert_passed(evaluate(&guard, &ctx_for("example.review")));
+        }
+        let denied = ctx_for("example.review");
+        assert_denied(evaluate(&guard, &denied));
+        assert_passed(evaluate(&guard, &ctx_for("example.other")));
+        assert_denied(evaluate(&guard, &denied));
+        assert_passed(evaluate(&guard, &first));
+        assert_passed(evaluate(&guard, &ctx_for("example.other")));
+        assert_eq!(
+            guard.state.lock().expect("state").repeat_calls["example.other"],
+            2,
+            "old replays must not replace last capability"
+        );
+    }
+
+    // 覆盖：AE-L1-168 IC23-ID，身份缺失/漂移失败关闭且不改原决定。
+    #[test]
+    fn repeat_activity_requires_stable_identity() {
+        let guard = TianquanBuiltinGuard::new();
+        let first = ctx_for("example.review");
+        assert_passed(evaluate(&guard, &first));
+        let mut changed = first.clone();
+        changed.arguments_digest[0] = 1;
+        assert_denied(evaluate(&guard, &changed));
+        changed = first.clone();
+        changed.capability_name = "example.other".into();
+        assert_denied(evaluate(&guard, &changed));
+        changed.capability_name = CAPABILITY_SHELL.into();
+        assert_denied(evaluate(&guard, &changed));
+        changed = first.clone();
+        changed.tenant_id = TenantId::new("another-tenant").expect("tenant");
+        assert_denied(evaluate(&guard, &changed));
+        changed = first.clone();
+        changed.activity_id = None;
+        assert_denied(evaluate(&guard, &changed));
+        assert_passed(evaluate(&guard, &first));
+        assert_eq!(
+            guard.state.lock().expect("state").repeat_calls["example.review"],
+            1
+        );
+    }
+
+    // 覆盖：AE-L1-168 IC23-ORDER；锁线性化保证重复ID不多计，独立ID五过其余拒。
+    #[test]
+    fn repeat_activity_concurrent_replays_count_once() {
+        let guard = TianquanBuiltinGuard::new();
+        let first = ctx_for("example.review");
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| scope.spawn(|| evaluate(&guard, &first)))
+                .collect();
+            for handle in handles {
+                assert_passed(handle.join().expect("worker"));
+            }
+        });
+        assert_eq!(
+            guard.state.lock().expect("state").repeat_calls["example.review"],
+            1
+        );
+        let outcomes = std::thread::scope(|scope| {
+            (0..16)
+                .map(|_| scope.spawn(|| evaluate(&guard, &ctx_for("example.review"))))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().expect("worker"))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| **o == CapturedOutcome::Passed)
+                .count(),
+            4
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| **o == CapturedOutcome::Denied)
+                .count(),
+            12
+        );
+    }
+
+    // 覆盖：AE-L1-168 IC23-BOUND；记录满后不淘汰已拒绝/允许决定。
+    #[test]
+    fn repeat_activity_capacity_fails_closed_without_eviction() {
+        let guard = TianquanBuiltinGuard::new();
+        let first = ctx_for("example.review");
+        assert_passed(evaluate(&guard, &first));
+        for _ in 1..REPEAT_CALL_LIMIT - 1 {
+            assert_passed(evaluate(&guard, &ctx_for("example.review")));
+        }
+        let denied = ctx_for("example.review");
+        assert_denied(evaluate(&guard, &denied));
+        for i in REPEAT_CALL_LIMIT as usize..4096 {
+            let cap = if i % 2 == 0 { "example.a" } else { "example.b" };
+            assert_passed(evaluate(&guard, &ctx_for(cap)));
+        }
+        for _ in 0..10 {
+            assert_denied(evaluate(&guard, &ctx_for("example.new")));
+        }
+        assert_denied(evaluate(&guard, &denied));
+        assert_passed(evaluate(&guard, &first));
+        let state = guard.state.lock().expect("state");
+        assert_eq!(state.repeat_calls["example.review"], 6);
+        assert_eq!(state.repeat_activities.len(), REPEAT_ACTIVITY_CAPACITY);
+        assert_eq!(state.last_capability.as_deref(), Some("example.b"));
+    }
+
+    // 覆盖：AE-L1-168 IC23-SCOPE；production builder factory每次生成独立guard。
+    #[tokio::test]
+    async fn repeat_activity_factory_isolates_dispatchers() {
+        use ironclaw_hooks::dispatch::BeforeCapabilityDispatchOutcome;
+        let factory = super::super::factory::build_hook_dispatcher_builder_factory(
+            super::super::HooksActivationConfig::enabled(),
+            &super::super::projection::HookProjectionRegistry::from_projections(Vec::new()),
+        )
+        .expect("factory")
+        .expect("enabled");
+        let first = factory().expect("first run").build_arc();
+        let second = factory().expect("second run").build_arc();
+        let context = ctx_for("example.review");
+        for _ in 0..5 {
+            let outcome = first
+                .dispatch_before_capability(&ctx_for("example.review"))
+                .await;
+            assert!(outcome.decision.permits());
+        }
+        let BeforeCapabilityDispatchOutcome { decision, .. } =
+            first.dispatch_before_capability(&context).await;
+        assert!(!decision.permits());
+        let outcome = second.dispatch_before_capability(&context).await;
+        assert!(outcome.decision.permits());
     }
 
     #[tokio::test]

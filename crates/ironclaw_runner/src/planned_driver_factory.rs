@@ -347,17 +347,95 @@ pub fn register_scheduled_trigger_planned_profile(
 
 pub fn default_planned_run_profile_resolver()
 -> Result<InMemoryRunProfileResolver, RunProfileRegistryError> {
+    let registry = default_planned_run_profile_registry()?;
+    planned_run_profile_resolver_from_registry(registry)
+}
+
+pub(crate) fn default_planned_run_profile_registry()
+-> Result<InMemoryRunProfileRegistry, RunProfileRegistryError> {
     let mut registry = InMemoryRunProfileRegistry::with_builtin_profiles();
     register_default_planned_profile(&mut registry)?;
     register_subagent_planned_profile(&mut registry)?;
     register_subagent_novelist_planned_profile(&mut registry)?;
     register_scheduled_trigger_planned_profile(&mut registry)?;
+    Ok(registry)
+}
+
+pub(crate) fn planned_run_profile_resolver_from_registry(
+    registry: InMemoryRunProfileRegistry,
+) -> Result<InMemoryRunProfileResolver, RunProfileRegistryError> {
     let implicit_default = planned_default_profile_id()
         .map_err(|reason| RunProfileRegistryError::InvalidProfile { reason })?;
     Ok(InMemoryRunProfileResolver::new_with_implicit_default(
         registry,
         implicit_default,
     ))
+}
+
+/// Finite native authority declared by the registered runner profiles.
+/// Constructed only here; descriptor visibility cannot mint this permission.
+pub struct RegisteredNativeCapabilityCeiling {
+    spawn: bool,
+    skill_activation: bool,
+    result_read: bool,
+}
+impl RegisteredNativeCapabilityCeiling {
+    pub fn permits_spawn(&self) -> bool {
+        self.spawn
+    }
+    pub fn permits_skill_activation(&self) -> bool {
+        self.skill_activation
+    }
+    pub fn permits_result_read(&self) -> bool {
+        self.result_read
+    }
+}
+
+pub async fn registered_native_capability_ceiling(
+    run: &ironclaw_turns::run_profile::LoopRunContext,
+) -> Result<RegisteredNativeCapabilityCeiling, ironclaw_loop_host::CapabilityResolveError> {
+    use ironclaw_turns::RunProfileResolver;
+    let registry = default_planned_run_profile_resolver().map_err(|_| {
+        ironclaw_loop_host::CapabilityResolveError::unavailable(
+            "registered native profile unavailable",
+        )
+    })?;
+    let requested =
+        ironclaw_turns::RunProfileRequest::new(run.resolved_run_profile.profile_id.as_str())
+            .map_err(|_| {
+                ironclaw_loop_host::CapabilityResolveError::unavailable("invalid native profile")
+            })?;
+    let expected = registry
+        .resolve_run_profile(
+            ironclaw_turns::RunProfileResolutionRequest::interactive_default()
+                .with_requested_run_profile(requested),
+        )
+        .await
+        .map_err(|_| {
+            ironclaw_loop_host::CapabilityResolveError::unavailable("unknown native profile")
+        })?;
+    let actual = &run.resolved_run_profile;
+    if actual.profile_version != expected.profile_version
+        || actual.loop_driver != expected.loop_driver
+        || actual.checkpoint_schema_id != expected.checkpoint_schema_id
+        || actual.checkpoint_schema_version != expected.checkpoint_schema_version
+        || actual.capability_surface_profile_id != expected.capability_surface_profile_id
+    {
+        return Err(ironclaw_loop_host::CapabilityResolveError::unavailable(
+            "native profile identity mismatch",
+        ));
+    }
+    // Explicit normal planned contract; scheduled/text-only profiles do not gain
+    // these permissions simply because their port advertises a native tool.
+    let permitted = matches!(
+        actual.profile_id.as_str(),
+        PLANNED_DEFAULT_PROFILE_ID | SUBAGENT_PLANNED_PROFILE_ID | SUBAGENT_NOVELIST_PROFILE_ID
+    );
+    Ok(RegisteredNativeCapabilityCeiling {
+        spawn: permitted,
+        skill_activation: permitted,
+        result_read: permitted,
+    })
 }
 
 #[cfg(test)]
@@ -700,3 +778,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "native_result_read_ceiling_tests.rs"]
+mod native_result_read_ceiling_tests;

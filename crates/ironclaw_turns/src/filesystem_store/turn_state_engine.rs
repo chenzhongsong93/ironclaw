@@ -30,18 +30,18 @@ use crate::{
     AcceptedMessageRef, AdmissionRejection, AdmissionRejectionReason,
     AllowAllTurnAdmissionLimitProvider, BlockedReason, CancelRunRequest, CancelRunResponse,
     GetLoopCheckpointRequest, GetRunStateRequest, IdempotencyKey, LoopCheckpointRecord,
-    LoopCheckpointStore, LoopExitMapping, PutLoopCheckpointRequest, ReplyTargetBindingRef,
-    ResumeTurnRequest, ResumeTurnResponse, RetryTurnRequest, RetryTurnResponse,
-    RunProfileResolutionError, RunProfileResolutionRequest, RunProfileResolver, SanitizedFailure,
-    SourceBindingRef, SpawnTreeReservation, SpawnTreeReservationKey, SubmitChildRunRequest,
-    SubmitTurnRequest, SubmitTurnResponse, ThreadBusy, TurnActiveLockKey, TurnActiveLockRecord,
-    TurnActor, TurnAdmissionClass, TurnAdmissionLimitProvider, TurnAdmissionPolicy,
-    TurnAdmissionReservationRecord, TurnCapacityResource, TurnCheckpointId, TurnCheckpointRecord,
-    TurnError, TurnEventKind, TurnIdempotencyErrorReplay, TurnIdempotencyOperationKind,
-    TurnIdempotencyOutcomeKind, TurnIdempotencyRecord, TurnIdempotencyReplay, TurnLeaseToken,
-    TurnLifecycleEvent, TurnLockVersion, TurnPersistenceSnapshot, TurnRecord, TurnRunId,
-    TurnRunProfile, TurnRunRecord, TurnRunState, TurnScope, TurnSpawnTreeStateStore,
-    TurnStateStore, TurnStatus,
+    LoopCheckpointStore, LoopExitMapping, PutLoopCheckpointRequest, RecoverTurnRequest,
+    ReplyTargetBindingRef, ResumeTurnRequest, ResumeTurnResponse, RetryTurnRequest,
+    RetryTurnResponse, RunProfileResolutionError, RunProfileResolutionRequest, RunProfileResolver,
+    SanitizedFailure, SourceBindingRef, SpawnTreeReservation, SpawnTreeReservationKey,
+    SubmitChildRunRequest, SubmitTurnRequest, SubmitTurnResponse, ThreadBusy, TurnActiveLockKey,
+    TurnActiveLockRecord, TurnActor, TurnAdmissionClass, TurnAdmissionLimitProvider,
+    TurnAdmissionPolicy, TurnAdmissionReservationRecord, TurnCapacityResource, TurnCheckpointId,
+    TurnCheckpointRecord, TurnError, TurnEventKind, TurnIdempotencyErrorReplay,
+    TurnIdempotencyOperationKind, TurnIdempotencyOutcomeKind, TurnIdempotencyRecord,
+    TurnIdempotencyReplay, TurnLeaseToken, TurnLifecycleEvent, TurnLockVersion,
+    TurnPersistenceSnapshot, TurnRecord, TurnRunId, TurnRunProfile, TurnRunRecord, TurnRunState,
+    TurnScope, TurnSpawnTreeStateStore, TurnStateStore, TurnStatus,
     admission::{TurnAdmissionBucket, admission_buckets},
     events::{EventCursor, TurnEventPage, TurnEventProjectionSource, project_turn_events},
     runner::{
@@ -1283,6 +1283,34 @@ impl TurnStateStore for TurnStateEngine {
         result
     }
 
+    async fn recover_turn(
+        &self,
+        request: RecoverTurnRequest,
+    ) -> Result<ResumeTurnResponse, TurnError> {
+        let mut did_recover = false;
+        let result = {
+            let mut inner = self.lock_inner()?;
+            let idempotency_key = RunIdempotencyKey {
+                scope: request.scope.clone(),
+                run_id: request.run_id,
+                key: request.idempotency_key.clone(),
+            };
+            if let Some(replayed) = inner.resume_idempotency.get(&idempotency_key) {
+                replayed.clone()
+            } else {
+                let result =
+                    inner.recover_turn_once(&request, self.admission_limit_provider.as_ref());
+                inner.remember_resume_idempotency(idempotency_key, result.clone(), Utc::now());
+                did_recover = result.is_ok();
+                result
+            }
+        };
+        if did_recover {
+            self.persist_blocked_state().await;
+        }
+        result
+    }
+
     async fn retry_turn(&self, request: RetryTurnRequest) -> Result<RetryTurnResponse, TurnError> {
         let mut inner = self.lock_inner()?;
         let idempotency_key = RunIdempotencyKey {
@@ -1493,6 +1521,31 @@ impl TurnSpawnTreeStateStore for TurnStateEngine {
         }
         if parent.subagent_depth == u32::MAX {
             let response = Err(invalid_lineage("subagent depth would overflow"));
+            inner.remember_submit_idempotency(
+                idempotency_key.clone(),
+                response.clone(),
+                request.received_at,
+            );
+            inner.submit_idempotency_in_flight.remove(&idempotency_key);
+            self.submit_idempotency_ready.notify_waiters();
+            return response;
+        }
+        let protected_child = profile
+            .resolved
+            .provenance
+            .effective_privileges
+            .contains(&crate::run_profile::PrivilegedRunProfileDimension::SpecialDriver);
+        if protected_child
+            && (parent.status.get() != TurnStatus::Running
+                || parent.subagent_depth != 0
+                || parent.profile.resolved != profile.resolved
+                || parent.actor != request.actor
+                || parent.scope.explicit_owner_user_id() != Some(&request.actor.user_id)
+                || request.child_scope.explicit_owner_user_id() != Some(&request.actor.user_id)
+                || request.requested_run_id.is_none()
+                || request.spawn_tree_descendant_cap > 1)
+        {
+            let response = Err(TurnError::Unauthorized);
             inner.remember_submit_idempotency(
                 idempotency_key.clone(),
                 response.clone(),
@@ -2931,8 +2984,13 @@ impl Inner {
             record.resume_disposition = request.resume_disposition.clone();
             record.gate_ref = None;
             record.credential_requirements = Vec::new();
-            record.source_binding_ref = request.source_binding_ref.clone();
-            record.reply_target_binding_ref = request.reply_target_binding_ref.clone();
+            // A dependent-run gate belongs to the parent. The child edge only
+            // wakes the parent and carries its result reference; it must not
+            // replace the parent's role/source or reply binding.
+            if request.precondition != crate::ResumeTurnPrecondition::BlockedDependentRunGate {
+                record.source_binding_ref = request.source_binding_ref.clone();
+                record.reply_target_binding_ref = request.reply_target_binding_ref.clone();
+            }
             record.event_cursor = self.next_cursor();
             self.update_active_lock(&record, now);
             self.queued_runs.push_back(record.run_id);
@@ -2943,6 +3001,194 @@ impl Inner {
             };
             self.push_event(&record, TurnEventKind::Resumed, None, None);
             Ok(response)
+        })();
+        self.records.insert(record.run_id, record);
+        result
+    }
+
+    fn in_place_recovery_allowed(existing_recoveries: usize, failure_category: &str) -> bool {
+        // A host-stage redrive can itself fail before the replacement child is
+        // admitted. Permit one bounded host-stage retry, while retaining the
+        // exact checkpoint/failure gate and the four-attempt hard ceiling.
+        match (existing_recoveries, failure_category) {
+            (0, _) => true,
+            (1, "driver_invalid_request" | "host_stage_unavailable_unknown") => true,
+            (2 | 3, "host_stage_unavailable_unknown") => true,
+            _ => false,
+        }
+    }
+
+    fn recover_turn_once(
+        &mut self,
+        request: &RecoverTurnRequest,
+        admission_limit_provider: &dyn TurnAdmissionLimitProvider,
+    ) -> Result<ResumeTurnResponse, TurnError> {
+        let mut record = self.take_record(request.run_id)?;
+        let result = (|| {
+            if record.scope != request.scope {
+                return Err(TurnError::ScopeNotFound);
+            }
+            if record.actor != request.actor {
+                return Err(TurnError::Unauthorized);
+            }
+            if record.status.get() != TurnStatus::Failed
+                || !self.is_latest_run_for_turn(&record)
+                || record.parent_run_id.is_some()
+                || record.subagent_depth != 0
+                || record.spawn_tree_root_run_id.is_some()
+            {
+                return Err(TurnError::RunNotRetryable {
+                    run_id: request.run_id,
+                });
+            }
+            if record.checkpoint_id != Some(request.expected_checkpoint_id) {
+                return Err(TurnError::RunNotRetryable {
+                    run_id: request.run_id,
+                });
+            }
+            let Some(failure) = record.failure.as_ref() else {
+                return Err(TurnError::RunNotRetryable {
+                    run_id: request.run_id,
+                });
+            };
+            if failure.category() != request.expected_failure_category {
+                return Err(TurnError::RunNotRetryable {
+                    run_id: request.run_id,
+                });
+            }
+            if !record
+                .profile
+                .resolved
+                .provenance
+                .effective_privileges
+                .contains(&crate::PrivilegedRunProfileDimension::SpecialDriver)
+            {
+                return Err(TurnError::Unauthorized);
+            }
+            let Some(checkpoint) = self
+                .loop_checkpoints
+                .get(&request.expected_checkpoint_id)
+                .filter(|checkpoint| {
+                    checkpoint.scope == record.scope
+                        && checkpoint.turn_id == record.turn_id
+                        && checkpoint.run_id == record.run_id
+                        && checkpoint.kind == crate::run_profile::LoopCheckpointKind::BeforeBlock
+                })
+            else {
+                return Err(TurnError::RunNotRetryable {
+                    run_id: request.run_id,
+                });
+            };
+            if let Some(child_run_id) = request.expected_binding_child_run_id {
+                let expected_source =
+                    format!("subagent-source:{}:{}", request.run_id, child_run_id);
+                let expected_reply = format!("subagent-reply:{}:{}", request.run_id, child_run_id);
+                let expected_gate = format!("gate:subagent-{child_run_id}");
+                if record.source_binding_ref.as_str() != expected_source
+                    || record.reply_target_binding_ref.as_str() != expected_reply
+                    || checkpoint.gate_ref.as_ref().map(|gate| gate.as_str())
+                        != Some(expected_gate.as_str())
+                {
+                    return Err(TurnError::Conflict {
+                        reason: "recovery binding child evidence mismatch".to_string(),
+                    });
+                }
+            } else if record.source_binding_ref != request.source_binding_ref
+                || record.reply_target_binding_ref != request.reply_target_binding_ref
+            {
+                return Err(TurnError::Conflict {
+                    reason: "recovery canonical binding mismatch".to_string(),
+                });
+            }
+            let Some(source_raw) = request
+                .source_binding_ref
+                .as_str()
+                .strip_prefix("webui-src:")
+            else {
+                return Err(TurnError::InvalidRequest {
+                    reason: "recovery source binding is not WebUI".to_string(),
+                });
+            };
+            let Some(reply_raw) = request
+                .reply_target_binding_ref
+                .as_str()
+                .strip_prefix("webui-reply:")
+            else {
+                return Err(TurnError::InvalidRequest {
+                    reason: "recovery reply binding is not WebUI".to_string(),
+                });
+            };
+            if source_raw.is_empty() || source_raw != reply_raw {
+                return Err(TurnError::InvalidRequest {
+                    reason: "recovery WebUI bindings are not a canonical pair".to_string(),
+                });
+            }
+            let existing_recoveries = self
+                .events
+                .iter()
+                .filter(|event| {
+                    event.run_id == request.run_id
+                        && event.kind == TurnEventKind::Resumed
+                        && event.sanitized_reason.as_deref() == Some("in_place_recovery")
+                })
+                .count();
+            if !Self::in_place_recovery_allowed(existing_recoveries, failure.category()) {
+                return Err(TurnError::RunNotRetryable {
+                    run_id: request.run_id,
+                });
+            }
+            let lock_key = TurnActiveLockKey::from(&record.scope);
+            if self.active_locks.contains_key(&lock_key) {
+                return Err(TurnError::Conflict {
+                    reason: "thread already has an active run".to_string(),
+                });
+            }
+            if let Err(rejection) = self.reserve_admission(
+                request.run_id,
+                record.profile.admission_class.clone(),
+                &record.scope,
+                &record.actor,
+                admission_limit_provider,
+            ) {
+                return Err(TurnError::AdmissionRejected(rejection));
+            }
+            let now = Utc::now();
+            let transition = record.status.set(TurnStatus::Queued);
+            self.apply_status_transition(transition, &record);
+            record.failure = None;
+            record.gate_ref = None;
+            record.blocked_activity_id = None;
+            record.credential_requirements.clear();
+            record.resume_disposition = None;
+            record.runner_id = None;
+            record.lease_token = None;
+            record.lease_expires_at = None;
+            record.source_binding_ref = request.source_binding_ref.clone();
+            record.reply_target_binding_ref = request.reply_target_binding_ref.clone();
+            record.event_cursor = self.next_cursor();
+            self.active_locks.insert(
+                lock_key.clone(),
+                TurnActiveLockRecord {
+                    key: lock_key,
+                    run_id: record.run_id,
+                    status: TurnStatus::Queued,
+                    lock_version: TurnLockVersion::new(1),
+                    acquired_at: now,
+                    updated_at: now,
+                },
+            );
+            self.queued_runs.push_back(record.run_id);
+            self.push_event(
+                &record,
+                TurnEventKind::Resumed,
+                Some("in_place_recovery".to_string()),
+                None,
+            );
+            Ok(ResumeTurnResponse {
+                run_id: record.run_id,
+                status: record.status.get(),
+                event_cursor: record.event_cursor,
+            })
         })();
         self.records.insert(record.run_id, record);
         result
@@ -4241,8 +4487,8 @@ where
 mod tests {
     use super::*;
     use crate::{
-        AllowAllTurnAdmissionPolicy, ResolvedRunProfile, RunProfileId, RunProfileVersion,
-        TurnLeaseToken, TurnRunnerId,
+        AllowAllTurnAdmissionPolicy, ResolvedRunProfile, ResumeTurnPrecondition, RunProfileId,
+        RunProfileVersion, TurnLeaseToken, TurnRunnerId,
     };
     use async_trait::async_trait;
     use ironclaw_host_api::{AgentId, ProjectId, ThreadId};
@@ -4418,5 +4664,271 @@ mod tests {
         let after_newer = store.run_record(run_id).expect("claimed run record");
         assert_eq!(after_newer.last_heartbeat_at, Some(newer_heartbeat));
         assert_eq!(after_newer.lease_expires_at, Some(newer_expiry));
+    }
+
+    #[tokio::test]
+    async fn dependent_run_resume_preserves_parent_bindings() {
+        let store = TurnStateEngine::default();
+        let scope = TurnScope::new(
+            TenantId::new("tenant-binding-preserve").unwrap(),
+            Some(AgentId::new("agent-binding-preserve").unwrap()),
+            Some(ProjectId::new("project-binding-preserve").unwrap()),
+            ThreadId::new("thread-binding-preserve").unwrap(),
+        );
+        let actor =
+            TurnActor::new(ironclaw_host_api::UserId::new("user-binding-preserve").unwrap());
+        let run_id = TurnRunId::new();
+        let gate = crate::GateRef::new("gate:reviewer-await").unwrap();
+        let original_source = SourceBindingRef::new(format!("webui-src:{run_id}")).unwrap();
+        let original_reply = ReplyTargetBindingRef::new(format!("webui-reply:{run_id}")).unwrap();
+        let profile = TurnRunProfile::from_resolved(ResolvedRunProfile::legacy_compatibility(
+            RunProfileId::default_profile(),
+            RunProfileVersion::new(1),
+            false,
+        ));
+        let mut inner = store.lock_inner().unwrap();
+        inner.records.insert(
+            run_id,
+            RunRecord {
+                scope: scope.clone(),
+                actor: actor.clone(),
+                turn_id: crate::TurnId::new(),
+                run_id,
+                status: RunStatusCell::new(TurnStatus::BlockedDependentRun),
+                profile,
+                resolved_model_route: None,
+                model_usage: None,
+                accepted_message_ref: AcceptedMessageRef::new("msg:binding-preserve").unwrap(),
+                source_binding_ref: original_source.clone(),
+                reply_target_binding_ref: original_reply.clone(),
+                checkpoint_id: Some(TurnCheckpointId::new()),
+                gate_ref: Some(gate.clone()),
+                blocked_activity_id: None,
+                credential_requirements: Vec::new(),
+                failure: None,
+                event_cursor: EventCursor::default(),
+                runner_id: None,
+                lease_token: None,
+                lease_expires_at: None,
+                last_heartbeat_at: None,
+                claim_count: 0,
+                received_at: Utc::now(),
+                parent_run_id: None,
+                subagent_depth: 0,
+                spawn_tree_root_run_id: None,
+                product_context: None,
+                llm_subject: None,
+                resume_disposition: None,
+            },
+        );
+
+        let child_run_id = TurnRunId::new();
+        inner
+            .resume_turn_once(&ResumeTurnRequest {
+                scope,
+                actor,
+                run_id,
+                gate_resolution_ref: gate,
+                source_binding_ref: SourceBindingRef::new(format!(
+                    "subagent-source:{run_id}:{child_run_id}"
+                ))
+                .unwrap(),
+                reply_target_binding_ref: ReplyTargetBindingRef::new(format!(
+                    "subagent-reply:{run_id}:{child_run_id}"
+                ))
+                .unwrap(),
+                idempotency_key: IdempotencyKey::new("resume-binding-preserve").unwrap(),
+                precondition: ResumeTurnPrecondition::BlockedDependentRunGate,
+                resume_disposition: None,
+            })
+            .expect("dependent-run parent should resume");
+
+        let resumed = inner.records.get(&run_id).expect("resumed parent record");
+        assert_eq!(resumed.status.get(), TurnStatus::Queued);
+        assert_eq!(
+            resumed.source_binding_ref, original_source,
+            "await-edge resume must not replace the parent source binding"
+        );
+        assert_eq!(
+            resumed.reply_target_binding_ref, original_reply,
+            "await-edge resume must not replace the parent reply binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_failed_root_recover_repairs_only_proven_self_bindings() {
+        let store = TurnStateEngine::default();
+        let scope = TurnScope::new(
+            TenantId::new("tenant-recover").unwrap(),
+            Some(AgentId::new("agent-recover").unwrap()),
+            Some(ProjectId::new("project-recover").unwrap()),
+            ThreadId::new("thread-recover").unwrap(),
+        );
+        let actor = TurnActor::new(ironclaw_hapi_user("user-recover"));
+        let run_id = TurnRunId::new();
+        let turn_id = crate::TurnId::new();
+        let child_run_id = TurnRunId::new();
+        let checkpoint_id = TurnCheckpointId::new();
+        let gate = crate::LoopGateRef::new(format!("gate:subagent-{child_run_id}")).unwrap();
+        let original_source =
+            SourceBindingRef::new(format!("subagent-source:{run_id}:{child_run_id}")).unwrap();
+        let original_reply =
+            ReplyTargetBindingRef::new(format!("subagent-reply:{run_id}:{child_run_id}")).unwrap();
+        let canonical_source = SourceBindingRef::new("webui-src:canonical-recovery").unwrap();
+        let canonical_reply = ReplyTargetBindingRef::new("webui-reply:canonical-recovery").unwrap();
+        let mut resolved = ResolvedRunProfile::legacy_compatibility(
+            RunProfileId::default_profile(),
+            RunProfileVersion::new(1),
+            false,
+        );
+        resolved
+            .provenance
+            .effective_privileges
+            .push(crate::run_profile::PrivilegedRunProfileDimension::SpecialDriver);
+        let profile = TurnRunProfile::from_resolved(resolved);
+
+        let mut inner = store.lock_inner().unwrap();
+        inner.loop_checkpoints.insert(
+            checkpoint_id,
+            LoopCheckpointRecord {
+                checkpoint_id,
+                scope: scope.clone(),
+                turn_id,
+                run_id,
+                state_ref: crate::run_profile::LoopCheckpointStateRef::new(
+                    "checkpoint:recover-test",
+                )
+                .unwrap(),
+                schema_id: crate::run_profile::CheckpointSchemaId::from_trusted_static(
+                    "recover-test",
+                ),
+                schema_version: RunProfileVersion::new(1),
+                kind: crate::run_profile::LoopCheckpointKind::BeforeBlock,
+                gate_ref: Some(gate),
+                created_at: Utc::now(),
+            },
+        );
+        inner.records.insert(
+            run_id,
+            RunRecord {
+                scope: scope.clone(),
+                actor: actor.clone(),
+                turn_id,
+                run_id,
+                status: RunStatusCell::new(TurnStatus::Failed),
+                profile,
+                resolved_model_route: None,
+                model_usage: None,
+                accepted_message_ref: AcceptedMessageRef::new("msg:recover-test").unwrap(),
+                source_binding_ref: original_source.clone(),
+                reply_target_binding_ref: original_reply.clone(),
+                checkpoint_id: Some(checkpoint_id),
+                gate_ref: None,
+                blocked_activity_id: Some(crate::CapabilityActivityId::from_uuid(run_id.as_uuid())),
+                credential_requirements: Vec::new(),
+                failure: Some(SanitizedFailure::new("host_creation_failed").unwrap()),
+                event_cursor: EventCursor::default(),
+                runner_id: None,
+                lease_token: None,
+                lease_expires_at: None,
+                last_heartbeat_at: None,
+                claim_count: 2,
+                received_at: Utc::now(),
+                parent_run_id: None,
+                subagent_depth: 0,
+                spawn_tree_root_run_id: None,
+                product_context: None,
+                llm_subject: None,
+                resume_disposition: None,
+            },
+        );
+
+        let request = RecoverTurnRequest {
+            scope: scope.clone(),
+            actor: actor.clone(),
+            run_id,
+            expected_checkpoint_id: checkpoint_id,
+            expected_failure_category: "host_creation_failed".to_string(),
+            expected_binding_child_run_id: Some(child_run_id),
+            source_binding_ref: canonical_source.clone(),
+            reply_target_binding_ref: canonical_reply.clone(),
+            idempotency_key: IdempotencyKey::new("recover-exact").unwrap(),
+        };
+        let mut wrong_child = request.clone();
+        wrong_child.expected_binding_child_run_id = Some(TurnRunId::new());
+        assert!(matches!(
+            inner.recover_turn_once(&wrong_child, &AllowAllTurnAdmissionLimitProvider),
+            Err(TurnError::Conflict { .. })
+        ));
+        let still_failed = inner.records.get(&run_id).expect("failed run retained");
+        assert_eq!(still_failed.status.get(), TurnStatus::Failed);
+        assert_eq!(still_failed.source_binding_ref, original_source);
+        assert_eq!(still_failed.reply_target_binding_ref, original_reply);
+
+        let response = inner
+            .recover_turn_once(&request, &AllowAllTurnAdmissionLimitProvider)
+            .expect("exact failed root should recover");
+        assert_eq!(response.run_id, run_id);
+        assert_eq!(response.status, TurnStatus::Queued);
+        let recovered = inner.records.get(&run_id).expect("same run record");
+        assert_eq!(recovered.turn_id, turn_id);
+        assert_eq!(recovered.status.get(), TurnStatus::Queued);
+        assert_eq!(recovered.checkpoint_id, Some(checkpoint_id));
+        assert_eq!(recovered.source_binding_ref, canonical_source);
+        assert_eq!(recovered.reply_target_binding_ref, canonical_reply);
+        assert!(recovered.failure.is_none());
+        assert!(recovered.blocked_activity_id.is_none());
+        assert_eq!(recovered.claim_count, 2);
+        assert!(
+            inner
+                .active_locks
+                .contains_key(&TurnActiveLockKey::from(&scope))
+        );
+        assert!(inner.events.iter().any(|event| {
+            event.run_id == run_id
+                && event.kind == TurnEventKind::Resumed
+                && event.sanitized_reason.as_deref() == Some("in_place_recovery")
+        }));
+
+        let mut replay_after_queue = request;
+        replay_after_queue.idempotency_key = IdempotencyKey::new("recover-second").unwrap();
+        assert!(matches!(
+            inner.recover_turn_once(&replay_after_queue, &AllowAllTurnAdmissionLimitProvider),
+            Err(TurnError::RunNotRetryable { run_id: rejected }) if rejected == run_id
+        ));
+    }
+
+    #[test]
+    fn in_place_recovery_allows_bounded_host_stage_redrive() {
+        assert!(Inner::in_place_recovery_allowed(0, "host_creation_failed"));
+        assert!(Inner::in_place_recovery_allowed(
+            1,
+            "driver_invalid_request"
+        ));
+        assert!(Inner::in_place_recovery_allowed(
+            1,
+            "host_stage_unavailable_unknown"
+        ));
+        assert!(!Inner::in_place_recovery_allowed(1, "host_creation_failed"));
+        assert!(!Inner::in_place_recovery_allowed(
+            2,
+            "driver_invalid_request"
+        ));
+        assert!(Inner::in_place_recovery_allowed(
+            2,
+            "host_stage_unavailable_unknown"
+        ));
+        assert!(Inner::in_place_recovery_allowed(
+            3,
+            "host_stage_unavailable_unknown"
+        ));
+        assert!(!Inner::in_place_recovery_allowed(
+            4,
+            "host_stage_unavailable_unknown"
+        ));
+    }
+
+    fn ironclaw_hapi_user(value: &str) -> ironclaw_host_api::UserId {
+        ironclaw_host_api::UserId::new(value).unwrap()
     }
 }

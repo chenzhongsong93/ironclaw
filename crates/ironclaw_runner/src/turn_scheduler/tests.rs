@@ -889,3 +889,54 @@ async fn drop_with_saturated_queue_still_cancels_token() {
         .await
         .expect("shutdown token must be cancelled even when command queue is saturated");
 }
+
+// Mechanism controls: real scheduler loop + seeded queued run + await-edge recovery.
+#[tokio::test]
+async fn startup_hold_preserves_queued_and_recovery_until_release() {
+    use ironclaw_turns::TurnRunWakeNotifier;
+    let claimed=claimed_test_run("startup-held-queued").await;
+    let wake=TurnRunWake {scope:claimed.state.scope.clone(),run_id:claimed.state.run_id,status:TurnStatus::Queued,event_cursor:EventCursor(0)};
+    let transitions=Arc::new(BatchClaimTransitionPort::new(vec![claimed]));
+    let executor=Arc::new(CountingExecutor::new());let recovery=Arc::new(CountingAwaitEdgeRecovery::default());
+    let latch=crate::startup_execution::StartupExecutionLatch::closed();
+    let (notifier,channel)=super::SchedulerTurnRunWakeNotifier::channel(8);
+    let handle=TurnRunScheduler::new(transitions.clone(),executor.clone(),TurnRunSchedulerConfig::default())
+        .with_await_edge_recovery(recovery.clone(),Duration::from_secs(3600))
+        .start_with_channel_and_startup_execution(notifier,channel,latch.clone());
+    handle.wake_notifier().notify_queued_run(wake).unwrap();
+    for _ in 0..32 {tokio::task::yield_now().await;}
+    assert_eq!(transitions.claim_calls(),0);assert_eq!(executor.executed(),0);assert_eq!(recovery.calls.load(Ordering::SeqCst),0);
+    assert_eq!(transitions.claims.lock().await.len(),1);
+    latch.release();tokio::time::timeout(Duration::from_secs(1),async {while executor.executed()==0{executor.notify.notified().await;}}).await.unwrap();
+    assert!(recovery.calls.load(Ordering::SeqCst)>0);handle.shutdown().await;
+}
+#[tokio::test]
+async fn startup_cancel_and_release_same_ready_do_not_claim_or_recover() {
+    let claimed=claimed_test_run("startup-cancel-queued").await;
+    let transitions=Arc::new(BatchClaimTransitionPort::new(vec![claimed]));let recovery=Arc::new(CountingAwaitEdgeRecovery::default());
+    let executor=Arc::new(CountingExecutor::new());let latch=crate::startup_execution::StartupExecutionLatch::closed();
+    let (notifier,channel)=super::SchedulerTurnRunWakeNotifier::channel(8);
+    let handle=TurnRunScheduler::new(transitions.clone(),executor.clone(),TurnRunSchedulerConfig::default())
+        .with_await_edge_recovery(recovery.clone(),Duration::from_secs(3600))
+        .start_with_channel_and_startup_execution(notifier,channel,latch.clone());
+    // Cancel and release before the spawned scheduler gets its first poll.
+    handle.shutdown_token.cancel();latch.release();handle.shutdown().await;
+    assert_eq!(transitions.claim_calls(),0);assert_eq!(recovery.calls.load(Ordering::SeqCst),0);assert_eq!(executor.executed(),0);
+    assert_eq!(transitions.claims.lock().await.len(),1);
+}
+
+#[tokio::test]
+async fn startup_released_then_deadline_crossed_before_first_poll_does_not_claim_or_recover() {
+    let transitions=Arc::new(BatchClaimTransitionPort::new(vec![claimed_test_run("deadline-cross-queued").await]));
+    let recovery=Arc::new(CountingAwaitEdgeRecovery::default());let executor=Arc::new(CountingExecutor::new());
+    let latch=crate::startup_execution::StartupExecutionLatch::closed();
+    assert!(latch.release_before(tokio::time::Instant::now()+Duration::from_millis(2)));
+    // No scheduler has been spawned yet: no claim can race this bounded mechanism setup.
+    tokio::time::sleep(Duration::from_millis(3)).await;
+    let (notifier,channel)=super::SchedulerTurnRunWakeNotifier::channel(8);
+    let handle=TurnRunScheduler::new(transitions.clone(),executor.clone(),TurnRunSchedulerConfig::default())
+        .with_await_edge_recovery(recovery.clone(),Duration::from_secs(3600)).start_with_channel_and_startup_execution(notifier,channel,latch);
+    for _ in 0..32 {tokio::task::yield_now().await;}handle.shutdown().await;
+    assert_eq!(transitions.claim_calls(),0);assert_eq!(recovery.calls.load(Ordering::SeqCst),0);assert_eq!(executor.executed(),0);
+    assert_eq!(transitions.claims.lock().await.len(),1);
+}

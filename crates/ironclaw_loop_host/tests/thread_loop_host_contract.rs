@@ -212,6 +212,9 @@ async fn model_port_empty_request_applies_prompt_token_budget_to_context_fallbac
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].messages.len(), 1);
     assert_eq!(calls[0].messages[0].content, "latest short");
+    // CH-HOST-01: the existing authenticated/prompt-authorized port supplies the real thread.
+    assert_eq!(serde_json::to_value(&calls[0]).unwrap()["thread_id"],
+        fixture.run_context.thread_id.to_string());
 }
 
 #[tokio::test]

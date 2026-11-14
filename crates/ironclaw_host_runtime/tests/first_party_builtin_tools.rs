@@ -9785,6 +9785,7 @@ fn network_denied_policy() -> EffectiveRuntimePolicy {
 
 fn http_test_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "api.example.test".to_string(),
@@ -9797,6 +9798,7 @@ fn http_test_policy() -> NetworkPolicy {
 
 fn shell_test_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: None,
             host_pattern: "*".to_string(),

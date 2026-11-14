@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AcceptedMessageRef, GateRef, IdempotencyKey, ProductTurnContext, ReplyTargetBindingRef,
-    RunProfileRequest, SanitizedCancelReason, SourceBindingRef, TurnActor, TurnRunId, TurnScope,
-    TurnStatus,
+    RunProfileRequest, SanitizedCancelReason, SourceBindingRef, TurnActor, TurnCheckpointId,
+    TurnRunId, TurnScope, TurnStatus,
 };
 
 pub type TurnTimestamp = DateTime<Utc>;
@@ -133,6 +133,20 @@ pub struct ResumeTurnRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub resume_disposition: Option<GateResumeDisposition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoverTurnRequest {
+    pub scope: TurnScope,
+    pub actor: TurnActor,
+    pub run_id: TurnRunId,
+    pub expected_checkpoint_id: TurnCheckpointId,
+    pub expected_failure_category: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_binding_child_run_id: Option<TurnRunId>,
+    pub source_binding_ref: SourceBindingRef,
+    pub reply_target_binding_ref: ReplyTargetBindingRef,
+    pub idempotency_key: IdempotencyKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

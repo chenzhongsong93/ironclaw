@@ -9,6 +9,12 @@
 //! `AgentLoopDriverHost`, and the `sanitized_failure`/`sanitized_driver_failure`
 //! helpers that are shared across the executor and composition layers.
 
+mod host_creation_diagnostic;
+
+pub use host_creation_diagnostic::{
+    HostCreationDiagnostic, HostCreationFailure, HostCreationStage,
+};
+
 use async_trait::async_trait;
 use tracing::{debug, error};
 
@@ -89,6 +95,20 @@ pub trait HostFactory: Send + Sync {
         Box<dyn ironclaw_turns::run_profile::AgentLoopDriverHost + Send + Sync>,
         HostFactoryError,
     >;
+
+    /// Construct once, optionally carrying a closed, host-owned diagnostic.
+    /// Existing implementations retain their original single-call behavior.
+    async fn create_host_with_diagnostics(
+        &self,
+        claimed: &ClaimedTurnRun,
+    ) -> Result<
+        Box<dyn ironclaw_turns::run_profile::AgentLoopDriverHost + Send + Sync>,
+        HostCreationFailure,
+    > {
+        self.create_host(claimed)
+            .await
+            .map_err(HostCreationFailure::without_diagnostic)
+    }
 }
 
 /// Error returned when host construction fails.

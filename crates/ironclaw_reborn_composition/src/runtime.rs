@@ -489,12 +489,46 @@ mod auth_interaction_tests;
 #[path = "runtime/tests/default_system_prompt.rs"]
 mod default_system_prompt_tests;
 mod latency;
-mod local_dev;
+pub(crate) mod local_dev;
 #[cfg(test)]
 #[path = "runtime/tests/outbound_delivery.rs"]
 mod outbound_delivery_tests;
 mod production;
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+pub(crate) fn production_context_sources(
+    filesystem: Arc<dyn ironclaw_filesystem::RootFilesystem>,
+    identity_root: std::path::PathBuf,
+    identity_path: std::path::PathBuf,
+    disclosure_protocol_active: bool,
+) -> Result<crate::RebornProductionContextSources, RebornRuntimeError> {
+    let identity = DefaultSystemPromptIdentitySource::try_new(
+        identity_root, identity_path, disclosure_protocol_active,
+    ).map_err(|_| RebornRuntimeError::InvalidArgument {
+        reason: "Production identity source is unavailable".into(),
+    })?;
+    Ok(crate::RebornProductionContextSources {
+        identity: Arc::new(identity),
+        user_profile: Arc::new(MemoryBackedUserProfileSourceAdapter(
+            MemoryBackedUserProfileSource::new(filesystem),
+        )),
+    })
+}
+
+pub(crate) fn production_staged_capability_io(
+    threads: Arc<dyn SessionThreadService>,
+    owner: UserId,
+) -> (
+    Arc<dyn LoopCapabilityInputResolver>,
+    Arc<dyn LoopCapabilityResultWriter>,
+) {
+    local_dev::production_staged_capability_io(threads, owner)
+}
+
 mod runtime_turn_scheduler;
+mod resident_protocol;
+mod late_admission;
+pub use resident_protocol::{RebornRequesterRuntimeProtocolSnapshot,RebornResidentWorkerState};
 mod skills;
 #[cfg(feature = "test-support")]
 #[path = "runtime/test_support.rs"]
@@ -649,6 +683,11 @@ pub struct RebornRuntime {
     thread_scope: ThreadScope,
     turn_scheduler: RuntimeTurnScheduler,
     trigger_poller_handle: Option<TriggerPollerRuntimeHandle>,
+    trigger_poller_configured: bool,
+    runtime_instance_id: uuid::Uuid,
+    startup_execution:Arc<ironclaw_runner::startup_execution::StartupExecutionLatch>,
+    #[cfg(test)] late_admission_fixture: Option<late_admission::LateAdmissionPorts>,
+    resident_shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(any(feature = "libsql", feature = "postgres"))]
     credential_refresh_worker_handle:
         Option<crate::product_auth::credentials::credential_refresh_worker::CredentialRefreshWorkerRuntimeHandle>,
@@ -688,8 +727,8 @@ pub struct RebornRuntime {
     webui_event_log: Arc<dyn DurableEventLog>,
     default_run_profile_id: String,
     send_locks: Mutex<HashMap<ConversationId, Arc<Mutex<()>>>>,
-    skill_activation_source: Option<Arc<ComposedSelectableSkillContextSource>>,
-    skill_execution_adapter: Option<Arc<ComposedSkillExecutionAdapter>>,
+    skill_activation_source: Option<shared_skill_binding::RuntimeSkillSelector>,
+    skill_execution_adapter: Option<shared_skill_binding::RuntimeSkillExecutor>,
     /// Operator boot config, carried so the WebUI facade can compose the
     /// LLM-config settings service over `providers.json` / `config.toml`.
     boot: Option<ironclaw_reborn_config::RebornBootConfig>,
@@ -808,6 +847,10 @@ pub(crate) fn build_approval_interaction_service_with_turn_run_source(
         .with_tool_permission_override_store(local_runtime.tool_permission_overrides.clone()),
     ))
 }
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+pub(crate) mod production_dynamic_capability;
+pub(crate) mod shared_skill_binding;
 
 pub(crate) type ComposedSelectableSkillContextSource =
     SelectableSkillContextSource<FilesystemSkillBundleSource<CompositeRootFilesystem>>;
@@ -1386,6 +1429,76 @@ where
 }
 
 impl RebornRuntime {
+    /// Safe, read-only observation of this validated runtime, not a process/build qualification certificate.
+    /// Root joins fresh serialized bytes with its original holder/build identity; no caller sets fields.
+    pub fn requester_runtime_protocol_snapshot(&self)->RebornRequesterRuntimeProtocolSnapshot {
+        use std::sync::atomic::Ordering;
+        let shutdown_before=self.resident_shutdown_requested.load(Ordering::Acquire);
+        let turn_runner=self.turn_scheduler.resident_state();
+        let trigger_poller=match (&self.trigger_poller_handle,self.trigger_poller_configured) {
+            (None,false)=>RebornResidentWorkerState::NotConfigured,
+            (None,true)=>RebornResidentWorkerState::Missing,
+            (Some(handle),_)=>handle.resident_state(),
+        };
+        let shutdown_requested=shutdown_before||self.resident_shutdown_requested.load(Ordering::Acquire);
+        RebornRequesterRuntimeProtocolSnapshot::from_runtime_observation(
+            self.thread_scope.tenant_id.clone(),self.runtime_instance_id.to_string(),&self.services.readiness,turn_runner,trigger_poller,self.trigger_poller_configured,shutdown_requested).with_execution_pending(self.startup_execution.pending())
+    }
+
+    /// Emit only a bounded raw resident observation, not process identity or an authority token.
+    pub fn write_requester_runtime_protocol_frame(&self,output:&mut impl std::io::Write)->Result<(),&'static str> {
+        resident_protocol::write_frame(&self.requester_runtime_protocol_snapshot(),output)
+    }
+
+    fn resident_admission_observer(&self)->Arc<dyn Fn()->bool+Send+Sync> {
+        let metadata=self.services.readiness.clone();let tenant=self.thread_scope.tenant_id.clone();let instance=self.runtime_instance_id.to_string();
+        let scheduler=self.turn_scheduler.resident_observer();let trigger=self.trigger_poller_handle.as_ref().map(|h|h.resident_observer());
+        let configured=self.trigger_poller_configured;let stopped=self.resident_shutdown_requested.clone();
+        // This production observer never reads the admission store or invokes model/caller callbacks.
+        Arc::new(move|| {
+            let shutdown=stopped.load(std::sync::atomic::Ordering::Acquire);
+            let trigger_state=trigger.as_ref().map_or(if configured{RebornResidentWorkerState::Missing}else{RebornResidentWorkerState::NotConfigured},|observe|observe());
+            RebornRequesterRuntimeProtocolSnapshot::from_runtime_observation(tenant.clone(),instance.clone(),&metadata,scheduler(),trigger_state,configured,shutdown).ready()
+        })
+    }
+    fn bind_normal_operator_runtime(&self)->Result<(),RebornRuntimeError> {
+        #[cfg(any(feature="libsql",feature="postgres"))]
+        if let Some(graph)=self.services.production_runtime.as_ref() {
+            if self.services.local_runtime.as_ref().and_then(|runtime|runtime.operator_admission.as_ref()).is_some() {
+                return Err(RebornRuntimeError::InvalidArgument {reason:"sameRuntimeAdmissionAuthorityAmbiguous".into()});
+            }
+            graph.operator_admission().bind_runtime(&self.runtime_instance_id.to_string(),self.resident_admission_observer())
+                .map_err(|_|RebornRuntimeError::InvalidArgument {reason:"sameRuntimeAdmissionInitializationFailed".into()})?;
+            return Ok(());
+        }
+        if let Some(store)=self.services.local_runtime.as_ref().and_then(|runtime|runtime.operator_admission.as_ref()) {
+            store.bind_runtime(&self.runtime_instance_id.to_string(),self.resident_admission_observer())
+                .map_err(|_|RebornRuntimeError::InvalidArgument {reason:"sameRuntimeAdmissionInitializationFailed".into()})?;
+        }
+        Ok(())
+    }
+    /// Trusted startup SDK only; never registered as a model/MCP tool or ordinary HTTP DTO.
+    /// Consume Root-pinned validated bundle after ORIGINAL same-process capture, without replacing runtime/backend.
+    pub async fn admit_startup_host_extension_bundle(&self,bundle:crate::RebornHostExtensionBundle)->Result<Vec<ironclaw_product_workflow::LifecycleProductResponse>,RebornRuntimeError> {
+        if self.startup_execution.pending(){return Err(RebornRuntimeError::InvalidArgument {reason:"startupAdmissionOriginalDeadlineRequired".into()});}
+        self.admit_root_bundle_inner(bundle).await
+    }
+    /// Trusted startup SDK: uses the existing host stopAt, never a renewed duration/budget.
+    pub async fn admit_startup_host_extension_bundle_before(&self,bundle:crate::RebornHostExtensionBundle,original_stop_at:tokio::time::Instant)->Result<Vec<ironclaw_product_workflow::LifecycleProductResponse>,RebornRuntimeError> {
+        if tokio::time::Instant::now()>=original_stop_at {self.request_private_startup_admission_stop();return Err(RebornRuntimeError::InvalidArgument {reason:"startupAdmissionOriginalDeadlineExpired".into()});}
+        let responses=self.admit_root_bundle_inner(bundle).await?;
+        if !self.requester_runtime_protocol_snapshot().ready()||self.resident_shutdown_requested.load(std::sync::atomic::Ordering::SeqCst)||!self.startup_execution.release_before(original_stop_at) {
+            self.request_private_startup_admission_stop();
+            return Err(RebornRuntimeError::InvalidArgument {reason:"startupAdmissionStoppedOrExpired".into()});
+        }
+        Ok(responses)
+    }
+
+    /// Trusted bootstrap cancellation only: reduces authority and never opens the execution gate.
+    pub fn request_private_startup_admission_stop(&self) {
+        self.resident_shutdown_requested.store(true,std::sync::atomic::Ordering::Release);
+        self.startup_execution.stop();
+    }
     /// Snapshot of the substrate facades produced by `build_reborn_services`.
     /// Exposed for diagnostics / readiness reporting; **not** for traffic.
     pub fn services(&self) -> &RebornServices {
@@ -1554,9 +1667,9 @@ impl RebornRuntime {
     /// `tenant_id`. Rides the same `reborn-local-dev.db` handle the runtime
     /// already owns rather than opening a second handle to that file (the
     /// host filesystem abstraction owns the substrate, not the caller).
-    /// Returns `None` when the runtime was built without a local-runtime
-    /// substrate, so callers fail closed instead of synthesizing a second
-    /// identity store outside the host-owned substrate.
+    /// Opens the host-owned identity store. Production uses the same typed
+    /// store as the admin directory; local keeps its existing legacy fold.
+    /// Missing both substrates stays unavailable.
     pub async fn open_reborn_identity_resolver(
         &self,
         tenant_id: &TenantId,
@@ -1566,7 +1679,16 @@ impl RebornRuntime {
             ironclaw_reborn_identity::RebornIdentityError,
         >,
     > {
-        let local = self.services.local_runtime.as_ref()?;
+        let Some(local) = self.services.local_runtime.as_ref() else {
+            #[cfg(any(feature = "libsql", feature = "postgres"))]
+            if let Some(production) = self.services.production_runtime.as_ref() {
+                if tenant_id != &self.thread_scope.tenant_id {
+                    return None;
+                }
+                return Some(Ok(production.identity_resolver()));
+            }
+            return None;
+        };
         // Build the store on the host scoped filesystem (same substrate
         // boundary as every other durable store), scoped by the runtime-owner
         // caller identity. Data is partitioned by tenant in the record path.
@@ -1599,13 +1721,19 @@ impl RebornRuntime {
     /// substrate. Same store [`open_reborn_identity_resolver`] uses
     /// (`FilesystemRebornIdentityStore` implements both traits), so admin CRUD
     /// enumerates exactly the users SSO login persists. `None` when the runtime
-    /// has no local-runtime substrate (fail closed). Synchronous and fold-free
+    /// has neither substrate (fail closed). Synchronous and fold-free
     /// (the legacy fold seeds identity/index records, not `StoredUser` rows the
     /// directory reads), so `build_webui_services` can call it directly.
     pub(crate) fn reborn_user_directory(
         &self,
     ) -> Option<Arc<dyn ironclaw_reborn_identity::RebornUserDirectory>> {
-        let local = self.services.local_runtime.as_ref()?;
+        let Some(local) = self.services.local_runtime.as_ref() else {
+            #[cfg(any(feature = "libsql", feature = "postgres"))]
+            if let Some(production) = self.services.production_runtime.as_ref() {
+                return Some(production.user_directory());
+            }
+            return None;
+        };
         let store = ironclaw_reborn_identity::FilesystemRebornIdentityStore::new(
             Arc::clone(&local.identity_filesystem),
             self.thread_scope.tenant_id.clone(),
@@ -1622,11 +1750,14 @@ impl RebornRuntime {
     pub(crate) fn reborn_admin_secret_provisioner(
         &self,
     ) -> Option<Arc<dyn crate::admin_secrets::AdminSecretProvisioner>> {
-        self.services
-            .local_runtime
-            .as_ref()?
-            .admin_secret_provisioner
-            .clone()
+        if let Some(local) = self.services.local_runtime.as_ref() {
+            return local.admin_secret_provisioner.clone();
+        }
+        #[cfg(any(feature = "libsql", feature = "postgres"))]
+        if let Some(production) = self.services.production_runtime.as_ref() {
+            return Some(production.admin_secret_provisioner());
+        }
+        None
     }
 
     /// The admin API-token minter supplied via
@@ -1874,10 +2005,19 @@ impl RebornRuntime {
         self.approval_audit_sink.clone()
     }
 
+    pub(crate) fn webui_skill_activation_binding(
+        &self,
+    ) -> Option<shared_skill_binding::RuntimeSkillSelector> {
+        self.skill_activation_source.clone()
+    }
+
     pub(crate) fn webui_skill_activation_source(
         &self,
     ) -> Option<Arc<ComposedSelectableSkillContextSource>> {
-        self.skill_activation_source.clone()
+        match self.skill_activation_source.as_ref() {
+            Some(shared_skill_binding::RuntimeSkillSelector::Local(v)) => Some(v.clone()),
+            _ => None,
+        }
     }
 
     /// Read-write project-scoped workspace filesystem for landing inbound
@@ -2559,6 +2699,7 @@ impl RebornRuntime {
     /// Awaits both tasks before returning so background state is fully
     /// drained when the runtime drops.
     pub async fn shutdown(self) -> Result<(), RebornRuntimeError> {
+        self.resident_shutdown_requested.store(true,std::sync::atomic::Ordering::Release);
         if let Some(trigger_poller) = self.trigger_poller_handle {
             trigger_poller
                 .shutdown(TRIGGER_POLLER_SHUTDOWN_TIMEOUT)
@@ -2616,14 +2757,13 @@ impl RebornRuntime {
 
     fn skill_execution_plan_for_run(
         &self,
-        adapter: &SkillExecutionAdapter<FilesystemSkillBundleSource<CompositeRootFilesystem>>,
+        adapter: &shared_skill_binding::RuntimeSkillExecutor,
         scope: &TurnScope,
         run_id: TurnRunId,
     ) -> Result<RebornSkillExecutionPlan, RebornRuntimeError> {
         adapter
             .take_execution_plan_for_run(scope, run_id)
             .map_err(|error| RebornRuntimeError::SkillExecution(error.to_string()))?
-            .map(RebornSkillExecutionPlan::from_first_party)
             .ok_or_else(|| {
                 RebornRuntimeError::SkillExecution("skill activation plan unavailable".to_string())
             })
@@ -3101,6 +3241,135 @@ impl RebornRuntime {
 pub async fn build_reborn_runtime(
     input: RebornRuntimeInput,
 ) -> Result<RebornRuntime, RebornRuntimeError> {
+    build_reborn_runtime_with_opaque_input_backend(input, None).await
+}
+
+// Fixed assembly-only diagnostics: no configuration, path or error values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RebornStartupStage {
+    NearAiConfigBegin,
+    NearAiConfigReady,
+    ServicesBegin,
+    ServicesReady,
+    SecretKeyBegin,
+    SecretKeyReady,
+    PostgresFsMigrateBegin,
+    PostgresFsMigrateReady,
+    PostgresTriggerMigrateBegin,
+    PostgresTriggerMigrateReady,
+    GovernorWarmBegin,
+    GovernorWarmReady,
+    EventStoresBegin,
+    EventStoresReady,
+    CatalogLoadBegin,
+    CatalogLoadReady,
+    InstallationLoadBegin,
+    InstallationLoadReady,
+    CatalogRestoreBegin,
+    CatalogRestoreReady,
+    NearAiStoredKeyBegin,
+    NearAiStoredKeyReady,
+    NearAiBootstrapBegin,
+    NearAiBootstrapReady,
+    SkillLearningBegin,
+    SkillLearningReturned,
+    ModelGatewayBegin,
+    ModelGatewayReady,
+    SurfaceBegin,
+    SurfaceReady,
+    OpaqueInitBegin,
+    OpaqueInitReady,
+    PlannedProfileBegin,
+    PlannedProfileReady,
+    BootReloadBegin,
+    BootReloadReturned,
+    BootReloadSucceeded,
+    BootReloadFailed,
+    LlmReloadConfigReadFailed,
+    LlmReloadSelectionFailed,
+    LlmReloadCredentialReadFailed,
+    LlmReloadDefaultBuildFailed,
+    LlmReloadNoSelection,
+    RuntimeReady,
+}
+impl RebornStartupStage {
+    fn marker(self) -> &'static [u8] {
+        match self {
+            Self::NearAiConfigBegin => b"RebornStartupStage:nearAiConfigBegin\n",
+            Self::NearAiConfigReady => b"RebornStartupStage:nearAiConfigReady\n",
+            Self::ServicesBegin => b"RebornStartupStage:servicesBegin\n",
+            Self::ServicesReady => b"RebornStartupStage:servicesReady\n",
+            Self::SecretKeyBegin => b"RebornStartupStage:secretKeyBegin\n",
+            Self::SecretKeyReady => b"RebornStartupStage:secretKeyReady\n",
+            Self::PostgresFsMigrateBegin => b"RebornStartupStage:postgresFsMigrateBegin\n",
+            Self::PostgresFsMigrateReady => b"RebornStartupStage:postgresFsMigrateReady\n",
+            Self::PostgresTriggerMigrateBegin => b"RebornStartupStage:postgresTriggerMigrateBegin\n",
+            Self::PostgresTriggerMigrateReady => b"RebornStartupStage:postgresTriggerMigrateReady\n",
+            Self::GovernorWarmBegin => b"RebornStartupStage:governorWarmBegin\n",
+            Self::GovernorWarmReady => b"RebornStartupStage:governorWarmReady\n",
+            Self::EventStoresBegin => b"RebornStartupStage:eventStoresBegin\n",
+            Self::EventStoresReady => b"RebornStartupStage:eventStoresReady\n",
+            Self::CatalogLoadBegin => b"RebornStartupStage:catalogLoadBegin\n",
+            Self::CatalogLoadReady => b"RebornStartupStage:catalogLoadReady\n",
+            Self::InstallationLoadBegin => b"RebornStartupStage:installationLoadBegin\n",
+            Self::InstallationLoadReady => b"RebornStartupStage:installationLoadReady\n",
+            Self::CatalogRestoreBegin => b"RebornStartupStage:catalogRestoreBegin\n",
+            Self::CatalogRestoreReady => b"RebornStartupStage:catalogRestoreReady\n",
+            Self::NearAiStoredKeyBegin => b"RebornStartupStage:nearAiStoredKeyBegin\n",
+            Self::NearAiStoredKeyReady => b"RebornStartupStage:nearAiStoredKeyReady\n",
+            Self::NearAiBootstrapBegin => b"RebornStartupStage:nearAiBootstrapBegin\n",
+            Self::NearAiBootstrapReady => b"RebornStartupStage:nearAiBootstrapReady\n",
+            Self::SkillLearningBegin => b"RebornStartupStage:skillLearningBegin\n",
+            Self::SkillLearningReturned => b"RebornStartupStage:skillLearningReturned\n",
+            Self::ModelGatewayBegin => b"RebornStartupStage:modelGatewayBegin\n",
+            Self::ModelGatewayReady => b"RebornStartupStage:modelGatewayReady\n",
+            Self::SurfaceBegin => b"RebornStartupStage:surfaceBegin\n",
+            Self::SurfaceReady => b"RebornStartupStage:surfaceReady\n",
+            Self::OpaqueInitBegin => b"RebornStartupStage:opaqueInitBegin\n",
+            Self::OpaqueInitReady => b"RebornStartupStage:opaqueInitReady\n",
+            Self::PlannedProfileBegin => b"RebornStartupStage:plannedProfileBegin\n",
+            Self::PlannedProfileReady => b"RebornStartupStage:plannedProfileReady\n",
+            Self::BootReloadBegin => b"RebornStartupStage:bootReloadBegin\n",
+            Self::BootReloadReturned => b"RebornStartupStage:bootReloadReturned\n",
+            Self::BootReloadSucceeded => b"RebornStartupStage:bootReloadSucceeded\n",
+            Self::BootReloadFailed => b"RebornStartupStage:bootReloadFailed\n",
+            Self::LlmReloadConfigReadFailed => b"RebornStartupStage:llmReloadConfigReadFailed\n",
+            Self::LlmReloadSelectionFailed => b"RebornStartupStage:llmReloadSelectionFailed\n",
+            Self::LlmReloadCredentialReadFailed => b"RebornStartupStage:llmReloadCredentialReadFailed\n",
+            Self::LlmReloadDefaultBuildFailed => b"RebornStartupStage:llmReloadDefaultBuildFailed\n",
+            Self::LlmReloadNoSelection => b"RebornStartupStage:llmReloadNoSelection\n",
+            Self::RuntimeReady => b"RebornStartupStage:runtimeReady\n",
+        }
+    }
+}
+pub(crate) fn reborn_startup_stage(stage: RebornStartupStage) {
+    // Existing host stderr pipe; ignore write errors without changing the build Result.
+    let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), stage.marker());
+}
+
+/// 泛用宿主来源注入；领域资产及签名/持久化实现由消费方提供。
+/// 原入口保持None，不从模型、HTTP DTO或环境文本构造trusted材料。
+pub async fn build_reborn_runtime_with_opaque_input_backend(
+    input: RebornRuntimeInput,
+    opaque_input_backend: Option<Arc<dyn ironclaw_loop_host::OpaquePromptInputBackend>>,
+) -> Result<RebornRuntime, RebornRuntimeError> {
+    build_reborn_runtime_with_host_inputs(input, opaque_input_backend, None).await
+}
+
+/// Install an in-process product driver in the same runtime used by the gateway.
+pub async fn build_reborn_runtime_with_product_driver(
+    input: RebornRuntimeInput,
+    opaque_input_backend: Arc<dyn ironclaw_loop_host::OpaquePromptInputBackend>,
+    driver: ironclaw_runner::runtime::ProductRunDriver,
+) -> Result<RebornRuntime, RebornRuntimeError> {
+    build_reborn_runtime_with_host_inputs(input, Some(opaque_input_backend), Some(driver)).await
+}
+
+async fn build_reborn_runtime_with_host_inputs(
+    input: RebornRuntimeInput,
+    opaque_input_backend: Option<Arc<dyn ironclaw_loop_host::OpaquePromptInputBackend>>,
+    product_driver: Option<ironclaw_runner::runtime::ProductRunDriver>,
+) -> Result<RebornRuntime, RebornRuntimeError> {
     let RebornRuntimeInput {
         services: services_input,
         llm,
@@ -3115,6 +3384,8 @@ pub async fn build_reborn_runtime(
         default_project_id,
         regex_skill_activation_enabled,
         skill_context_source: configured_skill_context_source,
+        runtime_skill_bundle: configured_runtime_skill_bundle,
+        production_execution_surface_factory,
         hooks: hooks_config,
         budget_defaults,
         budget_event_observer,
@@ -3133,6 +3404,7 @@ pub async fn build_reborn_runtime(
     })?;
 
     let profile = services_input.profile();
+    let startup_execution=if services_input.private_startup_admission_hold {ironclaw_runner::startup_execution::StartupExecutionLatch::closed()} else {ironclaw_runner::startup_execution::StartupExecutionLatch::open()};
     // The deployment this build assembles, as data (§4.4/§5.6). Every axis
     // below — live-traffic admission, the cutover gate, substrate selection —
     // reads a field on this value instead of re-matching the profile.
@@ -3161,12 +3433,16 @@ pub async fn build_reborn_runtime(
     let mut has_nearai_mcp_bootstrap_config = services_input.has_nearai_mcp_bootstrap_config();
     if !has_nearai_mcp_bootstrap_config
         && let Some(llm) = llm.as_ref()
-        && let Some(config) =
-            crate::llm_admin::nearai_mcp::nearai_mcp_bootstrap_config_from_llm_config(&llm.config)
+        && let Some(config) = {
+            reborn_startup_stage(RebornStartupStage::NearAiConfigBegin);
+            let config = crate::llm_admin::nearai_mcp::nearai_mcp_bootstrap_config_from_llm_config(&llm.config)
                 .await
                 .map_err(|error| RebornRuntimeError::InvalidArgument {
                     reason: format!("NEAR AI MCP bootstrap config: {error}"),
-                })?
+                })?;
+            reborn_startup_stage(RebornStartupStage::NearAiConfigReady);
+            config
+        }
     {
         services_input = services_input.with_nearai_mcp_bootstrap_config(config);
         has_nearai_mcp_bootstrap_config = true;
@@ -3196,20 +3472,26 @@ pub async fn build_reborn_runtime(
         thread_id: None,
         invocation_id: InvocationId::new(),
     };
+    reborn_startup_stage(RebornStartupStage::ServicesBegin);
     let mut services = build_reborn_services(services_input).await?;
+    reborn_startup_stage(RebornStartupStage::ServicesReady);
     // The stored key no longer feeds the model gateway here (see the
     // post-construction reload below); the NEAR AI MCP bootstrap check is a
     // separate consumer that inspects `llm.config.nearai.api_key` directly,
     // so it still needs the key overlaid onto a local clone.
     if !has_nearai_mcp_bootstrap_config {
+        reborn_startup_stage(RebornStartupStage::NearAiStoredKeyBegin);
         let llm_for_mcp_bootstrap =
             overlay_stored_llm_key_for_nearai_mcp_bootstrap(llm.clone(), &services).await?;
+        reborn_startup_stage(RebornStartupStage::NearAiStoredKeyReady);
+        reborn_startup_stage(RebornStartupStage::NearAiBootstrapBegin);
         bootstrap_nearai_mcp_from_effective_llm(
             &services,
             llm_for_mcp_bootstrap.as_ref(),
             nearai_mcp_owner_scope,
         )
         .await?;
+        reborn_startup_stage(RebornStartupStage::NearAiBootstrapReady);
     }
     enforce_runtime_cutover_gate(&deployment, &services.readiness)?;
 
@@ -3298,6 +3580,36 @@ pub async fn build_reborn_runtime(
         subagent_await_edge_evidence,
         trigger_repository: _trigger_repository,
     } = runtime_parts;
+    // A normal injected Production surface uses the native skill files installed
+    // through the normal facade. Preserve an explicit complete caller bundle.
+    let configured_runtime_skill_bundle = if configured_runtime_skill_bundle.is_none()
+        && production_execution_surface_factory.is_some()
+    {
+        #[cfg(any(feature = "libsql", feature = "postgres"))]
+        {
+            let graph = services.production_runtime.as_ref().ok_or(RebornRuntimeError::HostRuntimeUnavailable)?;
+            let binding = graph.normal_capability_binding().map_err(|_| RebornRuntimeError::InvalidArgument {
+                reason: "Production normal skill binding is unavailable".into(),
+            })?;
+            Some(crate::RebornRuntimeSkillBundle::new(
+                binding.skill_source,
+                local_dev_selector_config(regex_skill_activation_enabled, skill_injection_mode_env()?),
+            ))
+        }
+        #[cfg(not(any(feature = "libsql", feature = "postgres")))]
+        { return Err(RebornRuntimeError::HostRuntimeUnavailable); }
+    } else { configured_runtime_skill_bundle };
+    if configured_runtime_skill_bundle.is_some()
+        && (configured_skill_context_source.is_some()
+            || local_runtime.is_some()
+            || production_execution_surface_factory.is_none())
+    {
+        return Err(RebornRuntimeError::InvalidArgument {
+            reason:
+                "complete skills require paired Production surface, not local/context-only override"
+                    .into(),
+        });
+    }
     let (skill_context_source, skill_activation_source, skill_execution_adapter) =
         match (configured_skill_context_source, local_runtime) {
             (Some(source), _) => (Some(source), None, None),
@@ -3332,6 +3644,25 @@ pub async fn build_reborn_runtime(
             (None, None) => (None, None, None),
         };
 
+    let (skill_context_source, skill_activation_source, skill_execution_adapter) =
+        if let Some(bundle) = configured_runtime_skill_bundle {
+            (
+                Some(bundle.context_source()),
+                Some(shared_skill_binding::RuntimeSkillSelector::Production(
+                    bundle.activation_source(),
+                )),
+                Some(shared_skill_binding::RuntimeSkillExecutor::Production(
+                    bundle.execution(),
+                )),
+            )
+        } else {
+            (
+                skill_context_source,
+                skill_activation_source.map(shared_skill_binding::RuntimeSkillSelector::Local),
+                skill_execution_adapter.map(shared_skill_binding::RuntimeSkillExecutor::Local),
+            )
+        };
+
     let tenant_id = validated_identity.tenant_id.clone();
     let agent_id = validated_identity.agent_id.clone();
     let thread_scope = ThreadScope {
@@ -3353,10 +3684,12 @@ pub async fn build_reborn_runtime(
     // (IRONCLAW_SKILL_LEARNING_MODEL), reusing the run's NEAR AI credentials
     // with only the model overridden. `llm` no longer feeds the model gateway
     // build below (see `build_production_model_gateway`).
+    reborn_startup_stage(RebornStartupStage::SkillLearningBegin);
     let skill_learning_provider = match llm.as_ref() {
         Some(resolved) => build_skill_learning_provider(&resolved.config).await,
         None => None,
     };
+    reborn_startup_stage(RebornStartupStage::SkillLearningReturned);
     // Caller instrumentation seam (e.g. a benchmark harness layering
     // token/reasoning capture): carry the resolved LLM's provider factory into
     // the cold-boot gateway so the wrapper wraps the swappable and stays in the
@@ -3411,6 +3744,7 @@ pub async fn build_reborn_runtime(
             }
         }
     });
+    reborn_startup_stage(RebornStartupStage::ModelGatewayBegin);
     #[cfg(any(test, feature = "test-support"))]
     let (model_gateway, llm_cost_table, llm_reload) = match model_gateway_override {
         Some(override_gateway) => (override_gateway, None, None),
@@ -3419,6 +3753,7 @@ pub async fn build_reborn_runtime(
     #[cfg(not(any(test, feature = "test-support")))]
     let (model_gateway, llm_cost_table, llm_reload) =
         build_production_model_gateway(boot_provider_factory, mission_model).await?;
+    reborn_startup_stage(RebornStartupStage::ModelGatewayReady);
 
     // Resolved cost table is either: the LLM-policy-derived table (real
     // LLM wired), a test override (so tests can drive deterministic
@@ -3540,7 +3875,8 @@ pub async fn build_reborn_runtime(
             reason: error.to_string(),
         })?;
     let durable_milestone_sink: Arc<dyn LoopHostMilestoneSink> = Arc::new(
-        DurableLoopHostMilestoneSink::new(Arc::clone(&event_log), milestone_scope),
+        DurableLoopHostMilestoneSink::new(Arc::clone(&event_log), milestone_scope)
+            .with_run_project_scope(),
     );
     if trusted_laptop_access {
         append_trusted_laptop_access_audit(&audit_log, &thread_scope, &actor_user_id).await?;
@@ -3589,6 +3925,68 @@ pub async fn build_reborn_runtime(
         durable_milestone_sink,
         live_projection_publisher,
     );
+    // Resolve the disclosure mode once so the runtime config and the system-prompt
+    // disclosure-protocol injection agree on a single value.
+    let resolved_tool_disclosure = tool_disclosure.unwrap_or_else(ToolDisclosureMode::from_env);
+
+    // 首片只接受当前Production graph同实例装配；local原路径保持原实现。
+    let injected_production_surface = if let Some(factory) = production_execution_surface_factory {
+        if local_runtime.is_some() {
+            return Err(RebornRuntimeError::InvalidArgument {
+                reason: "production execution surface cannot override local runtime".into(),
+            });
+        }
+        #[cfg(any(feature = "libsql", feature = "postgres"))]
+        {
+            let graph = services
+                .production_runtime
+                .as_ref()
+                .ok_or(RebornRuntimeError::HostRuntimeUnavailable)?;
+            let (gate_record_store, replay_payload_store) = graph.execution_surface_stores();
+            let context = crate::RebornProductionSurfaceContext {
+                host_runtime: services
+                    .host_runtime
+                    .clone()
+                    .ok_or(RebornRuntimeError::HostRuntimeUnavailable)?,
+                thread_service: thread_service.clone(),
+                base_scope: ResourceScope {
+                    tenant_id: validated_identity.tenant_id.clone(),
+                    user_id: actor_user_id.clone(),
+                    agent_id: Some(validated_identity.agent_id.clone()),
+                    project_id: thread_scope.project_id.clone(),
+                    mission_id: None,
+                    thread_id: None,
+                    invocation_id: InvocationId::new(),
+                },
+                gate_record_store,
+                replay_payload_store,
+                normal_milestones: milestone_sink.clone(),
+                disclosure_protocol_active: resolved_tool_disclosure.is_bridged(),
+                normal_binding: graph.normal_capability_binding().map_err(|e| {
+                    RebornRuntimeError::InvalidArgument {
+                        reason: e.to_string(),
+                    }
+                })?,
+                skill_selector: skill_activation_source.clone(),
+                trajectory_observer: trajectory_observer.clone(),
+                outbound_preferences_facade: outbound_preferences_facade.clone(),
+                provider_input_store: Arc::new(std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
+            };
+            reborn_startup_stage(RebornStartupStage::SurfaceBegin);
+            let surface = factory.assemble(context).await?;
+            reborn_startup_stage(RebornStartupStage::SurfaceReady);
+            Some(surface)
+        }
+        #[cfg(not(any(feature = "libsql", feature = "postgres")))]
+        {
+            return Err(RebornRuntimeError::HostRuntimeUnavailable);
+        }
+    } else {
+        None
+    };
+
     let (
         capability_factory,
         capability_input_resolver,
@@ -3597,7 +3995,21 @@ pub async fn build_reborn_runtime(
         model_gateway,
         builtin_capability_policy,
         display_previews,
-    ) = if local_runtime.is_some() {
+    ) = if let Some(surface) = injected_production_surface.as_ref() {
+        (
+            surface.capability_factory.clone(),
+            surface.input_resolver.clone(),
+            surface.result_writer.clone(),
+            Arc::new(
+                crate::production_execution_surface::BoundedProductionSurfaceResolver::new(
+                    surface.scope_resolver.clone(),
+                ),
+            ) as Arc<dyn CapabilitySurfaceProfileResolver>,
+            model_gateway,
+            None,
+            None,
+        )
+    } else if local_runtime.is_some() {
         let builtin_capability_policy = Arc::new(builtin_capability_policy().map_err(|error| {
             tracing::error!(%error, "local-dev capability policy is invalid");
             RebornRuntimeError::InvalidArgument {
@@ -3611,7 +4023,10 @@ pub async fn build_reborn_runtime(
             Arc::clone(&builtin_capability_policy),
             model_gateway,
             milestone_sink.clone(),
-            skill_activation_source.clone(),
+            skill_activation_source.as_ref().and_then(|v| match v {
+                shared_skill_binding::RuntimeSkillSelector::Local(s) => Some(s.clone()),
+                _ => None,
+            }),
             outbound_preferences_facade.clone(),
             trajectory_observer,
         )
@@ -3801,9 +4216,6 @@ pub async fn build_reborn_runtime(
         _ => None,
     };
 
-    // Resolve the disclosure mode once so the runtime config and the system-prompt
-    // disclosure-protocol injection agree on a single value.
-    let resolved_tool_disclosure = tool_disclosure.unwrap_or_else(ToolDisclosureMode::from_env);
     let default_runtime_config = DefaultPlannedRuntimeConfig::default();
 
     // Deferred bind (§ await-edge resolver ordering note above,
@@ -3817,10 +4229,44 @@ pub async fn build_reborn_runtime(
             reason: format!("await-edge resolver result writer bind failed: {error}"),
         })?;
 
+    let subagent_definition_resolver: Arc<dyn ironclaw_loop_host::SubagentDefinitionResolver> =
+        Arc::new(TianquanSubagentDefinitionResolver::new());
+    if let Some(backend) = opaque_input_backend.as_ref() {
+        reborn_startup_stage(RebornStartupStage::OpaqueInitBegin);
+        backend
+            .initialize_host_services(ironclaw_loop_host::OpaquePromptInputHostServices {
+                turns: turn_state_store.clone(),
+                threads: thread_service.clone(),
+                definitions: subagent_definition_resolver.clone(),
+            })
+            .await
+            .map_err(|_| RebornRuntimeError::MalformedConfig {
+                reason: "opaque backend host initialization failed".into(),
+            })?;
+        reborn_startup_stage(RebornStartupStage::OpaqueInitReady);
+    }
+
     // 天权 16 SOUL prompt material source 注入(在 parts move goal_store 前 clone)
     let tianquan_prompt_goal_store = Arc::clone(&subagent_goal_store);
     let tianquan_prompt_thread_service = Arc::clone(&thread_service);
 
+    let original_subagent_prompt_source: Arc<dyn ironclaw_loop_host::SubagentPromptMaterialSource> =
+        Arc::new(
+            tianquan_subagents::TianquanSubagentPromptMaterialSource::new(
+                tianquan_prompt_goal_store,
+                tianquan_prompt_thread_service,
+            ),
+        );
+    let subagent_prompt_source: Arc<dyn ironclaw_loop_host::SubagentPromptMaterialSource> =
+        match opaque_input_backend {
+            Some(backend) => Arc::new(
+                ironclaw_loop_host::OpaqueBackedSubagentPromptMaterialSource::new(
+                    original_subagent_prompt_source,
+                    backend,
+                ),
+            ),
+            None => original_subagent_prompt_source,
+        };
     let planned_runtime_parts = DefaultPlannedRuntimeParts {
         turn_state: Arc::clone(&turn_state_store),
         thread_service: Arc::clone(&thread_service),
@@ -3861,15 +4307,9 @@ pub async fn build_reborn_runtime(
         subagent_await_edge_writer,
         subagent_await_edge_settler,
         subagent_await_edge_evidence,
-        subagent_definition_resolver: Arc::new(TianquanSubagentDefinitionResolver::new()),
-        subagent_prompt_source: Some(Arc::new(
-            tianquan_subagents::TianquanSubagentPromptMaterialSource::new(
-                tianquan_prompt_goal_store,
-                tianquan_prompt_thread_service,
-            ),
-        )),
-        // 目录与 TianquanSubagentDefinitionResolver 同源:当前仅能解析 16 SOUL。
-        // 4 个内置类型在天权没有执行解析器,不得误报到模型可用目录。
+        subagent_definition_resolver,
+        subagent_prompt_source: Some(subagent_prompt_source),
+        // 目录只列出当前 TianQuan resolver 能执行的角色。
         subagent_flavor_catalog: Some(tianquan_subagents::flavors::tianquan_flavor_catalog()),
         subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(
             capability_input_resolver,
@@ -3906,20 +4346,24 @@ pub async fn build_reborn_runtime(
         cancellation_factory: None,
         skill_context_source,
         input_queue: None,
-        identity_context_source: match local_runtime {
-            Some(local_runtime) => Arc::new(
-                // Local-dev seeding validates the prompt path first, so non-file prompt paths fail
-                // as build errors before this runtime-level identity-source guard is reached.
-                DefaultSystemPromptIdentitySource::try_new(
-                    local_runtime.local_dev_storage_root.clone(),
-                    local_runtime.default_system_prompt_path.clone(),
-                    resolved_tool_disclosure.is_bridged(),
-                )
-                .map_err(|error| RebornRuntimeError::InvalidArgument {
-                    reason: error.to_string(),
-                })?,
-            ) as Arc<dyn HostIdentityContextSource>,
-            None => Arc::new(EmptyIdentityContextSource) as Arc<dyn HostIdentityContextSource>,
+        identity_context_source: if let Some(surface) = injected_production_surface.as_ref() {
+            surface.context_sources.identity.clone()
+        } else {
+            match local_runtime {
+                Some(local_runtime) => Arc::new(
+                    // Local-dev seeding validates the prompt path first, so non-file prompt paths fail
+                    // as build errors before this runtime-level identity-source guard is reached.
+                    DefaultSystemPromptIdentitySource::try_new(
+                        local_runtime.local_dev_storage_root.clone(),
+                        local_runtime.default_system_prompt_path.clone(),
+                        resolved_tool_disclosure.is_bridged(),
+                    )
+                    .map_err(|error| RebornRuntimeError::InvalidArgument {
+                        reason: error.to_string(),
+                    })?,
+                ) as Arc<dyn HostIdentityContextSource>,
+                None => Arc::new(EmptyIdentityContextSource) as Arc<dyn HostIdentityContextSource>,
+            }
         },
         // Resolve the per-user agent-context profile (timezone/locale/location) from
         // `context/profile.json` via the workspace filesystem. When a local-dev workspace
@@ -3938,12 +4382,18 @@ pub async fn build_reborn_runtime(
         // Wiring the production-graph composition for these optional context sources is a
         // single deferred follow-up (identity + profile together, to keep them paired);
         // do not wire only one of them here, or they will diverge. See issue #5013.
-        user_profile_source: match local_runtime {
-            Some(local_runtime) => Arc::new(MemoryBackedUserProfileSourceAdapter(
-                MemoryBackedUserProfileSource::new(Arc::clone(&local_runtime.extension_filesystem)
-                    as Arc<dyn ironclaw_filesystem::RootFilesystem>),
-            )) as Arc<dyn HostUserProfileSource>,
-            None => Arc::new(EmptyUserProfileSource) as Arc<dyn HostUserProfileSource>,
+        user_profile_source: if let Some(surface) = injected_production_surface.as_ref() {
+            surface.context_sources.user_profile.clone()
+        } else {
+            match local_runtime {
+                Some(local_runtime) => Arc::new(MemoryBackedUserProfileSourceAdapter(
+                    MemoryBackedUserProfileSource::new(Arc::clone(
+                        &local_runtime.extension_filesystem,
+                    )
+                        as Arc<dyn ironclaw_filesystem::RootFilesystem>),
+                )) as Arc<dyn HostUserProfileSource>,
+                None => Arc::new(EmptyUserProfileSource) as Arc<dyn HostUserProfileSource>,
+            }
         },
         model_policy_guard: None,
         model_budget_accountant,
@@ -3957,9 +4407,16 @@ pub async fn build_reborn_runtime(
         // `turn_coordinator_for_production`) and the scheduler's wake loop share the
         // exact same channel. For local-dev, `None` causes `build_default_planned_runtime`
         // to mint its own wiring internally (existing behavior).
-        scheduler_wake_wiring: production_scheduler_wake,
+        scheduler_wake_wiring: Some(production_scheduler_wake.unwrap_or_else(ironclaw_runner::runtime::SchedulerWakeWiring::channel).with_startup_execution(startup_execution.clone())),
     };
-    let composition = build_default_planned_runtime(planned_runtime_parts)?;
+    let composition = match product_driver {
+        Some(driver) => ironclaw_runner::runtime::build_default_planned_runtime_with_driver(
+            planned_runtime_parts,
+            driver,
+        )?,
+        None => build_default_planned_runtime(planned_runtime_parts)?,
+    };
+    reborn_startup_stage(RebornStartupStage::PlannedProfileBegin);
     let default_resolved_run_profile = composition
         .run_profile_resolver
         .resolve_run_profile(RunProfileResolutionRequest::interactive_default())
@@ -3967,6 +4424,7 @@ pub async fn build_reborn_runtime(
         .map_err(|error| RebornRuntimeError::InvalidArgument {
             reason: format!("could not resolve default run profile: {error}"),
         })?;
+    reborn_startup_stage(RebornStartupStage::PlannedProfileReady);
     let default_run_profile_id = default_resolved_run_profile.profile_id.as_str().to_string();
     let failure_explanation_thread_id =
         ThreadId::new("failure-explanation-system").map_err(|reason| {
@@ -4019,8 +4477,18 @@ pub async fn build_reborn_runtime(
     };
     let turn_event_source: Arc<dyn TurnEventProjectionSource> = turn_state_store.clone();
     let mut projection_services = projection_services
-        .with_turn_events(turn_event_source, Arc::clone(&planned_turn_coordinator))
-        .with_model_failure_explainer_factory(failure_explanation_inference);
+        .with_turn_events(turn_event_source, Arc::clone(&planned_turn_coordinator));
+    // Failure explanations are best-effort. Production keeps the model-backed
+    // explainer; recovery and zero-model acceptance can opt into the pinned
+    // deterministic projection summaries without making a model call.
+    if std::env::var("IRONCLAW_FAILURE_EXPLANATION_DETERMINISTIC")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        projection_services = projection_services
+            .with_model_failure_explainer_factory(failure_explanation_inference);
+    }
     if let Some(display_previews) = display_previews {
         projection_services = projection_services.with_display_previews(display_previews);
     }
@@ -4055,6 +4523,7 @@ pub async fn build_reborn_runtime(
     let trigger_conversation_pairing_value: Option<
         Arc<dyn ironclaw_conversations::ConversationActorPairingService>,
     >;
+    let trigger_poller_configured=trigger_poller.enabled;
     if trigger_poller.enabled {
         let local_runtime = local_runtime.ok_or(RebornRuntimeError::InvalidArgument {
             reason: "trigger poller is not wired for production runtime launch".to_string(),
@@ -4090,6 +4559,7 @@ pub async fn build_reborn_runtime(
         trigger_poller_handle = spawn_trigger_poller(
             trigger_poller,
             TriggerPollerCompositionDeps {
+                startup_execution:startup_execution.clone(),
                 repository: Arc::clone(&local_runtime.trigger_repository),
                 materializer: trigger_poller_services.materializer,
                 trusted_submitter: trigger_poller_services.trusted_submitter,
@@ -4185,16 +4655,21 @@ pub async fn build_reborn_runtime(
             crate::LlmKeyStore::new(services.secret_store()),
             reload_parts.mission_swappable.clone(),
         );
+        reborn_startup_stage(RebornStartupStage::BootReloadBegin);
         if let Err(error) = crate::LlmReloadTrigger::reload(&boot_reload_adapter).await {
+            reborn_startup_stage(RebornStartupStage::BootReloadFailed);
             tracing::warn!(
                 %error,
                 "boot-time LLM reload failed; the placeholder provider stays active until the \
                  next successful reload (e.g. through Settings -> Inference)"
             );
+        } else {
+            reborn_startup_stage(RebornStartupStage::BootReloadSucceeded);
         }
+        reborn_startup_stage(RebornStartupStage::BootReloadReturned);
     }
 
-    Ok(RebornRuntime {
+    let runtime=RebornRuntime {
         services,
         turn_coordinator,
         turn_state_flush,
@@ -4203,6 +4678,11 @@ pub async fn build_reborn_runtime(
         thread_scope,
         turn_scheduler: RuntimeTurnScheduler::new(composition.scheduler_handle, scheduler_notifier),
         trigger_poller_handle,
+        trigger_poller_configured,
+        runtime_instance_id: uuid::Uuid::new_v4(),
+        startup_execution,
+        #[cfg(test)] late_admission_fixture: None,
+        resident_shutdown_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         #[cfg(any(feature = "libsql", feature = "postgres"))]
         credential_refresh_worker_handle,
         trace_flush_worker,
@@ -4230,7 +4710,10 @@ pub async fn build_reborn_runtime(
         skill_execution_adapter,
         boot,
         llm_reload,
-    })
+    };
+    runtime.bind_normal_operator_runtime()?;
+    reborn_startup_stage(RebornStartupStage::RuntimeReady);
+    Ok(runtime)
 }
 
 /// Thin wrapper over

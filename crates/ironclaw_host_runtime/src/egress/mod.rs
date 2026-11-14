@@ -100,7 +100,7 @@ impl<N, S> HostHttpEgressService<N, S> {
         // 当 store policy deny_private=true 且 request policy deny_private=false 时,
         // 用 request policy(local-dev 放行私有 IP,容器内 MCP server 可达)。
         let store_policy = self.network_policy_store.get(&request.scope, &request.capability_id);
-        let policy = match &store_policy {
+        let mut policy = match &store_policy {
             Some(sp) if sp.deny_private_ip_ranges && !request.network_policy.deny_private_ip_ranges => {
                 // store 是 production policy(deny_private=true),request 是 local-dev(deny_private=false)
                 // 用 request policy 让 local-dev 放行私有 IP
@@ -109,6 +109,9 @@ impl<N, S> HostHttpEgressService<N, S> {
             Some(sp) => sp.clone(),
             None => request.network_policy.clone(),
         };
+        // A staged manifest/grant cannot erase the host request's deny-only constraint.
+        policy.deny_redirects |= request.network_policy.deny_redirects
+            || store_policy.as_ref().is_some_and(|stored| stored.deny_redirects);
         Ok(policy)
     }
 

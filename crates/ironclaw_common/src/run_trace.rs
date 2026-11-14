@@ -31,8 +31,12 @@
 //!   TIANQUAN_TRACE_MAX_ACTIVE / TIANQUAN_TRACE_MAX_ARCHIVED。
 
 use serde_json::{Value, json};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::Mutex;
+
+// Only same-process append/compact file transactions; release before rotate.
+static TRACE_IO_LOCK: Mutex<()> = Mutex::new(());
 
 /// 默认 trace 根(与 local-dev storage root 同卷,api 以只读卷共享)。
 const DEFAULT_TRACE_ROOT: &str = "/data/ironclaw-reborn/local-dev/traces";
@@ -130,11 +134,16 @@ pub fn append_trace_event(
         }
     };
     // append+create,单行写;并发 append 同文件由 OS 行原子性兜底(JSONL 惯例)
-    let result = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .and_then(|mut f| writeln!(f, "{line}"));
+    let result = TRACE_IO_LOCK
+        .lock()
+        .map_err(|_| std::io::Error::other("trace io lock poisoned"))
+        .and_then(|_guard| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut f| writeln!(f, "{line}"))
+        });
     if let Err(e) = result {
         tracing_stub_debug(format!("run trace append failed({}): {e}", path.display()));
     }
@@ -159,63 +168,63 @@ fn max_archived_files() -> usize {
         .unwrap_or(256)
 }
 
-/// 压缩单个 run 的 trace 文件(`{run}.jsonl` → `{run}.jsonl.gz`,原文件删除)。
-/// gzip 单线程流式压缩(JSONL 重复键名压缩率高);best-effort:失败保留原文件
-/// (下次轮转重试),仅 debug 日志。
+/// Archive existing prefix plus resumed hot suffix without changing the event schema.
+/// Precommit errors preserve archive/hot; postcommit cleanup errors retain committed
+/// archive plus hot and are reported. Retry dedup/crash/cross-process exact-once is OPEN.
 pub fn compact_run_trace(run_id: &str) {
     let root = trace_root();
     let safe = sanitize_run_id(run_id);
-    let src = root.join(format!("{safe}.jsonl"));
-    let dst = root.join(format!("{safe}.jsonl.gz"));
-    let Ok(new_segment) = std::fs::read(&src) else {
-        return; // 无文件=无事可做(正常态)
-    };
-    // A blocked run can be resumed with the same run_id after an earlier
-    // segment was compressed. Preserve that prefix when compacting the resumed
-    // hot segment; replacing the archive with only the suffix loses the exact
-    // model/tool steps needed to explain a blocking capability.
-    let mut data = if dst.exists() {
-        match read_gz_segment(&dst) {
-            Ok(prefix) => prefix,
-            Err(error) => {
-                tracing_stub_debug(format!(
-                    "run trace prior archive read failed({safe}): {error}"
-                ));
-                return;
-            }
-        }
-    } else {
-        Vec::new()
-    };
-    if !data.is_empty() && !data.ends_with(b"\n") && !new_segment.is_empty() {
-        data.push(b'\n');
-    }
-    data.extend_from_slice(&new_segment);
-    let tmp = root.join(format!("{safe}.jsonl.gz.tmp"));
-    let write_gz = || -> std::io::Result<()> {
-        let f = std::fs::File::create(&tmp)?;
-        let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
-        std::io::Write::write_all(&mut enc, &data)?;
-        enc.finish()?;
-        replace_compacted_archive(&tmp, &dst, &root, &safe)
-    };
-    match write_gz() {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&src); // gz 落定后才删原文件
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            tracing_stub_debug(format!("run trace compact failed({safe}): {e}"));
-        }
+    if let Err(error) = compact_run_trace_transaction(&root, &safe) {
+        tracing_stub_debug(format!("run trace compact failed({safe}): {error}"));
     }
 }
 
-fn read_gz_segment(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
-    let file = std::fs::File::open(path)?;
-    let mut decoder = flate2::read::GzDecoder::new(file);
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut decoder, &mut bytes)?;
-    Ok(bytes)
+fn compact_run_trace_transaction(root: &std::path::Path, safe: &str) -> std::io::Result<()> {
+    let _guard = TRACE_IO_LOCK
+        .lock()
+        .map_err(|_| std::io::Error::other("trace io lock poisoned"))?;
+    let src = root.join(format!("{safe}.jsonl"));
+    let dst = root.join(format!("{safe}.jsonl.gz"));
+    let tmp = root.join(format!("{safe}.jsonl.gz.tmp"));
+    match std::fs::symlink_metadata(&src) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(std::io::Error::other("trace hot is not a regular file"));
+        }
+        Ok(_) => {}
+    }
+    let mut prefix = Vec::new();
+    match std::fs::symlink_metadata(&dst) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(std::io::Error::other("trace archive is not a regular file"));
+        }
+        Ok(_) => {
+            // MultiGzDecoder verifies all members/trailers; corrupt prefix is never empty fallback.
+            let mut decoder = flate2::read::MultiGzDecoder::new(std::fs::File::open(&dst)?);
+            decoder.read_to_end(&mut prefix)?;
+        }
+    }
+    let hot = std::fs::read(&src)?;
+    if !prefix.is_empty() && !prefix.ends_with(b"\n") && !hot.is_empty() {
+        prefix.push(b'\n');
+    }
+    // create_new rejects a retained prior failed temp; never truncate diagnostic evidence.
+    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    encoder.write_all(&prefix)?;
+    encoder.write_all(&hot)?;
+    let mut file = encoder.finish()?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+    replace_compacted_archive(&tmp, &dst, root, &safe)?;
+    std::fs::remove_file(&src).map_err(|error| {
+        std::io::Error::new(error.kind(), "trace archive committed; hot cleanup failed")
+    })?;
+    Ok(())
 }
 
 /// Replace the archive atomically where the platform permits it. Windows
@@ -519,3 +528,7 @@ mod tests {
         assert_eq!(parsed["kind"], "tool_call");
     }
 }
+
+#[cfg(test)]
+#[path = "run_trace_archive_tests.rs"]
+mod archive_retention_tests;

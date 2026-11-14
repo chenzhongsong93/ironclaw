@@ -1488,6 +1488,8 @@ fn nearai_gateway_test_request() -> HostManagedModelRequest {
         }],
         surface_version: None,
         resolved_model_route: None,
+        thread_id: None,
+        conversation_id: None,
         run_id: TurnRunId::new(),
         turn_id: TurnId::new(),
         llm_subject: None,
@@ -1528,6 +1530,9 @@ impl ironclaw_llm::LlmProvider for RecordingLlmProvider {
             .expect("recording provider request lock poisoned")
             .push(request.model);
         Ok(ironclaw_llm::CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: "ok".to_string(),
             input_tokens: 1,
             output_tokens: 1,
@@ -1547,6 +1552,9 @@ impl ironclaw_llm::LlmProvider for RecordingLlmProvider {
             .expect("recording provider request lock poisoned")
             .push(request.model);
         Ok(ironclaw_llm::ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: Some("ok".to_string()),
             tool_calls: Vec::new(),
             input_tokens: 1,
@@ -2069,6 +2077,9 @@ impl ironclaw_llm::LlmProvider for CountingOverrideProvider {
     ) -> Result<ironclaw_llm::CompletionResponse, ironclaw_llm::LlmError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(ironclaw_llm::CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: "override-driven".to_string(),
             input_tokens: 0,
             output_tokens: 0,
@@ -2085,6 +2096,9 @@ impl ironclaw_llm::LlmProvider for CountingOverrideProvider {
     ) -> Result<ironclaw_llm::ToolCompletionResponse, ironclaw_llm::LlmError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(ironclaw_llm::ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: Some("override-driven".to_string()),
             tool_calls: Vec::new(),
             input_tokens: 0,
@@ -7070,3 +7084,6 @@ async fn scheduler_stopped_rejects_send_user_message() {
     // shutdown() handles the already-taken scheduler handle gracefully.
     runtime.shutdown().await.expect("runtime shutdown");
 }
+
+#[path = "resident_protocol.rs"]
+mod resident_protocol_tests;

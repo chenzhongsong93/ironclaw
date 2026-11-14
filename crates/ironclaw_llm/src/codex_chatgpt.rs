@@ -1057,6 +1057,9 @@ impl LlmProvider for CodexChatGptProvider {
         let result = self.send_request(body).await?;
 
         Ok(CompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: result.text,
             input_tokens: result.input_tokens,
             output_tokens: result.output_tokens,
@@ -1121,6 +1124,9 @@ impl LlmProvider for CodexChatGptProvider {
         };
 
         Ok(ToolCompletionResponse {
+            normalization_version: None,
+            normalized_input_tokens: None,
+            cache_details_observed: None,
             content: if result.text.is_empty() {
                 None
             } else {

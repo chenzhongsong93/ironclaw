@@ -8,8 +8,8 @@ use chrono::Utc;
 use tracing::debug;
 
 use crate::{
-    CancelRunRequest, CancelRunResponse, GetRunStateRequest, ResumeTurnRequest, ResumeTurnResponse,
-    RetryTurnRequest, RetryTurnResponse, RunProfileResolver, SubmitChildRunRequest,
+    CancelRunRequest, CancelRunResponse, GetRunStateRequest, RecoverTurnRequest, ResumeTurnRequest,
+    ResumeTurnResponse, RetryTurnRequest, RetryTurnResponse, RunProfileResolver, SubmitChildRunRequest,
     SubmitTurnRequest, SubmitTurnResponse, TurnAdmissionPolicy, TurnCheckpointId,
     TurnCommittedEventObserver, TurnError, TurnEventKind, TurnEventSink, TurnId,
     TurnLifecycleEvent, TurnRunId, TurnRunRecord, TurnRunState, TurnScope, TurnSpawnTreeStateStore,
@@ -432,6 +432,23 @@ fn retry_event(request: &RetryTurnRequest, response: &RetryTurnResponse) -> Turn
     }
 }
 
+fn recover_event(request: &RecoverTurnRequest, response: &ResumeTurnResponse) -> TurnLifecycleEvent {
+    TurnLifecycleEvent {
+        cursor: response.event_cursor,
+        scope: request.scope.clone(),
+        occurred_at: Some(Utc::now()),
+        owner_user_id: lifecycle_owner_user_id(&request.scope, Some(&request.actor.user_id)),
+        run_id: response.run_id,
+        status: response.status,
+        kind: TurnEventKind::Resumed,
+        blocked_gate: None,
+        sanitized_reason: Some("in_place_recovery".to_string()),
+        retryable: None,
+        detail: None,
+        model_usage: None,
+    }
+}
+
 fn cancel_event(
     request: &CancelRunRequest,
     response: &CancelRunResponse,
@@ -525,6 +542,17 @@ where
         let event_request = request.clone();
         let response = self.inner.retry_turn(request).await?;
         self.publish_event_once_deferred(retry_event(&event_request, &response))
+            .await?;
+        Ok(response)
+    }
+
+    async fn recover_turn(
+        &self,
+        request: RecoverTurnRequest,
+    ) -> Result<ResumeTurnResponse, TurnError> {
+        let event_request = request.clone();
+        let response = self.inner.recover_turn(request).await?;
+        self.publish_event_once_deferred(recover_event(&event_request, &response))
             .await?;
         Ok(response)
     }

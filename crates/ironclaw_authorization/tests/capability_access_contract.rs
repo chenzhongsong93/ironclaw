@@ -67,6 +67,7 @@ async fn capability_access_returns_grant_constraints_as_runtime_obligations() {
     )])
     .unwrap();
     let network = NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "api.example.com".to_string(),
@@ -140,6 +141,7 @@ async fn capability_access_allows_first_party_dynamic_secret_consumers_without_s
         ..wasm_descriptor()
     };
     let network = NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "api.example.com".to_string(),

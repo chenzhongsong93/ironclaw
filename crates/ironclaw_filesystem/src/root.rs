@@ -204,6 +204,20 @@ pub trait RootFilesystem: Send + Sync {
         unsupported(path, FilesystemOperation::BeginTxn)
     }
 
+    /// One backend committed statement/snapshot returns the COMPLETE retained
+    /// current-incarnation path log, with pre-transfer record/byte bounds.
+    /// Numeric seq gaps are legal. No writes/materialization/retention changes.
+    /// Unsupported backends must refuse, never compose ordinary tail+head reads.
+    async fn complete_event_prefix(&self, path: &VirtualPath, _max_records: usize, _max_bytes: usize, _max_record_bytes: usize)
+        -> Result<Option<crate::CompleteEventPrefix>, FilesystemError> {
+        unsupported(path,FilesystemOperation::Tail)
+    }
+    /// Same path incarnation discriminator; normal appends keep it stable,
+    /// wholepath delete/recreate changes it. Not a permanent retention promise.
+    async fn event_log_generation(&self, path: &VirtualPath) -> Result<Option<String>,FilesystemError> {
+        unsupported(path,FilesystemOperation::Tail)
+    }
+
     // ─── Event plane (append/tail) ────────────────────────────────────────
 
     /// Append `payload` to the event log at `path`, returning the assigned

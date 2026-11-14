@@ -8,6 +8,7 @@
 //! Pattern follows `nearai_chat.rs`: direct HTTP calls via `reqwest::Client`.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use reqwest::Client;
@@ -15,15 +16,18 @@ use rust_decimal::Decimal;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
-use crate::anthropic_thinking::{AnthropicThinking, thinking_for_request};
+use crate::anthropic_thinking::{AnthropicThinking, thinking_for_request_model};
 use crate::config::RegistryProviderConfig;
 use crate::error::LlmError;
 use crate::provider::{
-    ChatMessage, CompletionRequest, CompletionResponse, ContentPart, FinishReason, LlmProvider,
+    ChatMessage, CompletionRequest, CompletionResponse, CompletionStreamSink, ContentPart, FinishReason, LlmProvider,
     Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse,
     strip_unsupported_completion_params, strip_unsupported_tool_params,
 };
 use ironclaw_common::llm_costs as costs;
+
+#[path = "anthropic_request_headers.rs"]
+mod request_headers;
 
 /// Read a fresh `claude login` OAuth token from the OS credential store.
 ///
@@ -80,6 +84,27 @@ fn context_length_error_for_status(status_code: u16, response_text: &str) -> Opt
 }
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
+
+async fn policy_response_error(response: reqwest::Response) -> LlmError {
+    match crate::provider_policy::from_response(response).await {
+        Some(reason) => LlmError::PolicyDenied {
+            provider: "anthropic_oauth".to_owned(),
+            reason,
+        },
+        None => LlmError::RequestFailed {
+            provider: "anthropic_oauth".to_owned(),
+            reason: "HTTP 403: policy response classification is unknown".to_owned(),
+        },
+    }
+}
+
+/// A custom Bearer endpoint cannot authorize reading an unrelated local credential.
+/// Bind both the configured destination and the final response destination.
+fn allows_claude_cli_refresh(requested_url: &str, response_url: &str) -> bool {
+    let official =
+        |value: &str| url::Url::parse(value).is_ok_and(|url| url.as_str() == ANTHROPIC_API_URL);
+    official(requested_url) && official(response_url)
+}
 /// OAuth beta requires 2023-06-01; the 2024-10-22 version is not valid with the beta flag.
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 /// Required beta flag to enable OAuth Bearer auth on api.anthropic.com.
@@ -92,6 +117,7 @@ pub(crate) const DEFAULT_MAX_TOKENS: u32 = 8192;
 /// Anthropic provider using OAuth Bearer authentication.
 pub(crate) struct AnthropicOAuthProvider {
     client: Client,
+    request_headers: request_headers::RequestHeaders,
     provider_id: String,
     /// OAuth token, wrapped in RwLock so it can be updated after a successful
     /// Keychain refresh (fixes #1136: stale token reuse after expiry).
@@ -104,6 +130,9 @@ pub(crate) struct AnthropicOAuthProvider {
     /// Fallback `max_tokens` when a request leaves it unset
     /// (`config.max_tokens` at construction, else [`DEFAULT_MAX_TOKENS`]).
     default_max_tokens: u32,
+    /// Unit-only credential IO seam; never configurable by runtime or model input.
+    #[cfg(test)]
+    cli_refresh_loader: Option<fn() -> Option<String>>,
 }
 
 impl AnthropicOAuthProvider {
@@ -129,6 +158,7 @@ impl AnthropicOAuthProvider {
             })?;
 
         let active_model = std::sync::RwLock::new(config.model.clone());
+        let request_headers = request_headers::RequestHeaders::new(&config.extra_headers)?;
         let base_url = if config.base_url.is_empty() {
             None
         } else {
@@ -140,6 +170,7 @@ impl AnthropicOAuthProvider {
 
         Ok(Self {
             client,
+            request_headers,
             provider_id: config.provider_id.clone(),
             token: std::sync::RwLock::new(token),
             model: config.model.clone(),
@@ -147,6 +178,8 @@ impl AnthropicOAuthProvider {
             active_model,
             unsupported_params,
             default_max_tokens: config.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            #[cfg(test)]
+            cli_refresh_loader: None,
         })
     }
 
@@ -246,6 +279,8 @@ impl AnthropicOAuthProvider {
         body: &AnthropicRequest,
         bearer_token: &str,
         subject_scoped: bool,
+        extra_headers: &reqwest::header::HeaderMap,
+        sink: Option<&dyn CompletionStreamSink>,
     ) -> Result<AnthropicResponse, LlmError> {
         let url = self.api_url();
         let mut streamed = body.clone();
@@ -258,6 +293,7 @@ impl AnthropicOAuthProvider {
         let response = self
             .client
             .post(&url)
+            .headers(extra_headers.clone())
             .bearer_auth(bearer_token)
             .header("anthropic-version", ANTHROPIC_API_VERSION)
             .header("anthropic-beta", ANTHROPIC_OAUTH_BETA)
@@ -271,6 +307,9 @@ impl AnthropicOAuthProvider {
                 reason: format!("streaming request failed: {e}"),
             })?;
         let status = response.status();
+        if status.as_u16() == 403 {
+            return Err(policy_response_error(response).await);
+        }
         if !status.is_success() {
             let response_text = response
                 .text()
@@ -303,6 +342,19 @@ impl AnthropicOAuthProvider {
                 if let Some(payload) = line.strip_prefix("data:")
                     && let Ok(event) = serde_json::from_str::<SseEvent>(payload.trim())
                 {
+                    if let Some(sink) = sink {
+                        match &event {
+                            SseEvent::ContentBlockDelta { delta: SseDelta::TextDelta { text }, .. }
+                                if !text.is_empty() => {
+                                    sink.text_delta(text.clone()).await;
+                                }
+                            SseEvent::ContentBlockDelta { delta: SseDelta::ThinkingDelta { thinking }, .. }
+                                if !thinking.is_empty() => sink.provider_activity().await,
+                            SseEvent::ContentBlockDelta { delta: SseDelta::InputJsonDelta { partial_json }, .. }
+                                if !partial_json.is_empty() => sink.provider_activity().await,
+                            _ => {}
+                        }
+                    }
                     aggregator.absorb(event);
                 }
             }
@@ -314,11 +366,28 @@ impl AnthropicOAuthProvider {
         aggregator.finish()
     }
 
+    async fn refresh_token_after_401(
+        &self,
+        requested_url: &str,
+        response_url: &str,
+    ) -> Option<String> {
+        if !allows_claude_cli_refresh(requested_url, response_url) {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        #[cfg(test)]
+        if let Some(load) = self.cli_refresh_loader {
+            return load();
+        }
+        refresh_claude_oauth_token()
+    }
+
     async fn send_request<R: for<'de> Deserialize<'de>>(
         &self,
         body: &AnthropicRequest,
         bearer_token: &str,
         subject_scoped: bool,
+        extra_headers: &reqwest::header::HeaderMap,
     ) -> Result<R, LlmError> {
         let url = self.api_url();
 
@@ -327,6 +396,7 @@ impl AnthropicOAuthProvider {
         let response = self
             .client
             .post(&url)
+            .headers(extra_headers.clone())
             .bearer_auth(bearer_token)
             .header("anthropic-version", ANTHROPIC_API_VERSION)
             .header("anthropic-beta", ANTHROPIC_OAUTH_BETA)
@@ -341,7 +411,11 @@ impl AnthropicOAuthProvider {
 
         let status = response.status();
 
+        if status.as_u16() == 403 {
+            return Err(policy_response_error(response).await);
+        }
         if !status.is_success() {
+            let response_url = response.url().to_string();
             // Parse Retry-After header before consuming the body.
             let retry_after = Some(crate::retry::parse_retry_after(
                 response.headers().get("retry-after"),
@@ -367,14 +441,13 @@ impl AnthropicOAuthProvider {
                 //
                 // Brief delay to give Claude Code time to complete its async
                 // Keychain refresh write (fixes race in #1136).
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-                if let Some(fresh) = refresh_claude_oauth_token() {
+                if let Some(fresh) = self.refresh_token_after_401(&url, &response_url).await {
                     let fresh_token = SecretString::from(fresh);
                     // Retry once with the refreshed token
                     let retry = self
                         .client
                         .post(&url)
+                        .headers(extra_headers.clone())
                         .bearer_auth(fresh_token.expose_secret())
                         .header("anthropic-version", ANTHROPIC_API_VERSION)
                         .header("anthropic-beta", ANTHROPIC_OAUTH_BETA)
@@ -386,6 +459,9 @@ impl AnthropicOAuthProvider {
                             provider: "anthropic_oauth".to_string(),
                             reason: e.to_string(),
                         })?;
+                    if retry.status().as_u16() == 403 {
+                        return Err(policy_response_error(retry).await);
+                    }
                     if retry.status().is_success() {
                         // Persist the refreshed token so subsequent requests
                         // don't hit 401 again (fixes #1136).
@@ -458,6 +534,7 @@ impl AnthropicOAuthProvider {
 #[async_trait]
 impl LlmProvider for AnthropicOAuthProvider {
     async fn complete(&self, mut req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+        let headers = self.request_headers.resolve(&req.metadata)?;
         let (bearer_token, subject_scoped) = self.token_for_request(&req.metadata).await?;
         let model = req
             .take_model_override()
@@ -465,10 +542,12 @@ impl LlmProvider for AnthropicOAuthProvider {
         self.strip_unsupported_completion_params(&mut req);
         let (system, messages) = convert_messages(req.messages);
         let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens);
+        let (model, thinking) =
+            thinking_for_request_model(&model, max_tokens, req.temperature, false);
 
         let request = AnthropicRequest {
             stream: None,
-            thinking: thinking_for_request(&model, max_tokens, req.temperature, false),
+            thinking,
             model,
             messages,
             system,
@@ -479,7 +558,7 @@ impl LlmProvider for AnthropicOAuthProvider {
         };
 
         let response: AnthropicResponse = self
-            .send_request(&request, &bearer_token, subject_scoped)
+            .send_request(&request, &bearer_token, subject_scoped, &headers)
             .await?;
         let extracted = extract_response_content(&response);
 
@@ -490,10 +569,19 @@ impl LlmProvider for AnthropicOAuthProvider {
             _ => FinishReason::Unknown,
         };
 
+        let normalized = response.usage.normalization_fields_present.then(|| crate::usage_normalization::parse_anthropic_messages_usage(&serde_json::json!({
+            "input_tokens":response.usage.input_tokens,"output_tokens":response.usage.output_tokens,
+            "cache_read_input_tokens":response.usage.cache_read_input_tokens,
+            "cache_creation_input_tokens":response.usage.cache_creation_input_tokens
+        }))).and_then(Result::ok);
+        let normalization_version = normalized.map(|_| 1);
         Ok(CompletionResponse {
             content: extracted.content.unwrap_or_default(),
             finish_reason,
             input_tokens: response.usage.input_tokens,
+            normalization_version,
+            normalized_input_tokens: normalized.map(|value| value.parts().0),
+            cache_details_observed: normalized.map(|value| value.cache_details_observed()),
             output_tokens: response.usage.output_tokens,
             reasoning: extracted.reasoning,
             cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
@@ -503,8 +591,55 @@ impl LlmProvider for AnthropicOAuthProvider {
 
     async fn complete_with_tools(
         &self,
-        mut req: ToolCompletionRequest,
+        req: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
+        self.complete_anthropic_tools(req, None).await
+    }
+
+    async fn complete_with_tools_streaming(
+        &self,
+        req: ToolCompletionRequest,
+        sink: Arc<dyn CompletionStreamSink>,
+    ) -> Result<ToolCompletionResponse, LlmError> {
+        self.complete_anthropic_tools(req, Some(sink.as_ref())).await
+    }
+
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    fn cost_per_token(&self) -> (Decimal, Decimal) {
+        let model = self.active_model_name();
+        costs::model_cost(&model).unwrap_or_else(costs::default_cost)
+    }
+
+    fn active_model_name(&self) -> String {
+        match self.active_model.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn set_model(&self, model: &str) -> Result<(), LlmError> {
+        match self.active_model.write() {
+            Ok(mut guard) => {
+                *guard = model.to_string();
+            }
+            Err(poisoned) => {
+                *poisoned.into_inner() = model.to_string();
+            }
+        }
+        Ok(())
+    }
+}
+
+impl AnthropicOAuthProvider {
+    async fn complete_anthropic_tools(
+        &self,
+        mut req: ToolCompletionRequest,
+        sink: Option<&dyn CompletionStreamSink>,
+    ) -> Result<ToolCompletionResponse, LlmError> {
+        let headers = self.request_headers.resolve(&req.metadata)?;
         let (bearer_token, subject_scoped) = self.token_for_request(&req.metadata).await?;
         let model = req
             .take_model_override()
@@ -549,14 +684,12 @@ impl LlmProvider for AnthropicOAuthProvider {
         // preserved on text-only turns via `complete()`.
         let has_tools = !tools.is_empty();
         let opt_tools = if has_tools { Some(tools) } else { None };
+        let (model, request_thinking) =
+            thinking_for_request_model(&model, max_tokens, req.temperature, false);
 
         let request = AnthropicRequest {
             stream: None,
-            thinking: if has_tools {
-                None
-            } else {
-                thinking_for_request(&model, max_tokens, req.temperature, false)
-            },
+            thinking: if has_tools { None } else { request_thinking },
             model,
             messages,
             system,
@@ -569,7 +702,7 @@ impl LlmProvider for AnthropicOAuthProvider {
         // 2026-08-28 天权补丁:tool-capable 请求走流式聚合(非流式长生成在兼容
         // 网关上慢且空,见 send_request_streaming 注释)。
         let response: AnthropicResponse = self
-            .send_request_streaming(&request, &bearer_token, subject_scoped)
+            .send_request_streaming(&request, &bearer_token, subject_scoped, &headers, sink)
             .await?;
         let extracted = extract_response_content(&response);
 
@@ -586,11 +719,20 @@ impl LlmProvider for AnthropicOAuthProvider {
             }
         };
 
+        let normalized = response.usage.normalization_fields_present.then(|| crate::usage_normalization::parse_anthropic_messages_usage(&serde_json::json!({
+            "input_tokens":response.usage.input_tokens,"output_tokens":response.usage.output_tokens,
+            "cache_read_input_tokens":response.usage.cache_read_input_tokens,
+            "cache_creation_input_tokens":response.usage.cache_creation_input_tokens
+        }))).and_then(Result::ok);
+        let normalization_version = normalized.map(|_| 1);
         Ok(ToolCompletionResponse {
             content: extracted.content,
             tool_calls: extracted.tool_calls,
             finish_reason,
             input_tokens: response.usage.input_tokens,
+            normalization_version,
+            normalized_input_tokens: normalized.map(|value| value.parts().0),
+            cache_details_observed: normalized.map(|value| value.cache_details_observed()),
             output_tokens: response.usage.output_tokens,
             cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
             reasoning: extracted.reasoning,
@@ -599,33 +741,6 @@ impl LlmProvider for AnthropicOAuthProvider {
         })
     }
 
-    fn model_name(&self) -> &str {
-        &self.model
-    }
-
-    fn cost_per_token(&self) -> (Decimal, Decimal) {
-        let model = self.active_model_name();
-        costs::model_cost(&model).unwrap_or_else(costs::default_cost)
-    }
-
-    fn active_model_name(&self) -> String {
-        match self.active_model.read() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
-    }
-
-    fn set_model(&self, model: &str) -> Result<(), LlmError> {
-        match self.active_model.write() {
-            Ok(mut guard) => {
-                *guard = model.to_string();
-            }
-            Err(poisoned) => {
-                *poisoned.into_inner() = model.to_string();
-            }
-        }
-        Ok(())
-    }
 }
 
 // --- Anthropic Messages API types ---
@@ -748,15 +863,15 @@ enum SseEvent {
 #[derive(Debug, Default, Deserialize)]
 struct SseMessageUsage {
     #[serde(default)]
-    usage: SseUsageDelta,
+    usage: AnthropicUsage,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct SseUsageDelta {
     #[serde(default)]
     input_tokens: u32,
-    #[serde(default)]
-    output_tokens: u32,
+    #[serde(default, deserialize_with = "observed_usage_u32")]
+    output_tokens: Option<u32>,
     #[serde(default)]
     cache_creation_input_tokens: u32,
     #[serde(default)]
@@ -798,6 +913,11 @@ struct SseAggregator {
     blocks: std::collections::BTreeMap<usize, AggregatingBlock>,
     stop_reason: Option<String>,
     usage: AnthropicUsage,
+    final_output_observed: bool,
+    message_stop_seen: bool,
+    message_start_seen: bool,
+    usage_sequence_fault: bool,
+    initial_output_reported: u32,
 }
 
 enum AggregatingBlock {
@@ -812,8 +932,19 @@ enum AggregatingBlock {
 
 impl SseAggregator {
     fn absorb(&mut self, event: SseEvent) {
+        if self.message_stop_seen && !matches!(&event, SseEvent::Ignored) {
+            self.usage_sequence_fault = true;
+        }
         match event {
             SseEvent::MessageStart { message } => {
+                if self.message_start_seen {
+                    self.usage_sequence_fault = true;
+                }
+                self.message_start_seen = true;
+                self.initial_output_reported = message.usage.output_tokens;
+                self.usage.normalization_fields_present =
+                    message.usage.normalization_fields_present;
+                self.final_output_observed = false;
                 self.usage.input_tokens = message.usage.input_tokens;
                 self.usage.cache_creation_input_tokens = message.usage.cache_creation_input_tokens;
                 self.usage.cache_read_input_tokens = message.usage.cache_read_input_tokens;
@@ -854,18 +985,32 @@ impl SseAggregator {
                 SseDelta::Ignored => {}
             },
             SseEvent::MessageDelta { delta, usage } => {
+                if !self.message_start_seen {
+                    self.usage_sequence_fault = true;
+                }
                 if delta.stop_reason.is_some() {
                     self.stop_reason = delta.stop_reason;
                 }
-                if usage.output_tokens > 0 {
-                    self.usage.output_tokens = usage.output_tokens;
+                if let Some(output) = usage.output_tokens {
+                    if output < self.usage.output_tokens || output < self.initial_output_reported {
+                        self.usage_sequence_fault = true;
+                    }
+                    self.final_output_observed = true;
+                    if output > 0 {
+                        self.usage.output_tokens = output;
+                    }
                 }
             }
-            SseEvent::MessageStop | SseEvent::Ignored => {}
+            SseEvent::MessageStop => self.message_stop_seen = true,
+            SseEvent::Ignored => {}
         }
     }
 
-    fn finish(self) -> Result<AnthropicResponse, LlmError> {
+    fn finish(mut self) -> Result<AnthropicResponse, LlmError> {
+        self.usage.normalization_fields_present &= self.message_start_seen
+            && self.final_output_observed
+            && self.message_stop_seen
+            && !self.usage_sequence_fault;
         if self.blocks.is_empty() {
             return Err(LlmError::RequestFailed {
                 provider: "anthropic_oauth".to_string(),
@@ -923,16 +1068,46 @@ enum AnthropicResponseBlock {
     Other,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default)]
 struct AnthropicUsage {
-    #[serde(default)]
+    // Internal presence proof, never read from a model/user field.
+    normalization_fields_present: bool,
     input_tokens: u32,
-    #[serde(default)]
     output_tokens: u32,
-    #[serde(default)]
     cache_creation_input_tokens: u32,
-    #[serde(default)]
     cache_read_input_tokens: u32,
+}
+fn observed_usage_u32<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    u32::deserialize(deserializer).map(Some)
+}
+impl<'de> serde::Deserialize<'de> for AnthropicUsage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            #[serde(default, deserialize_with = "observed_usage_u32")]
+            input_tokens: Option<u32>,
+            #[serde(default, deserialize_with = "observed_usage_u32")]
+            output_tokens: Option<u32>,
+            #[serde(default, deserialize_with = "observed_usage_u32")]
+            cache_creation_input_tokens: Option<u32>,
+            #[serde(default, deserialize_with = "observed_usage_u32")]
+            cache_read_input_tokens: Option<u32>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let normalization_fields_present = raw.input_tokens.is_some()
+            && raw.output_tokens.is_some()
+            && raw.cache_creation_input_tokens.is_some()
+            && raw.cache_read_input_tokens.is_some();
+        Ok(Self {
+            normalization_fields_present,
+            input_tokens: raw.input_tokens.unwrap_or_default(),
+            output_tokens: raw.output_tokens.unwrap_or_default(),
+            cache_creation_input_tokens: raw.cache_creation_input_tokens.unwrap_or_default(),
+            cache_read_input_tokens: raw.cache_read_input_tokens.unwrap_or_default(),
+        })
+    }
 }
 
 /// Build Anthropic `image` content blocks from a user message's multimodal
@@ -1130,8 +1305,207 @@ fn extract_response_content(response: &AnthropicResponse) -> ExtractedAnthropicR
 }
 
 #[cfg(test)]
+#[path = "anthropic_oauth_header_tests.rs"]
+mod request_header_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        static CLI_REFRESH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn fixture_cli_refresh() -> Option<String> {
+        CLI_REFRESH_READS.with(|count| count.set(count.get() + 1));
+        Some("fixture-cli-credential".to_string())
+    }
+
+    async fn custom_401_caller(subject_scoped: bool) {
+        use std::io::{Read, Write};
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let headers = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::clone(&stop);
+        let observed = Arc::clone(&headers);
+        let server = std::thread::spawn(move || {
+            while !done.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        socket.set_nonblocking(false).unwrap();
+                        socket
+                            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                            .unwrap();
+                        let mut raw = Vec::new();
+                        let mut bytes = [0; 2048];
+                        loop {
+                            let n = socket.read(&mut bytes).unwrap();
+                            assert!(n > 0);
+                            raw.extend_from_slice(&bytes[..n]);
+                            assert!(raw.len() <= 65536);
+                            if let Some(end) = raw.windows(4).position(|p| p == b"\r\n\r\n") {
+                                let head = std::str::from_utf8(&raw[..end]).unwrap();
+                                let length = head
+                                    .lines()
+                                    .find_map(|line| {
+                                        line.to_ascii_lowercase()
+                                            .strip_prefix("content-length:")
+                                            .map(|v| v.trim().parse::<usize>().unwrap())
+                                    })
+                                    .unwrap_or(0);
+                                if raw.len() >= end + 4 + length {
+                                    let authorization = head
+                                        .lines()
+                                        .find_map(|line| {
+                                            line.split_once(':')
+                                                .filter(|(key, _)| {
+                                                    key.eq_ignore_ascii_case("authorization")
+                                                })
+                                                .map(|(_, value)| value.trim().to_owned())
+                                        })
+                                        .unwrap();
+                                    observed.lock().unwrap().push(authorization);
+                                    break;
+                                }
+                            }
+                        }
+                        let body = br#"{"error":{"type":"authentication_error","message":"fixture denied"}}"#;
+                        write!(socket, "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                        socket.write_all(body).unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5))
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                }
+            }
+        });
+        let mut config = RegistryProviderConfig::generic(
+            crate::registry::ProviderProtocol::Anthropic,
+            "fixture",
+            None,
+            origin,
+            "fixture-model",
+        );
+        config.oauth_token = Some(SecretString::from("fixture-original-token"));
+        let mut provider = AnthropicOAuthProvider::new(&config, 5).unwrap();
+        provider.client = reqwest::Client::builder().no_proxy().build().unwrap();
+        provider.cli_refresh_loader = Some(fixture_cli_refresh);
+        CLI_REFRESH_READS.with(|count| count.set(0));
+        let body = AnthropicRequest {
+            model: "fixture-model".into(),
+            messages: vec![],
+            stream: None,
+            system: None,
+            max_tokens: 1,
+            temperature: None,
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let result = provider
+            .send_request::<serde_json::Value>(&body, "fixture-original-token", subject_scoped, &reqwest::header::HeaderMap::new())
+            .await;
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        let reads = CLI_REFRESH_READS.with(std::cell::Cell::get);
+        let headers = headers.lock().unwrap();
+        eprintln!(
+            "CustomBearer401Fixture:requests={},refreshReads={}",
+            headers.len(),
+            reads
+        );
+        assert_eq!(
+            reads, 0,
+            "custom endpoints must not read host CLI credentials"
+        );
+        assert_eq!(
+            headers.len(),
+            1,
+            "401 must not retry with another credential"
+        );
+        assert_eq!(headers[0], "Bearer fixture-original-token");
+        if subject_scoped {
+            assert!(matches!(
+                result,
+                Err(LlmError::SubjectAuthRejected {
+                    code: "llm_subject_key_invalid"
+                })
+            ));
+        } else {
+            assert!(matches!(result, Err(LlmError::AuthFailed { .. })));
+        }
+    }
+
+    // TEST-SPEC-custom-bearer-401 CB01/CB04: actual HTTP and original send_request.
+    #[tokio::test(flavor = "current_thread")]
+    async fn custom_bearer_401_never_reads_cli_credentials() {
+        custom_401_caller(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn custom_bearer_subject_401_preserves_subject_rejection() {
+        custom_401_caller(true).await;
+    }
+
+    #[test]
+    fn custom_bearer_refresh_origin_requires_both_exact_official_destinations() {
+        assert!(allows_claude_cli_refresh(
+            ANTHROPIC_API_URL,
+            ANTHROPIC_API_URL
+        ));
+        assert!(allows_claude_cli_refresh(
+            "https://API.ANTHROPIC.com:443/v1/messages",
+            ANTHROPIC_API_URL
+        ));
+        for custom in [
+            "http://127.0.0.1:3100/v1/messages",
+            "https://proxy.invalid/v1/messages",
+            "https://api.anthropic.com.evil.invalid/v1/messages",
+            "https://user@api.anthropic.com/v1/messages",
+            "http://api.anthropic.com/v1/messages",
+            "https://api.anthropic.com:8443/v1/messages",
+            "https://api.anthropic.com/v1/messages?override=1",
+            "https://api.anthropic.com/v1/messages#fragment",
+            "https://api.anthropic.com/other",
+        ] {
+            assert!(!allows_claude_cli_refresh(custom, ANTHROPIC_API_URL));
+            assert!(!allows_claude_cli_refresh(ANTHROPIC_API_URL, custom));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn custom_bearer_guard_preserves_official_cli_refresh_only() {
+        let mut config = RegistryProviderConfig::generic(
+            crate::registry::ProviderProtocol::Anthropic,
+            "fixture",
+            None,
+            String::new(),
+            "fixture-model",
+        );
+        config.oauth_token = Some(SecretString::from("fixture-original-token"));
+        let mut provider = AnthropicOAuthProvider::new(&config, 5).unwrap();
+        provider.cli_refresh_loader = Some(fixture_cli_refresh);
+        CLI_REFRESH_READS.with(|count| count.set(0));
+        assert!(
+            provider
+                .refresh_token_after_401("http://127.0.0.1:3100/v1/messages", ANTHROPIC_API_URL)
+                .await
+                .is_none()
+        );
+        assert_eq!(CLI_REFRESH_READS.with(std::cell::Cell::get), 0);
+        let fresh = provider
+            .refresh_token_after_401(ANTHROPIC_API_URL, ANTHROPIC_API_URL)
+            .await;
+        assert_eq!(fresh.as_deref(), Some("fixture-cli-credential"));
+        assert_eq!(CLI_REFRESH_READS.with(std::cell::Cell::get), 1);
+    }
 
     #[test]
     fn context_overflow_413_maps_to_context_length_exceeded() {
@@ -1261,6 +1635,7 @@ mod tests {
             }],
             stop_reason: Some("end_turn".to_string()),
             usage: AnthropicUsage {
+                normalization_fields_present: false,
                 input_tokens: 10,
                 output_tokens: 5,
                 cache_creation_input_tokens: 0,
@@ -1287,6 +1662,7 @@ mod tests {
             ],
             stop_reason: Some("tool_use".to_string()),
             usage: AnthropicUsage {
+                normalization_fields_present: false,
                 input_tokens: 20,
                 output_tokens: 15,
                 cache_creation_input_tokens: 0,
@@ -1314,6 +1690,7 @@ mod tests {
             ],
             stop_reason: Some("end_turn".to_string()),
             usage: AnthropicUsage {
+                normalization_fields_present: false,
                 input_tokens: 20,
                 output_tokens: 15,
                 cache_creation_input_tokens: 0,
@@ -1340,6 +1717,7 @@ mod tests {
             ],
             stop_reason: Some("end_turn".to_string()),
             usage: AnthropicUsage {
+                normalization_fields_present: false,
                 input_tokens: 20,
                 output_tokens: 15,
                 cache_creation_input_tokens: 0,
@@ -1377,99 +1755,211 @@ mod tests {
 
 // 覆盖:2026-08-28 天权补丁——SSE 流式聚合(治子 agent 长生成非流式死循环)
 #[cfg(test)]
-mod streaming_tests {
+mod streaming_tests;
+
+#[cfg(test)]
+mod normalized_usage_presence_tests {
     use super::*;
-
-    fn feed(aggregator: &mut SseAggregator, json_line: &str) {
-        let event: SseEvent = serde_json::from_str(json_line).expect("测试事件应可解析");
-        aggregator.absorb(event);
+    fn event(aggregator: &mut SseAggregator, value: serde_json::Value) {
+        aggregator.absorb(serde_json::from_value(value).unwrap());
+    }
+    fn aggregate(final_usage: bool, stop: bool) -> AnthropicResponse {
+        let mut original = SseAggregator::default();
+        event(
+            &mut original,
+            serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}),
+        );
+        event(
+            &mut original,
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"ok"}}),
+        );
+        if final_usage {
+            event(
+                &mut original,
+                serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}),
+            );
+        }
+        if stop {
+            event(&mut original, serde_json::json!({"type":"message_stop"}));
+        }
+        original.finish().unwrap()
+    }
+    #[test]
+    fn actual_zero_requires_present_final_usage_and_message_stop() {
+        assert!(aggregate(true, true).usage.normalization_fields_present);
+        assert!(!aggregate(false, true).usage.normalization_fields_present);
+        assert!(!aggregate(true, false).usage.normalization_fields_present);
+        let missing: AnthropicUsage = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!missing.normalization_fields_present);
+        assert_eq!(missing.input_tokens, 0); // Old raw projection remains compatible, never V1.
     }
 
     #[test]
-    fn sse_text_and_tool_use_aggregate() {
-        let mut agg = SseAggregator::default();
-        feed(
-            &mut agg,
-            r#"{"type":"message_start","message":{"usage":{"input_tokens":120,"cache_read_input_tokens":30}}}"#,
+    fn null_counters_and_post_stop_or_decreasing_usage_cannot_mint_v1() {
+        assert!(
+            serde_json::from_value::<AnthropicUsage>(serde_json::json!({"input_tokens":null}))
+                .is_err()
         );
-        feed(
-            &mut agg,
-            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text"}}"#,
+        assert!(
+            serde_json::from_value::<SseUsageDelta>(serde_json::json!({"output_tokens":null}))
+                .is_err()
         );
-        feed(
-            &mut agg,
-            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"正文"}}"#,
+        let mut original = SseAggregator::default();
+        event(
+            &mut original,
+            serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":2,"output_tokens":0,"cache_read_input_tokens":7,"cache_creation_input_tokens":100}}}),
         );
-        feed(
-            &mut agg,
-            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"续写"}}"#,
+        event(
+            &mut original,
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"ok"}}),
         );
-        feed(
-            &mut agg,
-            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tu_1","name":"write_file"}}"#,
+        event(
+            &mut original,
+            serde_json::json!({"type":"message_delta","usage":{"output_tokens":3}}),
         );
-        feed(
-            &mut agg,
-            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
+        event(
+            &mut original,
+            serde_json::json!({"type":"message_delta","usage":{"output_tokens":0}}),
         );
-        feed(
-            &mut agg,
-            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"/tmp/a\"}"}}"#,
+        event(&mut original, serde_json::json!({"type":"message_stop"}));
+        assert!(
+            !original
+                .finish()
+                .unwrap()
+                .usage
+                .normalization_fields_present
         );
-        feed(
-            &mut agg,
-            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":456}}"#,
+        let mut post = SseAggregator::default();
+        event(
+            &mut post,
+            serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}),
         );
-        feed(&mut agg, r#"{"type":"message_stop"}"#);
-        let resp = agg.finish().expect("聚合应成功");
-        assert_eq!(resp.usage.input_tokens, 120);
-        assert_eq!(resp.usage.cache_read_input_tokens, 30);
-        assert_eq!(resp.usage.output_tokens, 456);
-        assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
-        match &resp.content[0] {
-            AnthropicResponseBlock::Text { text } => assert_eq!(text, "正文续写"),
-            other => panic!("块 0 应为 Text: {other:?}"),
-        }
-        match &resp.content[1] {
-            AnthropicResponseBlock::ToolUse { id, name, input } => {
-                assert_eq!(id, "tu_1");
-                assert_eq!(name, "write_file");
-                assert_eq!(input["path"], "/tmp/a");
-            }
-            other => panic!("块 1 应为 ToolUse: {other:?}"),
-        }
+        event(
+            &mut post,
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"ok"}}),
+        );
+        event(
+            &mut post,
+            serde_json::json!({"type":"message_delta","usage":{"output_tokens":0}}),
+        );
+        event(&mut post, serde_json::json!({"type":"message_stop"}));
+        event(
+            &mut post,
+            serde_json::json!({"type":"message_delta","usage":{"output_tokens":0}}),
+        );
+        assert!(!post.finish().unwrap().usage.normalization_fields_present);
     }
-
+    fn aggregate_original_start_and_delta(
+        start: serde_json::Value,
+        delta_usage: serde_json::Value,
+    ) -> AnthropicResponse {
+        let mut original = SseAggregator::default();
+        event(
+            &mut original,
+            serde_json::json!({"type":"message_start","message":start}),
+        );
+        event(
+            &mut original,
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"ok"}}),
+        );
+        event(
+            &mut original,
+            serde_json::json!({"type":"message_delta","usage":delta_usage}),
+        );
+        event(&mut original, serde_json::json!({"type":"message_stop"}));
+        original.finish().unwrap()
+    }
     #[test]
-    fn sse_thinking_block_aggregates() {
-        let mut agg = SseAggregator::default();
-        feed(
-            &mut agg,
-            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}"#,
+    fn message_start_full_presence_is_required_even_with_final_explicit_zero_and_stop() {
+        let full = serde_json::json!({"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0});
+        let known = aggregate_original_start_and_delta(
+            serde_json::json!({"usage":full.clone()}),
+            serde_json::json!({"output_tokens":0}),
         );
-        feed(
-            &mut agg,
-            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"推理"}}"#,
-        );
-        feed(
-            &mut agg,
-            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}"#,
-        );
-        let resp = agg.finish().expect("聚合应成功");
-        match &resp.content[0] {
-            AnthropicResponseBlock::Thinking { thinking, .. } => {
-                assert_eq!(thinking.as_deref(), Some("推理"))
-            }
-            other => panic!("应为 Thinking: {other:?}"),
+        assert!(known.usage.normalization_fields_present);
+        for key in [
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ] {
+            let mut missing = full.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            let response = aggregate_original_start_and_delta(
+                serde_json::json!({"usage":missing}),
+                serde_json::json!({"output_tokens":0}),
+            );
+            assert!(
+                !response.usage.normalization_fields_present,
+                "missing {key} cannot qualify raw zero"
+            );
+            assert_eq!(response.usage.output_tokens, 0); // Only raw backwards-compatible projection.
         }
+        assert!(
+            !aggregate_original_start_and_delta(
+                serde_json::json!({}),
+                serde_json::json!({"output_tokens":0})
+            )
+            .usage
+            .normalization_fields_present
+        );
+        assert!(
+            !aggregate_original_start_and_delta(
+                serde_json::json!({"usage":full}),
+                serde_json::json!({})
+            )
+            .usage
+            .normalization_fields_present
+        );
     }
-
     #[test]
-    fn sse_empty_stream_errors() {
-        let agg = SseAggregator::default();
-        assert!(agg.finish().is_err(), "空流应报错(端点空响应铁证形态)");
+    fn message_start_null_and_initial_output_lower_bound_cannot_mint_known_usage() {
+        let full = serde_json::json!({"input_tokens":0,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0});
+        for key in [
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ] {
+            let mut null = full.clone();
+            null[key] = serde_json::Value::Null;
+            assert!(
+                serde_json::from_value::<SseEvent>(
+                    serde_json::json!({"type":"message_start","message":{"usage":null}})
+                )
+                .is_err(),
+                "null {key}"
+            );
+        }
+        assert!(
+            serde_json::from_value::<SseEvent>(
+                serde_json::json!({"type":"message_start","message":{"usage":null}})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<SseEvent>(
+                serde_json::json!({"type":"message_delta","usage":{"output_tokens":null}})
+            )
+            .is_err()
+        );
+        let decreasing = aggregate_original_start_and_delta(
+            serde_json::json!({"usage":full.clone()}),
+            serde_json::json!({"output_tokens":4}),
+        );
+        assert!(!decreasing.usage.normalization_fields_present);
+        let monotonic = aggregate_original_start_and_delta(
+            serde_json::json!({"usage":full}),
+            serde_json::json!({"output_tokens":5}),
+        );
+        assert!(monotonic.usage.normalization_fields_present);
+        assert_eq!(monotonic.usage.output_tokens, 5);
     }
-    // -- ISSUE-IRONCLAW-007: config-level max_tokens fallback --
+}
+
+#[cfg(test)]
+mod subject_policy_tests {
+    use super::*;
 
     fn oauth_test_config(max_tokens: Option<u32>) -> crate::config::RegistryProviderConfig {
         let mut config = crate::config::RegistryProviderConfig::generic(
@@ -1484,20 +1974,6 @@ mod streaming_tests {
         .with_max_tokens(max_tokens);
         config.oauth_token = Some(secrecy::SecretString::from("test-oauth-token"));
         config
-    }
-
-    #[test]
-    fn provider_uses_config_max_tokens_as_fallback() {
-        let provider = AnthropicOAuthProvider::new(&oauth_test_config(Some(65536)), 60)
-            .expect("provider builds");
-        assert_eq!(provider.default_max_tokens, 65536);
-    }
-
-    #[test]
-    fn provider_falls_back_to_builtin_default_max_tokens() {
-        let provider =
-            AnthropicOAuthProvider::new(&oauth_test_config(None), 60).expect("provider builds");
-        assert_eq!(provider.default_max_tokens, DEFAULT_MAX_TOKENS);
     }
 
     struct TestSubjectResolver;

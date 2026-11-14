@@ -17,11 +17,12 @@ use std::num::{NonZeroU32, NonZeroU64};
 mod run_action_descriptors;
 
 pub use run_action_descriptors::{
-    WEBUI_V2_PATTERN_CANCEL_RUN, WEBUI_V2_PATTERN_RESOLVE_GATE, WEBUI_V2_PATTERN_RETRY_RUN,
-    WEBUI_V2_ROUTE_CANCEL_RUN, WEBUI_V2_ROUTE_RESOLVE_GATE, WEBUI_V2_ROUTE_RETRY_RUN,
+    WEBUI_V2_PATTERN_CANCEL_RUN, WEBUI_V2_PATTERN_RECOVER_RUN, WEBUI_V2_PATTERN_RESOLVE_GATE,
+    WEBUI_V2_PATTERN_RETRY_RUN, WEBUI_V2_ROUTE_CANCEL_RUN,
+    WEBUI_V2_ROUTE_RESOLVE_GATE, WEBUI_V2_ROUTE_RETRY_RUN,
 };
 use run_action_descriptors::{
-    cancel_run_descriptor, resolve_gate_descriptor, retry_run_descriptor,
+    cancel_run_descriptor, recover_run_descriptor, resolve_gate_descriptor, retry_run_descriptor,
 };
 
 pub const WEBUI_V2_ROUTE_CREATE_THREAD: &str = "webui.v2.create_thread";
@@ -227,6 +228,7 @@ pub const WEBUI_V2_PATTERN_PROJECT_MEMBER_DETAIL: &str =
 pub fn webui_v2_routes() -> Vec<IngressRouteDescriptor> {
     vec![
         get_session_descriptor(),
+        usage_tree_descriptor(),
         create_thread_descriptor(),
         delete_thread_descriptor(),
         send_message_descriptor(),
@@ -241,6 +243,7 @@ pub fn webui_v2_routes() -> Vec<IngressRouteDescriptor> {
         cancel_run_descriptor(),
         resolve_gate_descriptor(),
         retry_run_descriptor(),
+        recover_run_descriptor(),
         list_automations_descriptor(),
         pause_automation_descriptor(),
         resume_automation_descriptor(),
@@ -1782,4 +1785,21 @@ fn rate_limit_per_caller(max: u32, window_secs: u32) -> RateLimitPolicy {
         max_requests: NonZeroU32::new(max).expect("max_requests must be non-zero"), // safety: all call sites pass crate-local positive constants (12, 60, 120)
         window_seconds: NonZeroU32::new(window_secs).expect("window_seconds must be non-zero"), // safety: all call sites pass crate-local positive constants (60)
     }
+}
+
+pub const WEBUI_V2_PATTERN_USAGE_TREE: &str =
+    "/api/webchat/v2/threads/{thread_id}/runs/{run_id}/usage-tree";
+pub const WEBUI_V2_ROUTE_USAGE_TREE: &str = "webui.v2.usage_tree";
+fn usage_tree_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_USAGE_TREE,
+        NetworkMethod::Get,
+        WEBUI_V2_PATTERN_USAGE_TREE,
+        read_policy(
+            read_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProductWorkflow,
+            StreamingMode::None,
+        ),
+    )
 }

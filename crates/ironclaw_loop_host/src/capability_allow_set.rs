@@ -54,6 +54,16 @@ pub trait CapabilitySurfaceProfileResolver: Send + Sync {
         &self,
         run_context: &LoopRunContext,
     ) -> Result<CapabilityAllowSet, CapabilityResolveError>;
+
+    /// Resolve against the actual decorated port before profile filtering.
+    /// Existing resolvers retain their original ceiling by default.
+    async fn resolve_for_capabilities(
+        &self,
+        run_context: &LoopRunContext,
+        _capabilities: &(dyn ironclaw_turns::run_profile::LoopCapabilityPort + Send + Sync),
+    ) -> Result<CapabilityAllowSet, CapabilityResolveError> {
+        self.resolve(run_context).await
+    }
 }
 
 #[cfg(test)]

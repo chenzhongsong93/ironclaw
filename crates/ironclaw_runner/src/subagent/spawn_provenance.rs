@@ -46,9 +46,11 @@ pub(crate) struct SpawnProvenanceRecord {
     /// Trusted parent from the persisted child-run relationship, never a model-supplied value.
     pub parent_run_id: String,
     pub subagent_type: String,
+    /// Set at accepted start from the exact TianQuan parent binding when present.
+    /// Terminal updates never populate this field from the child scope.
     pub project_id: Option<String>,
-    /// Spawn context carries no layer concept today → always `None` (never
-    /// hardcode a TianQuan-specific value upstream).
+    /// Copied only from a matching TianQuan parent run binding at accepted start;
+    /// never inferred from a subagent role or task text. Terminal updates leave it unset.
     pub layer: Option<String>,
     pub spawned_at: DateTime<Utc>,
     pub terminal_status: String,
@@ -65,7 +67,6 @@ pub(crate) struct SpawnProvenanceRecord {
 pub(crate) struct SpawnTerminalInput<'a> {
     pub child_run_id: &'a TurnRunId,
     pub parent_run_id: &'a TurnRunId,
-    pub child_scope: &'a TurnScope,
     pub subagent_kind: &'a ironclaw_loop_host::SubagentKindId,
     pub terminal_kind: EdgeTerminalKind,
     pub final_text: Option<&'a str>,
@@ -107,7 +108,6 @@ impl SpawnProvenanceRecord {
         let SpawnTerminalInput {
             child_run_id,
             parent_run_id,
-            child_scope,
             subagent_kind,
             terminal_kind,
             final_text,
@@ -118,10 +118,7 @@ impl SpawnProvenanceRecord {
             child_run_id: child_run_id.to_string(),
             parent_run_id: parent_run_id.to_string(),
             subagent_type: subagent_kind.to_string(),
-            project_id: child_scope
-                .project_id
-                .as_ref()
-                .map(|p| p.as_str().to_string()),
+            project_id: None,
             layer: None,
             spawned_at,
             terminal_status: terminal_status_str(terminal_kind).to_string(),
@@ -176,14 +173,16 @@ pub(crate) async fn record_spawn_terminal(
     record: &SpawnProvenanceRecord,
     final_text: Option<&str>,
 ) {
-    if !persist_final_text_to_workspace(final_text, record) {
-        // 已有同 child 的不同原文或落盘失败：不更新 PG hash，保留首次可信来源。
-        return;
+    let raw_persisted = persist_final_text_to_workspace(final_text, record);
+    let mut terminal_record = record.clone();
+    if !raw_persisted {
+        // 文件失败不能隐藏终态，也不能发布未经落盘确认的新 hash。
+        terminal_record.final_text_hash = None;
     }
     let Some(pg_url) = pg_url else {
         return;
     };
-    if let Err(error) = upsert_spawn_record(pg_url, record).await {
+    if let Err(error) = upsert_spawn_record(pg_url, &terminal_record).await {
         tracing::warn!(
             target: "tianquan_spawn_provenance",
             child_run_id = %record.child_run_id,
@@ -201,12 +200,41 @@ pub(crate) async fn record_spawn_started(pg_url: Option<&str>, record: &SpawnPro
     let Some(pg_url) = pg_url else {
         return;
     };
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        insert_spawn_started(pg_url, record),
-    )
-    .await
-    {
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut trusted_record = record.clone();
+        match read_tianquan_parent_scope(pg_url, &trusted_record.parent_run_id).await {
+            Ok(Some((parent_project, _layer)))
+                if trusted_record
+                    .project_id
+                    .as_deref()
+                    .is_some_and(|project| project != parent_project.as_str()) =>
+            {
+                tracing::warn!(
+                    target: "tianquan_spawn_provenance",
+                    parent_run_id = %trusted_record.parent_run_id,
+                    child_project_id = trusted_record.project_id.as_deref(),
+                    parent_project_id = %parent_project,
+                    "child scope project disagrees with trusted TianQuan parent; clearing both provenance fields"
+                );
+                trusted_record.project_id = None;
+                trusted_record.layer = None;
+            }
+            Ok(Some((parent_project, layer))) => {
+                trusted_record.project_id = Some(parent_project);
+                trusted_record.layer = layer.filter(|value| is_known_tianquan_layer(value));
+            }
+            Ok(None) => trusted_record.layer = None,
+            Err(error) => tracing::warn!(
+                target: "tianquan_spawn_provenance",
+                parent_run_id = %trusted_record.parent_run_id,
+                error = %error,
+                "trusted TianQuan parent layer lookup failed; preserving unknown layer"
+            ),
+        }
+        insert_spawn_started(pg_url, &trusted_record).await
+    })
+    .await;
+    match result {
         Ok(Ok(())) => {}
         Ok(Err(error)) => tracing::warn!(
             target: "tianquan_spawn_provenance",
@@ -220,6 +248,50 @@ pub(crate) async fn record_spawn_started(pg_url: Option<&str>, record: &SpawnPro
             "spawn start provenance insert timed out after 2 seconds (best-effort)"
         ),
     }
+}
+
+/// Read project and optional legacy layer only from the server-owned parent run binding.
+/// Parent IDs come from the accepted await edge. A known child project must match; an absent
+/// child project may be filled from the binding. Old schemas and NULL layers remain compatible.
+async fn read_tianquan_parent_scope(
+    pg_url: &str,
+    parent_run_id: &str,
+) -> Result<Option<(String, Option<String>)>, tokio_postgres::Error> {
+    let (client, connection) = tokio_postgres::connect(pg_url, tokio_postgres::NoTls).await?;
+    let connection_task = tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            tracing::warn!(
+                target: "tianquan_spawn_provenance",
+                error = %error,
+                "TianQuan parent layer lookup connection failed"
+            );
+        }
+    });
+    let row = client
+        .query_opt(
+            "SELECT binding.project_id, to_jsonb(binding)->>'legacy_layer' \
+             FROM tianquan_run_bindings binding WHERE binding.run_id=$1",
+            &[&parent_run_id],
+        )
+        .await?;
+    drop(client);
+    let _ = connection_task.await;
+    Ok(row.map(|row| (row.get::<_, String>(0), row.get::<_, Option<String>>(1))))
+}
+
+fn is_known_tianquan_layer(layer: &str) -> bool {
+    matches!(
+        layer,
+        "meta:greenlight"
+            | "meta:ontology"
+            | "world:static"
+            | "loop:state"
+            | "loop:plot"
+            | "loop:event"
+            | "loop:discourse"
+            | "loop:pack"
+            | "loop:prose"
+    )
 }
 
 /// 把子 agent final_text 原文忠实落盘到 workspace 正文文件(引擎侧落盘,零 LLM 转抄)。
@@ -328,7 +400,7 @@ async fn upsert_spawn_record(
              layer = COALESCE(spawn_records.layer, EXCLUDED.layer), \
              spawned_at = spawn_records.spawned_at, \
              terminal_status = EXCLUDED.terminal_status, \
-             final_text_hash = EXCLUDED.final_text_hash, \
+             final_text_hash = COALESCE(EXCLUDED.final_text_hash, spawn_records.final_text_hash), \
              failure_category = EXCLUDED.failure_category",
             &[
                 &record.child_run_id,
@@ -402,18 +474,20 @@ mod tests {
 
     macro_rules! terminal_record {
         ($child:expr, $parent:expr, $scope:expr, $kind:expr,
-         $terminal:expr, $text:expr, $spawned_at:expr, $failure:expr $(,)?) => {
-            SpawnProvenanceRecord::from_terminal(SpawnTerminalInput {
-                child_run_id: $child,
-                parent_run_id: $parent,
-                child_scope: $scope,
-                subagent_kind: $kind,
-                terminal_kind: $terminal,
-                final_text: $text,
-                spawned_at: $spawned_at,
-                failure_category: $failure,
-            })
-        };
+         $terminal:expr, $text:expr, $spawned_at:expr, $failure:expr $(,)?) => {{
+            {
+                let _ = $scope;
+                SpawnProvenanceRecord::from_terminal(SpawnTerminalInput {
+                    child_run_id: $child,
+                    parent_run_id: $parent,
+                    subagent_kind: $kind,
+                    terminal_kind: $terminal,
+                    final_text: $text,
+                    spawned_at: $spawned_at,
+                    failure_category: $failure,
+                })
+            }
+        }};
     }
 
     static PROSE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -534,7 +608,7 @@ mod tests {
 
     // 覆盖:§2.2 PH-IC-MAP-03 — project_id 从 scope 取,None → None(不硬编码)
     #[test]
-    fn record_from_terminal_project_id_passthrough() {
+    fn record_from_terminal_does_not_backfill_project_from_child_scope() {
         let child_run_id = TurnRunId::new();
         let scope_none = scope_with_project(None);
         let rec = terminal_record!(
@@ -561,7 +635,7 @@ mod tests {
             Utc::now(),
             None,
         );
-        assert_eq!(rec.project_id.as_deref(), Some("project:iron-city"));
+        assert_eq!(rec.project_id, None);
     }
 
     #[test]
@@ -598,6 +672,29 @@ mod tests {
         );
         // 无 PG 在跑;若误触网必 panic/超时,返回即证明零开销跳过
         record_spawn_terminal(None, &rec, None).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicit read-only PostgreSQL preflight DSN"]
+    async fn tokio_pg_dsn_options_preserve_role_and_search_path() {
+        let pg_url = std::env::var("TIANQUAN_PG_PREFLIGHT_URL")
+            .expect("read-only preflight URL must be explicit");
+        let expected_role =
+            std::env::var("TIANQUAN_PG_PREFLIGHT_ROLE").expect("preflight role must be explicit");
+        let expected_schema = std::env::var("TIANQUAN_PG_PREFLIGHT_SCHEMA")
+            .expect("preflight schema must be explicit");
+        let (client, connection) = tokio_postgres::connect(&pg_url, tokio_postgres::NoTls)
+            .await
+            .expect("connect read-only preflight PG");
+        let driver = tokio::spawn(async move { connection.await.expect("PG connection driver") });
+        let row = client
+            .query_one("SELECT current_user, current_schema()", &[])
+            .await
+            .expect("read role and current schema");
+        assert_eq!(row.get::<_, String>(0), expected_role);
+        assert_eq!(row.get::<_, String>(1), expected_schema);
+        drop(client);
+        driver.await.expect("join PG driver");
     }
 
     // 覆盖:2026-08-04 落盘标准 + 2026-08-07 铁律——raw final_text 忠实落盘(通用平台不做领域判断)
@@ -809,16 +906,23 @@ mod tests {
                 "CREATE TABLE spawn_records (\
                  child_run_id TEXT PRIMARY KEY, parent_run_id TEXT, subagent_type TEXT NOT NULL, \
                  project_id TEXT, layer TEXT, spawned_at TIMESTAMPTZ NOT NULL, \
-                 terminal_status TEXT, final_text_hash TEXT, failure_category TEXT)",
+                 terminal_status TEXT, final_text_hash TEXT, failure_category TEXT); \
+                 CREATE TABLE tianquan_run_bindings (\
+                 run_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, legacy_layer TEXT)",
             )
             .await
-            .expect("create disposable spawn table");
+            .expect("create disposable provenance tables");
         let parent = TurnRunId::new();
         let child = TurnRunId::new();
         let raw = "原文不允许被重写。";
-        let scope = scope_with_project(Some(ironclaw_host_api::ProjectId::from_trusted(
-            "atomic-spawn".to_string(),
-        )));
+        let scope = scope_with_project(None);
+        client
+            .execute(
+                "INSERT INTO tianquan_run_bindings(run_id,project_id,legacy_layer) VALUES ($1,$2,$3)",
+                &[&parent.to_string(), &"atomic-spawn", &Some("loop:prose".to_owned())],
+            )
+            .await
+            .expect("seed trusted parent binding");
         let spawned_at = Utc::now();
         let started = SpawnProvenanceRecord::from_spawned(
             &child,
@@ -832,7 +936,7 @@ mod tests {
         let started_row = client
             .query_one(
                 "SELECT parent_run_id, subagent_type, project_id, terminal_status, \
-                 final_text_hash, spawned_at FROM spawn_records WHERE child_run_id=$1",
+                 final_text_hash, spawned_at, layer FROM spawn_records WHERE child_run_id=$1",
                 &[&started.child_run_id],
             )
             .await
@@ -849,6 +953,10 @@ mod tests {
         assert_eq!(started_row.get::<_, String>(3), "Spawned");
         assert_eq!(started_row.get::<_, Option<String>>(4), None);
         let persisted_spawned_at: DateTime<Utc> = started_row.get(5);
+        assert_eq!(
+            started_row.get::<_, Option<String>>(6).as_deref(),
+            Some("loop:prose")
+        );
         let record = terminal_record!(
             &child,
             &parent,
@@ -862,7 +970,7 @@ mod tests {
         record_spawn_terminal(Some(&pg_url), &record, None).await;
         let row = client
             .query_one(
-                "SELECT parent_run_id, project_id, final_text_hash, terminal_status, spawned_at \
+                "SELECT parent_run_id, project_id, final_text_hash, terminal_status, spawned_at, layer \
                  FROM spawn_records WHERE child_run_id=$1",
                 &[&record.child_run_id],
             )
@@ -873,8 +981,272 @@ mod tests {
         assert_eq!(row.get::<_, Option<String>>(2), Some(sha256_hex(raw)));
         assert_eq!(row.get::<_, String>(3), "Completed");
         assert_eq!(row.get::<_, DateTime<Utc>>(4), persisted_spawned_at);
+        assert_eq!(
+            row.get::<_, Option<String>>(5).as_deref(),
+            Some("loop:prose")
+        );
+
+        // 覆盖:AE-L2-107/ISSUE-IRONCLAW-021 — raw目录失败不能隐藏终态或发布新hash。
+        let bad_root =
+            tempfile::NamedTempFile::new().expect("ordinary file cannot be raw directory");
+        let good_root = tempfile::tempdir().expect("isolated raw root");
+        let old_root = std::env::var_os("TIANQUAN_SPAWN_PROSE_DIR");
+        unsafe { std::env::set_var("TIANQUAN_SPAWN_PROSE_DIR", bad_root.path()) };
+        let export_child = TurnRunId::new();
+        let export_started = SpawnProvenanceRecord::from_spawned(
+            &export_child,
+            &parent,
+            &scope,
+            &kind("novelist"),
+            spawned_at,
+        );
+        record_spawn_started(Some(&pg_url), &export_started).await;
+        let export_terminal = terminal_record!(
+            &export_child,
+            &parent,
+            &scope,
+            &kind("novelist"),
+            EdgeTerminalKind::Completed,
+            Some("first raw"),
+            spawned_at,
+            None,
+        );
+        record_spawn_terminal(Some(&pg_url), &export_terminal, Some("first raw")).await;
+        let failed_export = client
+            .query_one(
+                "SELECT terminal_status,final_text_hash FROM spawn_records WHERE child_run_id=$1",
+                &[&export_child.to_string()],
+            )
+            .await
+            .expect("failed export row");
+        assert_eq!(
+            failed_export.get::<_, String>(0),
+            "Completed",
+            "file failure must not leave Spawned"
+        );
+        assert_eq!(failed_export.get::<_, Option<String>>(1), None);
+        unsafe { std::env::set_var("TIANQUAN_SPAWN_PROSE_DIR", good_root.path()) };
+        record_spawn_terminal(Some(&pg_url), &export_terminal, Some("first raw")).await;
+        let conflict = terminal_record!(
+            &export_child,
+            &parent,
+            &scope,
+            &kind("novelist"),
+            EdgeTerminalKind::Completed,
+            Some("different raw"),
+            spawned_at,
+            None,
+        );
+        record_spawn_terminal(Some(&pg_url), &conflict, Some("different raw")).await;
+        let unavailable_pg = pg_url.replace("/atomic_spawn_test", "/atomic_spawn_missing");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            record_spawn_terminal(Some(&unavailable_pg), &conflict, Some("different raw")),
+        )
+        .await
+        .expect("raw conflict and unavailable database must not break settle");
+        match old_root {
+            Some(value) => unsafe { std::env::set_var("TIANQUAN_SPAWN_PROSE_DIR", value) },
+            None => unsafe { std::env::remove_var("TIANQUAN_SPAWN_PROSE_DIR") },
+        }
+        let preserved = client
+            .query_one(
+                "SELECT final_text_hash FROM spawn_records WHERE child_run_id=$1",
+                &[&export_child.to_string()],
+            )
+            .await
+            .expect("preserved raw hash");
+        assert_eq!(
+            preserved.get::<_, Option<String>>(0),
+            Some(sha256_hex("first raw"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                good_root
+                    .path()
+                    .join("runs")
+                    .join(format!("{export_child}.txt"))
+            )
+            .expect("first raw"),
+            "first raw"
+        );
+
+        // Wrong-project and NULL sources never acquire a layer, regardless of novelist role.
+        let wrong_project_parent = TurnRunId::new();
         client
-            .batch_execute("DROP TABLE spawn_records")
+            .execute(
+                "INSERT INTO tianquan_run_bindings(run_id,project_id,legacy_layer) VALUES ($1,$2,$3)",
+                &[&wrong_project_parent.to_string(), &"atomic-spawn", &Some("loop:prose".to_owned())],
+            )
+            .await
+            .unwrap();
+        let wrong_project_child = TurnRunId::new();
+        let wrong_project_scope = scope_with_project(Some(
+            ironclaw_host_api::ProjectId::from_trusted("other-project".to_string()),
+        ));
+        let wrong_project_start = SpawnProvenanceRecord::from_spawned(
+            &wrong_project_child,
+            &wrong_project_parent,
+            &wrong_project_scope,
+            &kind("novelist"),
+            Utc::now(),
+        );
+        record_spawn_started(Some(&pg_url), &wrong_project_start).await;
+        let wrong_row = client
+            .query_one(
+                "SELECT project_id,layer FROM spawn_records WHERE child_run_id=$1",
+                &[&wrong_project_start.child_run_id],
+            )
+            .await
+            .unwrap();
+        let wrong_scope = (
+            wrong_row.get::<_, Option<String>>(0),
+            wrong_row.get::<_, Option<String>>(1),
+        );
+        assert_eq!(wrong_scope, (None, None));
+        let wrong_project_terminal = terminal_record!(
+            &wrong_project_child,
+            &wrong_project_parent,
+            &wrong_project_scope,
+            &kind("novelist"),
+            EdgeTerminalKind::Completed,
+            Some("错项目终态"),
+            Utc::now(),
+            None,
+        );
+        record_spawn_terminal(Some(&pg_url), &wrong_project_terminal, None).await;
+        let wrong_terminal_row = client
+            .query_one(
+                "SELECT project_id,layer FROM spawn_records WHERE child_run_id=$1",
+                &[&wrong_project_start.child_run_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                wrong_terminal_row.get::<_, Option<String>>(0),
+                wrong_terminal_row.get::<_, Option<String>>(1)
+            ),
+            (None, None),
+            "terminal child scope must not refill rejected parent provenance"
+        );
+
+        let null_layer_parent = TurnRunId::new();
+        client
+            .execute(
+                "INSERT INTO tianquan_run_bindings(run_id,project_id,legacy_layer) VALUES ($1,$2,NULL)",
+                &[&null_layer_parent.to_string(), &"atomic-spawn"],
+            )
+            .await
+            .unwrap();
+        let null_layer_child = TurnRunId::new();
+        let null_layer_start = SpawnProvenanceRecord::from_spawned(
+            &null_layer_child,
+            &null_layer_parent,
+            &scope,
+            &kind("novelist"),
+            Utc::now(),
+        );
+        record_spawn_started(Some(&pg_url), &null_layer_start).await;
+        let null_row = client
+            .query_one(
+                "SELECT project_id,layer FROM spawn_records WHERE child_run_id=$1",
+                &[&null_layer_start.child_run_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                null_row.get::<_, Option<String>>(0),
+                null_row.get::<_, Option<String>>(1)
+            ),
+            (Some("atomic-spawn".to_owned()), None)
+        );
+
+        // A terminal-only legacy row cannot backfill layer from a later binding.
+        let absent_parent = TurnRunId::new();
+        let absent_child = TurnRunId::new();
+        let absent_start = SpawnProvenanceRecord::from_spawned(
+            &absent_child,
+            &absent_parent,
+            &scope,
+            &kind("novelist"),
+            Utc::now(),
+        );
+        record_spawn_started(Some(&pg_url), &absent_start).await;
+        client
+            .execute(
+                "INSERT INTO tianquan_run_bindings(run_id,project_id,legacy_layer) VALUES ($1,$2,$3)",
+                &[&absent_parent.to_string(), &"atomic-spawn", &Some("loop:prose".to_owned())],
+            )
+            .await
+            .unwrap();
+        let absent_terminal = terminal_record!(
+            &absent_child,
+            &absent_parent,
+            &scope,
+            &kind("novelist"),
+            EdgeTerminalKind::Completed,
+            Some("终态原文"),
+            Utc::now(),
+            None,
+        );
+        record_spawn_terminal(Some(&pg_url), &absent_terminal, None).await;
+        let historical_scope = client
+            .query_one(
+                "SELECT project_id,layer FROM spawn_records WHERE child_run_id=$1",
+                &[&absent_child.to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                historical_scope.get::<_, Option<String>>(0),
+                historical_scope.get::<_, Option<String>>(1)
+            ),
+            (None, None),
+            "terminal update must not backfill project or layer after a missing start source"
+        );
+
+        // Migration rollout can briefly expose the old parent table shape; project remains
+        // sourced from that row while the absent layer key resolves to NULL.
+        client
+            .batch_execute("ALTER TABLE tianquan_run_bindings DROP COLUMN legacy_layer")
+            .await
+            .unwrap();
+        let old_schema_parent = TurnRunId::new();
+        client
+            .execute(
+                "INSERT INTO tianquan_run_bindings(run_id,project_id) VALUES ($1,$2)",
+                &[&old_schema_parent.to_string(), &"atomic-spawn"],
+            )
+            .await
+            .unwrap();
+        let old_schema_child = TurnRunId::new();
+        let old_schema_start = SpawnProvenanceRecord::from_spawned(
+            &old_schema_child,
+            &old_schema_parent,
+            &scope_with_project(None),
+            &kind("novelist"),
+            Utc::now(),
+        );
+        record_spawn_started(Some(&pg_url), &old_schema_start).await;
+        let old_schema_row = client
+            .query_one(
+                "SELECT project_id,layer FROM spawn_records WHERE child_run_id=$1",
+                &[&old_schema_child.to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                old_schema_row.get::<_, Option<String>>(0),
+                old_schema_row.get::<_, Option<String>>(1)
+            ),
+            (Some("atomic-spawn".to_owned()), None)
+        );
+        client
+            .batch_execute("DROP TABLE spawn_records; DROP TABLE tianquan_run_bindings")
             .await
             .expect("remove disposable table");
         drop(client);

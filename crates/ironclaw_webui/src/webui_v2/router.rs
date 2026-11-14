@@ -18,7 +18,7 @@ use crate::webui_v2::descriptors::{
     WEBUI_V2_PATTERN_ADMIN_USER_ROLE, WEBUI_V2_PATTERN_ADMIN_USER_SECRET,
     WEBUI_V2_PATTERN_ADMIN_USER_SECRETS, WEBUI_V2_PATTERN_ADMIN_USER_STATUS,
     WEBUI_V2_PATTERN_ADMIN_USERS, WEBUI_V2_PATTERN_AUTOMATION_DETAIL,
-    WEBUI_V2_PATTERN_BROWSE_FS_DIR, WEBUI_V2_PATTERN_CANCEL_RUN,
+    WEBUI_V2_PATTERN_BROWSE_FS_DIR, WEBUI_V2_PATTERN_CANCEL_RUN, WEBUI_V2_PATTERN_RECOVER_RUN,
     WEBUI_V2_PATTERN_COMPLETE_NEARAI_WALLET_LOGIN, WEBUI_V2_PATTERN_CREATE_THREAD,
     WEBUI_V2_PATTERN_DELETE_LLM_PROVIDER, WEBUI_V2_PATTERN_DELETE_THREAD,
     WEBUI_V2_PATTERN_GET_ATTACHMENT, WEBUI_V2_PATTERN_GET_LLM_CONFIG,
@@ -50,6 +50,7 @@ use crate::webui_v2::descriptors::{
     WEBUI_V2_PATTERN_TEST_LLM_CONNECTION, WEBUI_V2_PATTERN_TRACE_ACCOUNT_LOGIN_LINK,
     WEBUI_V2_PATTERN_TRACE_ACCOUNT_TRACES, WEBUI_V2_PATTERN_TRACE_CREDITS,
     WEBUI_V2_PATTERN_TRACE_HOLD_AUTHORIZE,
+    WEBUI_V2_PATTERN_USAGE_TREE,
 };
 use crate::webui_v2::handlers;
 use crate::webui_v2::sse_capacity::SseCapacity;
@@ -250,6 +251,11 @@ pub fn webui_v2_router_with_options(state: WebUiV2State, options: WebUiV2RouteOp
         .route(WEBUI_V2_PATTERN_CANCEL_RUN, post(handlers::cancel_run))
         .route(WEBUI_V2_PATTERN_RESOLVE_GATE, post(handlers::resolve_gate))
         .route(WEBUI_V2_PATTERN_RETRY_RUN, post(handlers::retry_run))
+        .route(WEBUI_V2_PATTERN_RECOVER_RUN, post(handlers::recover_run))
+        .route(
+            WEBUI_V2_PATTERN_USAGE_TREE,
+            get(handlers::usage_tree::read_usage_tree),
+        )
         .route(
             WEBUI_V2_PATTERN_LIST_AUTOMATIONS,
             get(handlers::list_automations),

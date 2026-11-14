@@ -83,13 +83,14 @@ impl DurableLoopHostMilestoneScope {
         Ok(scope)
     }
 
-    fn resource_scope(
+    fn resource_scope_with_project(
         &self,
         milestone: &LoopHostMilestone,
+        allow_run_project_scope: bool,
     ) -> Result<ResourceScope, AgentLoopHostError> {
         if milestone.scope.tenant_id != self.tenant_id
             || milestone.scope.agent_id != self.agent_id
-            || milestone.scope.project_id != self.project_id
+            || (!allow_run_project_scope && milestone.scope.project_id != self.project_id)
         {
             return Err(AgentLoopHostError::new(
                 AgentLoopHostErrorKind::ScopeMismatch,
@@ -118,7 +119,11 @@ impl DurableLoopHostMilestoneScope {
             tenant_id: self.tenant_id.clone(),
             user_id: self.user_id.clone(),
             agent_id: self.agent_id.clone(),
-            project_id: self.project_id.clone(),
+            project_id: if allow_run_project_scope {
+                milestone.scope.project_id.clone()
+            } else {
+                self.project_id.clone()
+            },
             mission_id: self.mission_id.clone(),
             thread_id: Some(milestone.scope.thread_id.clone()),
             invocation_id: InvocationId::from_uuid(milestone.run_id.as_uuid()),
@@ -138,11 +143,21 @@ impl DurableLoopHostMilestoneScope {
 pub struct DurableLoopHostMilestoneSink {
     event_log: Arc<dyn DurableEventLog>,
     scope: DurableLoopHostMilestoneScope,
+    allow_run_project_scope: bool,
 }
 
 impl DurableLoopHostMilestoneSink {
     pub fn new(event_log: Arc<dyn DurableEventLog>, scope: DurableLoopHostMilestoneScope) -> Self {
-        Self { event_log, scope }
+        Self {
+            event_log,
+            scope,
+            allow_run_project_scope: false,
+        }
+    }
+
+    pub fn with_run_project_scope(mut self) -> Self {
+        self.allow_run_project_scope = true;
+        self
     }
 
     pub fn event_log(&self) -> Arc<dyn DurableEventLog> {
@@ -153,7 +168,8 @@ impl DurableLoopHostMilestoneSink {
         &self,
         milestone: &LoopHostMilestone,
     ) -> Result<ResourceScope, AgentLoopHostError> {
-        self.scope.resource_scope(milestone)
+        self.scope
+            .resource_scope_with_project(milestone, self.allow_run_project_scope)
     }
 }
 
@@ -163,6 +179,7 @@ impl std::fmt::Debug for DurableLoopHostMilestoneSink {
             .debug_struct("DurableLoopHostMilestoneSink")
             .field("event_log", &"<durable_event_log>")
             .field("scope", &self.scope)
+            .field("allow_run_project_scope", &self.allow_run_project_scope)
             .finish()
     }
 }
@@ -460,6 +477,36 @@ mod tests {
         assert_eq!(event.hook_trust_class.as_deref(), Some("builtin"));
         assert!(event.hook_decision.is_none());
         assert!(event.hook_failure_category.is_none());
+    }
+
+    #[test]
+    fn dynamic_project_scope_accepts_project_scoped_run_milestones() {
+        let (milestone, thread_id, run_id) = fixture_milestone(
+            LoopHostMilestoneKind::ModelStarted {
+                requested_model_profile_id: None,
+            },
+        );
+        let event_log: Arc<dyn DurableEventLog> = Arc::new(InMemoryDurableEventLog::new());
+        let mut thread_scope = fixture_thread_scope();
+        thread_scope.project_id = None;
+        let milestone_scope = DurableLoopHostMilestoneScope::from_thread_scope_for_run(
+            &thread_scope,
+            thread_id,
+            run_id,
+        )
+        .expect("owner-scoped milestone fixture");
+        let sink =
+            DurableLoopHostMilestoneSink::new(event_log, milestone_scope).with_run_project_scope();
+
+        let event = sink
+            .runtime_event_for_milestone(&milestone)
+            .expect("project-scoped milestone should follow the run project")
+            .expect("model milestone projects to a runtime event");
+
+        assert_eq!(
+            event.scope.project_id.as_ref().map(|id| id.as_str()),
+            Some("project-hook-projection")
+        );
     }
 
     #[test]

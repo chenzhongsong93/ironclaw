@@ -1367,6 +1367,7 @@ fn sample_capability_id() -> CapabilityId {
 
 fn staged_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "api.example.test".to_string(),
@@ -1379,6 +1380,7 @@ fn staged_policy() -> NetworkPolicy {
 
 fn caller_policy() -> NetworkPolicy {
     NetworkPolicy {
+        deny_redirects: false,
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: "caller.example.test".to_string(),

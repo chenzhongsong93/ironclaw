@@ -31,6 +31,8 @@ pub struct SubagentPromptMaterial {
 
 #[async_trait]
 pub trait SubagentPromptMaterialSource: Send + Sync {
+    /// 仅宿主装配注入；旧source默认无额外必需材料，保持原行为。
+    fn opaque_input_port(&self) -> Option<Arc<dyn crate::SubagentOpaqueInputPort>> { None }
     async fn material_for_run(
         &self,
         run_context: &LoopRunContext,
@@ -75,12 +77,56 @@ impl SubagentPromptLimits {
 pub struct SubagentPromptComposer {
     source: Arc<dyn SubagentPromptMaterialSource>,
     limits: SubagentPromptLimits,
+    opaque_input_port: Option<Arc<dyn crate::SubagentOpaqueInputPort>>,
 }
 
 pub struct SubagentLoopPromptPort {
     inner: Arc<dyn LoopPromptPort>,
     run_context: LoopRunContext,
     composer: SubagentPromptComposer,
+}
+
+#[derive(Clone, Copy)]
+enum SubagentPromptStage {
+    Source,
+    Goal,
+    Direction,
+    Framing,
+    Opaque,
+    OpaqueValidation,
+    OpaqueRender,
+    Inner,
+}
+
+impl SubagentPromptStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Goal => "goal",
+            Self::Direction => "direction",
+            Self::Framing => "framing",
+            Self::Opaque => "opaque",
+            Self::OpaqueValidation => "opaque-validation",
+            Self::OpaqueRender => "opaque-render",
+            Self::Inner => "inner",
+        }
+    }
+}
+
+// Only this closed enum enters the log. Return the exact original error and
+// never log its summary/detail/ref or any context, identifier, body, or hash.
+fn record_subagent_prompt_stage<T>(
+    stage: SubagentPromptStage,
+    result: Result<T, AgentLoopHostError>,
+) -> Result<T, AgentLoopHostError> {
+    if result.is_err() {
+        tracing::warn!(
+            target: "ironclaw::subagent_prompt",
+            stage = stage.as_str(),
+            "SubagentPromptStageFailed"
+        );
+    }
+    result
 }
 
 impl SubagentLoopPromptPort {
@@ -104,7 +150,10 @@ impl LoopPromptPort for SubagentLoopPromptPort {
         request: LoopPromptBundleRequest,
     ) -> Result<LoopPromptBundle, AgentLoopHostError> {
         let request = self.composer.compose(&self.run_context, request).await?;
-        self.inner.build_prompt_bundle(request).await
+        record_subagent_prompt_stage(
+            SubagentPromptStage::Inner,
+            self.inner.build_prompt_bundle(request).await,
+        )
     }
 }
 
@@ -113,7 +162,12 @@ impl SubagentPromptComposer {
         Self {
             source,
             limits: SubagentPromptLimits::default(),
+            opaque_input_port: None,
         }
+    }
+
+    pub fn with_opaque_input_port(mut self,port:Arc<dyn crate::SubagentOpaqueInputPort>)->Self {
+        self.opaque_input_port=Some(port);self
     }
 
     pub fn with_limits(mut self, limits: SubagentPromptLimits) -> Self {
@@ -126,13 +180,55 @@ impl SubagentPromptComposer {
         run_context: &LoopRunContext,
         mut request: LoopPromptBundleRequest,
     ) -> Result<LoopPromptBundleRequest, AgentLoopHostError> {
-        let material = self.source.material_for_run(run_context).await?;
-        let goal_message = materialize_goal_message(&material.goal, self.limits)?;
+        let material = record_subagent_prompt_stage(
+            SubagentPromptStage::Source,
+            self.source.material_for_run(run_context).await,
+        )?;
+        let goal_message = record_subagent_prompt_stage(
+            SubagentPromptStage::Goal,
+            materialize_goal_message(&material.goal, self.limits),
+        )?;
+        let direction_message = record_subagent_prompt_stage(
+            SubagentPromptStage::Direction,
+            materialize_direction_message(&material.direction_markdown),
+        )?;
+        let framing_message = record_subagent_prompt_stage(
+            SubagentPromptStage::Framing,
+            materialize_goal_framing_message(),
+        )?;
+        if let Some(port)=&self.opaque_input_port {
+            if let Some(locked)=record_subagent_prompt_stage(
+                SubagentPromptStage::Opaque,
+                port.material_for_child(run_context).await,
+            )? {
+                use sha2::{Digest,Sha256};
+                let hash=Sha256::digest(locked.body.as_bytes()).iter().map(|byte|format!("{byte:02x}")).collect::<String>();
+                let visible=sanitize_model_visible_text(locked.body.clone());
+                // 把实际已渲染direction/framing/goal和原request消息一起收费；溢出拒绝。
+                let total = request.inline_messages.iter().try_fold(locked.charged_bytes, |n, message| {
+                    n.checked_add(message.safe_body.as_str().len())
+                }).and_then(|n| n.checked_add(goal_message.safe_body.as_str().len()))
+                    .and_then(|n| n.checked_add(direction_message.safe_body.as_str().len()))
+                    .and_then(|n| n.checked_add(framing_message.safe_body.as_str().len()));
+                if hash!=locked.receipt.content_hash() || visible!=locked.body || locked.charged_bytes<locked.body.len()
+                    || total.is_none_or(|bytes|bytes>self.limits.max_goal_bytes) {
+                    return record_subagent_prompt_stage(
+                        SubagentPromptStage::OpaqueValidation,
+                        Err(AgentLoopHostError::new(AgentLoopHostErrorKind::Invalid,"required opaque input hash/budget mismatch")),
+                    );
+                }
+                let message=record_subagent_prompt_stage(
+                    SubagentPromptStage::OpaqueRender,
+                    materialize_inline_message(LoopInlineMessageRole::User,"locked opaque input",&locked.body),
+                )?;
+                request.inline_messages.insert(0,message);
+            }
+        }
         request.inline_messages.splice(
             0..0,
             [
-                materialize_direction_message(&material.direction_markdown)?,
-                materialize_goal_framing_message()?,
+                direction_message,
+                framing_message,
                 goal_message,
             ],
         );

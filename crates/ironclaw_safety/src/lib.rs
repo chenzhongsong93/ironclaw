@@ -35,6 +35,7 @@ pub(crate) const REDOS_SCAN_BUDGET_MS: u128 = 2000;
 pub use credential_detect::{
     http_parts_contain_manual_credentials, params_contain_manual_credentials,
 };
+pub use display_redaction::sanitize_display_json;
 pub use display_redaction::{
     SHELL_COMMAND_DISPLAY_MAX_BYTES, SafeDisplayText, sanitize_display_text,
     sanitize_url_for_display, shell_command_display_text,

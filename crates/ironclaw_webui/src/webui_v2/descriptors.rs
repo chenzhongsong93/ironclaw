@@ -234,6 +234,7 @@ pub fn webui_v2_routes() -> Vec<IngressRouteDescriptor> {
         send_message_descriptor(),
         list_threads_descriptor(),
         get_timeline_descriptor(),
+        get_tool_result_descriptor(),
         get_thread_plan_descriptor(),
         get_run_state_descriptor(),
         logs_descriptor(),
@@ -1799,6 +1800,23 @@ fn usage_tree_descriptor() -> IngressRouteDescriptor {
             read_rate_limit(),
             AuditTraceClass::UserAction,
             AllowedEffectPath::ProductWorkflow,
+            StreamingMode::None,
+        ),
+    )
+}
+
+pub const WEBUI_V2_ROUTE_GET_TOOL_RESULT: &str = "webui.v2.get_tool_result";
+pub const WEBUI_V2_PATTERN_GET_TOOL_RESULT: &str = "/api/webchat/v2/threads/{thread_id}/runs/{run_id}/results";
+
+fn get_tool_result_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_GET_TOOL_RESULT,
+        NetworkMethod::Get,
+        WEBUI_V2_PATTERN_GET_TOOL_RESULT,
+        read_policy(
+            read_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProjectionOnly,
             StreamingMode::None,
         ),
     )

@@ -196,6 +196,10 @@ pub fn webui_v2_router_with_options(state: WebUiV2State, options: WebUiV2RouteOp
             WEBUI_V2_PATTERN_GET_THREAD_PLAN,
             get(handlers::get_thread_plan),
         )
+        .route(
+            crate::webui_v2::descriptors::WEBUI_V2_PATTERN_GET_TOOL_RESULT,
+            get(handlers::get_tool_result),
+        )
         .route(WEBUI_V2_PATTERN_GET_RUN_STATE, get(handlers::get_run_state))
         .route(WEBUI_V2_PATTERN_LOGS, get(handlers::query_logs))
         .route(

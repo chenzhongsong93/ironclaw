@@ -131,3 +131,5 @@ pub use static_assets::{
 };
 
 pub use descriptors::{WEBUI_V2_PATTERN_USAGE_TREE,WEBUI_V2_ROUTE_USAGE_TREE};
+
+pub use descriptors::WEBUI_V2_ROUTE_GET_TOOL_RESULT;

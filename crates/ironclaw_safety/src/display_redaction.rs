@@ -860,3 +860,62 @@ mod tests {
         assert!(!sanitized.contains("/Users/alice"));
     }
 }
+
+/// Redact structured display output without applying token substitutions to
+/// serialized JSON syntax. JSON carried inside string fields (for example MCP
+/// text blocks) is parsed and serialized again at the same bounded depth.
+pub fn sanitize_display_json(value: &serde_json::Value) -> serde_json::Value {
+    sanitize_display_json_at_depth(value, 32)
+}
+
+fn sanitize_display_json_at_depth(value: &serde_json::Value, depth: usize) -> serde_json::Value {
+    use serde_json::Value;
+    if depth == 0 {
+        return Value::String("[truncated]".to_string());
+    }
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    let compact = key.to_ascii_lowercase().replace(['_', '-'], "");
+                    let sensitive = compact.contains("secret")
+                        || compact.contains("password")
+                        || compact.contains("token")
+                        || compact.contains("credential")
+                        || compact.contains("apikey")
+                        || compact == "key"
+                        || compact.contains("authorization")
+                        || compact.contains("bearer")
+                        || compact.contains("cookie")
+                        || compact.contains("privatekey")
+                        || compact == "xauth"
+                        || compact == "auth";
+                    let safe = if sensitive {
+                        Value::String("[redacted]".to_string())
+                    } else {
+                        sanitize_display_json_at_depth(value, depth - 1)
+                    };
+                    (sanitize_display_text(key), safe)
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|value| sanitize_display_json_at_depth(value, depth - 1))
+                .collect(),
+        ),
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if (trimmed.starts_with('{') || trimmed.starts_with('['))
+                && let Ok(nested) = serde_json::from_str::<Value>(trimmed)
+            {
+                return Value::String(
+                    sanitize_display_json_at_depth(&nested, depth - 1).to_string(),
+                );
+            }
+            Value::String(sanitize_display_text(text))
+        }
+        other => other.clone(),
+    }
+}

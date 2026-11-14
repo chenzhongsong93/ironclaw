@@ -167,6 +167,7 @@ pub use ironclaw_product_adapters::{
     ProductOutboundPayload, ProductProjectionItem, ProductProjectionState, ProductWorkSummaryPhase,
     ProgressKind, ProgressUpdateView, ProjectionCursor, TurnCostView,
 };
+pub use reborn_services::{RebornToolResultRequest, RebornToolResultResponse};
 pub use reborn_services::{
     AUTOMATION_LIST_DEFAULT_PAGE_SIZE, AUTOMATION_LIST_MAX_PAGE_SIZE,
     AUTOMATION_RUN_HISTORY_DEFAULT_PAGE_SIZE, AUTOMATION_RUN_HISTORY_MAX_PAGE_SIZE,

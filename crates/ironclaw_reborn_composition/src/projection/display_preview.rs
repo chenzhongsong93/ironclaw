@@ -1052,7 +1052,7 @@ fn sanitize_json_value_at_depth(
             SanitizedJson { value, truncated }
         }
         serde_json::Value::String(value) => SanitizedJson {
-            value: serde_json::Value::String(sanitize_text(value)),
+            value: ironclaw_safety::sanitize_display_json(&serde_json::Value::String(value.clone())),
             truncated: false,
         },
         other => SanitizedJson {
@@ -1076,12 +1076,18 @@ fn is_sensitive_key(key: &str) -> bool {
 }
 
 fn bounded_display_text(text: &str, max_bytes: usize) -> CapabilityDisplayText {
-    let sanitized = sanitize_text(text);
+    let sanitized = match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(value) => ironclaw_safety::sanitize_display_json(&value).to_string(),
+        Err(_) => sanitize_text(text),
+    };
     truncate_bytes(&sanitized, max_bytes)
 }
 
 fn bounded_preview_text(text: &str) -> CapabilityDisplayText {
-    let sanitized = sanitize_text(text);
+    let sanitized = match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(value) => ironclaw_safety::sanitize_display_json(&value).to_string(),
+        Err(_) => sanitize_text(text),
+    };
     truncate_bytes(&sanitized, CAPABILITY_DISPLAY_PREVIEW_MAX_BYTES)
 }
 
@@ -1102,6 +1108,19 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use serde_json::json;
+
+    #[test]
+    fn mcp_nested_json_preview_remains_parseable_after_redaction() {
+        let output = serde_json::json!({"content":[{"type":"text", "text":
+            "{\"nodes\":[{\"name\":\"甲\",\"token\":\"private-value\"}],\"edges\":[]}"}]});
+        let preview = super::output_preview(&output);
+        assert!(!preview.truncated);
+        let outer: serde_json::Value = serde_json::from_str(&preview.preview.unwrap()).unwrap();
+        let inner: serde_json::Value =
+            serde_json::from_str(outer["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["nodes"][0]["name"], "甲");
+        assert_eq!(inner["nodes"][0]["token"], "[redacted]");
+    }
 
     use super::*;
 

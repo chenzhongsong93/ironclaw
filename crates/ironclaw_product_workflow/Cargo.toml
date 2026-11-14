@@ -20,6 +20,7 @@ layer = "products"
 test-support = ["ironclaw_product_adapters/test-support"]
 
 [dependencies]
+ironclaw_safety = { path = "../ironclaw_safety", version = "0.2.2" }
 async-trait = "0.1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }

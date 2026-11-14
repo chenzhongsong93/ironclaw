@@ -78,7 +78,14 @@ fn requests() -> (CompletionRequest, CompletionRequest) {
 
 fn emit(run: &str, request: &CompletionRequest) {
     let scope = format!("run={run}\nturn=trace-fixture-turn\nmodel_call=1");
-    super::trace_model_request_event(Some(&scope), "trace-fixture-provider", request);
+    super::trace_model_request_event(
+        Some(&scope),
+        "trace-fixture-provider",
+        &request.messages,
+        request.model.as_deref(),
+        request.max_tokens,
+        &[],
+    );
 }
 
 fn events(root: &Path, run: &str) -> Vec<Value> {
@@ -197,5 +204,118 @@ fn interleaved_runs_keep_actual_prefix_scope() {
         &root.root,
         "trace-interleaved-child",
         &[first, after_tool.clone(), after_tool],
+    );
+}
+
+#[tokio::test]
+async fn provider_tool_definition_is_addressed_and_verifiable() {
+    use ironclaw_host_api::{CapabilityId, ProviderToolName, Resolution, ResolutionBatch};
+    use ironclaw_turns::run_profile::{
+        AgentLoopHostError, CapabilityBatchInvocation, CapabilityInvocation, LoopCapabilityPort,
+        ProviderToolDefinition, VisibleCapabilityRequest, VisibleCapabilitySurface,
+    };
+
+    struct Surface;
+    #[async_trait::async_trait]
+    impl LoopCapabilityPort for Surface {
+        fn tool_definitions(&self) -> Result<Vec<ProviderToolDefinition>, AgentLoopHostError> {
+            Ok(vec![ProviderToolDefinition {
+                capability_id: CapabilityId::new("fixture.lookup").unwrap(),
+                name: ProviderToolName::new("fixture_lookup").unwrap(),
+                description: "public fixture".into(),
+                parameters: serde_json::json!({"type":"object","properties":{"item":{"type":"string"}}}),
+            }])
+        }
+
+        async fn visible_capabilities(
+            &self,
+            _: VisibleCapabilityRequest,
+        ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
+            unreachable!("the provider request reads the resolved tool definitions")
+        }
+
+        async fn invoke_capability(
+            &self,
+            _: CapabilityInvocation,
+        ) -> Result<Resolution, AgentLoopHostError> {
+            unreachable!("the provider returns a final answer")
+        }
+
+        async fn invoke_capability_batch(
+            &self,
+            _: CapabilityBatchInvocation,
+        ) -> Result<ResolutionBatch, AgentLoopHostError> {
+            unreachable!("the provider returns a final answer")
+        }
+    }
+
+    #[derive(Default)]
+    struct Capture(std::sync::Mutex<Vec<ironclaw_llm::ToolDefinition>>);
+    #[async_trait::async_trait]
+    impl ironclaw_llm::LlmProvider for Capture {
+        fn model_name(&self) -> &str {
+            "fixture"
+        }
+        fn cost_per_token(&self) -> (rust_decimal::Decimal, rust_decimal::Decimal) {
+            (rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO)
+        }
+        async fn complete(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<ironclaw_llm::CompletionResponse, ironclaw_llm::LlmError> {
+            unreachable!("expected a tool-capable provider request")
+        }
+        async fn complete_with_tools(
+            &self,
+            req: ironclaw_llm::ToolCompletionRequest,
+        ) -> Result<ironclaw_llm::ToolCompletionResponse, ironclaw_llm::LlmError> {
+            *self.0.lock().unwrap() = req.tools;
+            Ok(ironclaw_llm::ToolCompletionResponse {
+                content: Some("done".into()),
+                tool_calls: Vec::new(),
+                normalization_version: None,
+                normalized_input_tokens: None,
+                cache_details_observed: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                finish_reason: ironclaw_llm::FinishReason::Stop,
+                reasoning: None,
+                reasoning_details: None,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+    }
+
+    let owned = TraceRoot::new();
+    let provider = Capture::default();
+    super::complete_model_request(
+        &provider,
+        CompletionRequest::new(vec![ChatMessage::user("fixture")]),
+        Some(std::sync::Arc::new(Surface)),
+        Some("run=trace-tools".into()),
+        None,
+        super::ProviderReplayIdentity::new("fixture", "fixture").unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    let tools = provider.0.lock().unwrap();
+    assert_eq!(tools.len(), 1);
+    let expected = serde_json::to_value(&tools[0]).unwrap();
+    let rows = events(&owned.root, "trace-tools");
+    assert_eq!(rows.len(), 1);
+    let definition = &rows[0]["data"]["tool_definitions"][0];
+    let reference = definition["definition_ref"].as_str().unwrap();
+    let stored =
+        std::fs::read(owned.root.join("content").join(format!("{reference}.json"))).unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&stored).unwrap(), expected);
+    assert_eq!(
+        definition["definition_sha256"],
+        ironclaw_common::hashing::sha256_hex(&stored)
+    );
+    assert_eq!(
+        definition["schema_sha256"],
+        ironclaw_common::hashing::sha256_hex(expected["parameters"].to_string().as_bytes())
     );
 }

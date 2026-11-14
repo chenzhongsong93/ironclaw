@@ -1292,16 +1292,43 @@ impl CompletionStreamSink for ProviderStreamSink {
     }
 }
 
+fn traced_tool_definitions(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            let definition = serde_json::json!({
+                "name": &tool.name,
+                "description": &tool.description,
+                "parameters": &tool.parameters,
+            });
+            let schema_sha256 =
+                ironclaw_common::hashing::sha256_hex(tool.parameters.to_string().as_bytes());
+            let definition_sha256 =
+                ironclaw_common::hashing::sha256_hex(definition.to_string().as_bytes());
+            let definition_ref = ironclaw_common::run_trace::store_message_content(&definition);
+            serde_json::json!({
+                "name": &tool.name,
+                "schema_sha256": schema_sha256,
+                "definition_sha256": definition_sha256,
+                "definition_ref": definition_ref,
+            })
+        })
+        .collect()
+}
+
 /// 每次模型请求独立写base0完整消息；原slim内容库仍按消息CAS去重。
 /// 不以OS线程局部或跨run序号引用逻辑run历史，重试与任务换线程不丢前缀。
 fn trace_model_request_event(
     provider_turn_scope: Option<&str>,
     provider_id: &str,
-    completion: &CompletionRequest,
+    messages: &[ChatMessage],
+    model: Option<&str>,
+    max_tokens: Option<u32>,
+    tools: &[ToolDefinition],
 ) {
     use ironclaw_common::run_trace::append_trace_event_slim;
     let (run, turn) = parse_provider_turn_scope(provider_turn_scope);
-    let all = serde_json::to_value(&completion.messages).unwrap_or(serde_json::json!([]));
+    let all = serde_json::to_value(messages).unwrap_or(serde_json::json!([]));
     append_trace_event_slim(
         "model_request",
         &run,
@@ -1309,11 +1336,12 @@ fn trace_model_request_event(
         turn.as_deref(),
         serde_json::json!({
             "provider_id": provider_id,
-            "model": completion.model,
-            "max_tokens": completion.max_tokens,
+            "model": model,
+            "max_tokens": max_tokens,
             "messages_base_seq": 0,
             "messages_base_count": 0,
             "new_messages": all,
+            "tool_definitions": traced_tool_definitions(tools),
         }),
     );
 }
@@ -1371,11 +1399,6 @@ where
     P: LlmProvider + ?Sized,
 {
     let system_prompt_hash = system_prompt_cache_signature(&completion.messages);
-    trace_model_request_event(
-        provider_turn_scope.as_deref(),
-        &replay_identity.provider_id,
-        &completion,
-    );
     if let Some(capabilities) = capabilities {
         let tool_definitions = capabilities
             .tool_definitions()
@@ -1415,6 +1438,14 @@ where
             let tool_definitions_hash = tool_definitions_cache_signature(&recovery_tool_names);
             let tool_request =
                 ToolCompletionRequest::from_completion_request(completion, llm_tool_definitions);
+            trace_model_request_event(
+                provider_turn_scope.as_deref(),
+                &replay_identity.provider_id,
+                &tool_request.messages,
+                tool_request.model.as_deref(),
+                tool_request.max_tokens,
+                &tool_request.tools,
+            );
             debug!("reborn model gateway dispatching tool-capable provider request");
             let provider_started_at = live_latency_started_at();
             let response = match if let Some(stream_sink) = stream_sink.as_ref() {
@@ -1497,6 +1528,14 @@ where
                             error.safe_summary.as_str(),
                         ));
                     let rejected_response = response;
+                    trace_model_request_event(
+                        provider_turn_scope.as_deref(),
+                        &replay_identity.provider_id,
+                        &repair_request.messages,
+                        repair_request.model.as_deref(),
+                        repair_request.max_tokens,
+                        &repair_request.tools,
+                    );
                     let retry_started_at = live_latency_started_at();
                     let response = match provider.complete_with_tools(repair_request).await {
                         Ok(response) => {
@@ -1580,6 +1619,14 @@ where
         );
     }
 
+    trace_model_request_event(
+        provider_turn_scope.as_deref(),
+        &replay_identity.provider_id,
+        &completion.messages,
+        completion.model.as_deref(),
+        completion.max_tokens,
+        &[],
+    );
     let provider_started_at = live_latency_started_at();
     let response = match if let Some(stream_sink) = stream_sink.as_ref() {
         provider

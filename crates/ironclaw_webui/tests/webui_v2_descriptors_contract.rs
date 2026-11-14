@@ -94,6 +94,23 @@ fn body_limit_kib(kib: u64) -> BodyLimitPolicy {
 fn expected_table() -> Vec<Expected> {
     vec![
         Expected {
+            route_id: ironclaw_webui::webui_v2::WEBUI_V2_ROUTE_GET_TOOL_RESULT,
+            method: NetworkMethod::Get,
+            pattern: "/api/webchat/v2/threads/{thread_id}/runs/{run_id}/results",
+            listener_class: ListenerClass::LocalGateway,
+            auth_schemes: &[IngressAuthScheme::BearerToken],
+            scope_source: IngressScopeSource::AuthenticatedCaller,
+            body_limit: BodyLimitPolicy::NoBody,
+            rate_limit_max: 120,
+            rate_limit_window_seconds: 60,
+            rate_limit_scope: RateLimitScope::PerCaller,
+            cors: CorsPolicy::SameOriginOnly,
+            websocket_origin: WebSocketOriginPolicy::NotApplicable,
+            streaming: StreamingMode::None,
+            audit: AuditTraceClass::UserAction,
+            effect_path: AllowedEffectPath::ProjectionOnly,
+        },
+        Expected {
             route_id: ironclaw_webui::webui_v2::WEBUI_V2_ROUTE_USAGE_TREE,
             method: NetworkMethod::Get,
             pattern: "/api/webchat/v2/threads/{thread_id}/runs/{run_id}/usage-tree",

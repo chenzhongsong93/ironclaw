@@ -69,7 +69,7 @@ tokio-util = { version = "0.7" }
 tracing = "0.1"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["json"] }

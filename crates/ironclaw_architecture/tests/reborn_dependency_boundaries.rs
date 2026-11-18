@@ -856,6 +856,12 @@ fn reborn_runner_llm_wiring_stays_out_of_root_src() {
 #[test]
 fn provider_tool_names_stay_at_model_protocol_boundaries() {
     let root = workspace_root();
+    let controls_parent = std::fs::read_to_string(root.join(
+        "crates/ironclaw_reborn_composition/src/runtime/production_dynamic_capability.rs",
+    )).expect("native test controls parent readable").replace("\r\n", "\n");
+    assert!(controls_parent.contains(
+        "#[cfg(all(test, feature = \"libsql\", feature = \"test-support\"))]\n#[path = \"production_native_surface_controls.rs\"]"
+    ), "provider-protocol test controls must remain test-only");
     let mut uses = Vec::new();
     collect_provider_tool_name_boundary_uses(&root.join("crates"), &root, &mut uses);
 
@@ -892,6 +898,8 @@ fn provider_tool_names_stay_at_model_protocol_boundaries() {
         "crates/ironclaw_reborn_composition/src/runtime/local_dev/external_tool_capability.rs",
         "crates/ironclaw_reborn_composition/src/runtime/local_dev/synthetic_capability.rs",
         "crates/ironclaw_reborn_composition/src/observability/trace_capture.rs",
+        // A nested test module under the guarded native-surface controls above.
+        "crates/ironclaw_reborn_composition/src/runtime/production_result_read_controls.rs",
     ]);
     let violations = uses
         .into_iter()
@@ -1206,7 +1214,7 @@ fn composition_runtime_has_no_slack_output_policy() {
     let violations = composition_sources
         .iter()
         .filter_map(|(path, source)| {
-            let relative = path.strip_prefix(&root).unwrap_or(path).to_string_lossy();
+            let relative = path.strip_prefix(&root).unwrap_or(path).to_string_lossy().replace('\\', "/");
             let is_runtime_root = relative == "crates/ironclaw_reborn_composition/src/runtime.rs";
             let is_runtime_source = is_runtime_root
                 || relative.starts_with("crates/ironclaw_reborn_composition/src/runtime/");
@@ -1265,7 +1273,7 @@ fn production_composition_sources(root: &std::path::Path) -> Vec<(PathBuf, Strin
     paths
         .into_iter()
         .filter(|path| {
-            let relative = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
+            let relative = path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/");
             !is_rust_test_source_path(&relative)
         })
         .map(|path| {
@@ -2607,7 +2615,7 @@ fn collect_forbidden_string_uses(
                 path.strip_prefix(root)
                     .unwrap_or(&path)
                     .to_string_lossy()
-                    .to_string(),
+                    .replace('\\', "/"),
             );
         }
     }
@@ -2640,7 +2648,7 @@ fn collect_provider_tool_name_boundary_uses(
             .strip_prefix(root)
             .unwrap_or(&path)
             .to_string_lossy()
-            .to_string();
+            .replace('\\', "/");
         if is_rust_test_source_path(&relative) {
             continue;
         }
@@ -4286,7 +4294,7 @@ fn collect_forbidden_runtime_network_uses(
                     let relative = path.strip_prefix(root).unwrap_or(&path);
                     violations.push(format!(
                         "{}:{} contains `{}` ({})",
-                        relative.display(),
+                        relative.to_string_lossy().replace('\\', "/"),
                         line_number + 1,
                         rule.pattern,
                         rule.reason
@@ -4326,7 +4334,7 @@ fn collect_forbidden_uses(
                     let relative = path.strip_prefix(root).unwrap_or(&path);
                     violations.push(format!(
                         "{}:{} contains `{}` ({})",
-                        relative.display(),
+                        relative.to_string_lossy().replace('\\', "/"),
                         line_number + 1,
                         rule.pattern,
                         rule.reason
@@ -4372,7 +4380,7 @@ fn collect_forbidden_reborn_auth_file_uses(
             }
             violations.push(format!(
                 "{}:{} contains forbidden product-auth implementation pattern `{}`: {}",
-                path.strip_prefix(root).unwrap_or(path).display(),
+                path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/"),
                 line_number + 1,
                 rule.pattern,
                 rule.reason

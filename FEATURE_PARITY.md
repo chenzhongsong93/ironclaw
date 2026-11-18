@@ -26,6 +26,8 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | Session-based messaging | ✅ | ✅ | Owner scope is separate from sender identity and conversation scope |
 | Loopback-first networking | ✅ | ✅ | HTTP binds to 0.0.0.0 but can be configured |
 
+Reborn委派上下文补充：受信任profile可选择`delegated_task_context_v1`，不向任务专用子运行注入父身份与通用技能；不改变上表多Agent工作区隔离的未实现状态。验证见`ironclaw_runner/tests/loop_driver_host.rs`的`delegated_task_context`用例。
+
 ### Owner: _Unassigned_
 
 ---

@@ -1,6 +1,9 @@
 pub use ironclaw_product_workflow::{
     AuthChallengeProvider, AuthChallengeView, BlockedAuthFlowCanceller,
 };
+pub use production_execution_surface::{RebornProductionBoundPorts,RebornProductionSurfaceContext,
+    RebornProductionContextSources,RebornProductionExecutionSurface,
+    RebornProductionExecutionSurfaceFactory};
 pub use admin_token::AdminApiTokenMinter;
 pub use automation::facade::RebornAutomationProductFacade;
 pub use error::RebornBuildError;
@@ -36,6 +39,10 @@ pub use ironclaw_product_workflow::{
     LifecycleProductResponse, LifecycleSearchExtensionSummary,
 };
 pub use ironclaw_runner::runtime::DEFAULT_TURN_RUNNER_WORKER_COUNT;
+pub use ironclaw_runner::{
+    driver_registry::{DriverRequirements, RequirementLevel},
+    runtime::ProductRunDriver,
+};
 pub use ironclaw_runner::failure_summary::reborn_failure_summary_for_category;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 pub use ironclaw_runtime_policy::{
@@ -118,9 +125,11 @@ pub use root::profile::{RebornCompositionProfile, RebornCompositionProfileParseE
 #[cfg(any(test, feature = "test-support"))]
 pub use runtime::RebornTurnDriveOutcome;
 pub use runtime::{
+    RebornRequesterRuntimeProtocolSnapshot, RebornResidentWorkerState,
     AssistantReply, ConversationId, RebornRuntime, RebornRuntimeError, RebornSkillActivation,
     RebornSkillActivationMode, RebornSkillAsset, RebornSkillBundle, RebornSkillExecutionPlan,
     RebornSkillExecutionResult, RebornSkillSourceKind, build_reborn_runtime,
+    build_reborn_runtime_with_opaque_input_backend, build_reborn_runtime_with_product_driver,
 };
 pub use runtime_input::{
     CredentialRefreshSettings, DEFAULT_TURN_RUNNER_HEARTBEAT_INTERVAL,
@@ -189,3 +198,5 @@ pub use ironclaw_reborn_identity::{
     ExternalSubjectId, IdentityKeyError, ProviderInstanceId, ProviderKind, RebornIdentityError,
     RebornIdentityResolver, ResolveExternalIdentity, SurfaceKind,
 };
+pub use runtime_skill_bundle::RebornRuntimeSkillBundle;
+pub use operator_host_bundle::RebornHostExtensionBundle;

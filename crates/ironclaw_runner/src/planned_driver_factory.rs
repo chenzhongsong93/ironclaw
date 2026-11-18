@@ -303,7 +303,11 @@ pub fn subagent_novelist_planned_profile_definition()
         descriptor,
         SUBAGENT_CAPABILITY_SURFACE_PROFILE_ID,
     )?;
-    Ok(definition.with_model_profile_id(model_profile_id))
+    Ok(definition
+        .with_model_profile_id(model_profile_id)
+        .with_context_profile_id(
+            ironclaw_turns::run_profile::ContextProfileId::delegated_task_v1(),
+        ))
 }
 
 /// Dedicated run profile for scheduled-trigger fires (issue #5505). Reuses

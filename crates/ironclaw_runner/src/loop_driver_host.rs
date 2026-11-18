@@ -1627,6 +1627,21 @@ where
         });
 
         let context_window_cache = Arc::new(ThreadContextWindowCache::default());
+        // Select once from the persisted run snapshot. Both prompt construction
+        // and final message resolution must use the same sources. Never mutate
+        // this shared factory or classify all subagents as task-only: coding
+        // subagents and historical snapshots still need their ambient rules.
+        let (skill_context_source, identity_context_source) =
+            if run_context.resolved_run_profile.context_profile_id
+                == ironclaw_turns::run_profile::ContextProfileId::delegated_task_v1()
+            {
+                (None, None)
+            } else {
+                (
+                    self.skill_context_source.clone(),
+                    self.identity_context_source.clone(),
+                )
+            };
         let mut context_adapter = ThreadBackedLoopContextPort::new(
             Arc::clone(&self.thread_service),
             effective_scope.clone(),
@@ -1634,10 +1649,10 @@ where
             max_messages,
         )
         .with_context_window_cache(Arc::clone(&context_window_cache));
-        if let Some(source) = self.skill_context_source.as_ref() {
+        if let Some(source) = skill_context_source.as_ref() {
             context_adapter = context_adapter.with_skill_context_source(source.clone());
         }
-        if let Some(source) = self.identity_context_source.as_ref() {
+        if let Some(source) = identity_context_source.as_ref() {
             context_adapter = context_adapter.with_identity_context_source(source.clone());
         }
         context_adapter = context_adapter.with_milestone_sink(Arc::clone(&self.milestone_sink));
@@ -1923,8 +1938,8 @@ where
                     thread_scope: effective_scope.clone(),
                     host_gateway: gw,
                     max_messages,
-                    skill_context_source: self.skill_context_source.clone(),
-                    identity_context_source: self.identity_context_source.clone(),
+                    skill_context_source: skill_context_source.clone(),
+                    identity_context_source: identity_context_source.clone(),
                     instruction_materialization_store: Some(Arc::clone(
                         &instruction_materialization_store,
                     )),
@@ -1939,8 +1954,8 @@ where
                     thread_scope: effective_scope.clone(),
                     host_gateway: Arc::clone(&self.model_gateway),
                     max_messages,
-                    skill_context_source: self.skill_context_source.clone(),
-                    identity_context_source: self.identity_context_source.clone(),
+                    skill_context_source,
+                    identity_context_source,
                     instruction_materialization_store: Some(Arc::clone(
                         &instruction_materialization_store,
                     )),

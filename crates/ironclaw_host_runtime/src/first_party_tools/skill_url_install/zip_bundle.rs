@@ -47,7 +47,10 @@ pub(super) fn extract_skill_bundle(
                     RuntimeDispatchErrorKind::OutputTooLarge,
                 ));
             }
-            raw_paths.push(normalize_archive_path(Path::new(file.name()))?);
+            let name = file.name().map_err(|_| {
+                FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::InputEncode)
+            })?;
+            raw_paths.push(normalize_archive_path(Path::new(name.as_ref()))?);
         }
     }
     let strip_root = strip_common_archive_root(&raw_paths);
@@ -68,7 +71,10 @@ pub(super) fn extract_skill_bundle(
                 RuntimeDispatchErrorKind::OutputTooLarge,
             ));
         }
-        let entry_name = file.name().to_string();
+        let entry_name = file
+            .name()
+            .map_err(|_| FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::InputEncode))?
+            .into_owned();
         let mut path = normalize_archive_path(Path::new(&entry_name))?;
         if let Some(root) = &strip_root
             && let Ok(stripped) = path.strip_prefix(root)
@@ -175,4 +181,31 @@ pub(super) fn extract_skill_bundle(
         bundle_subdir: (!requested_dir.as_os_str().is_empty())
             .then(|| requested_dir.display().to_string()),
     })
+}
+
+#[cfg(test)]
+mod name_validation_tests {
+    use super::*;
+    use std::io::{Cursor, Write};
+
+    fn archive(name: &str) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .write_all(b"---\nname: example\n---\nA bounded skill.")
+            .unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn zip_bundle_keeps_valid_names_and_rejects_unsafe_central_paths() {
+        let mut bytes = archive("example/SKILL.md");
+        assert!(extract_skill_bundle(&bytes, None).is_ok());
+        assert!(extract_skill_bundle(&archive("../SKILL.md"), None).is_err());
+        let central = bytes.windows(4).position(|s| s == b"PK\x01\x02").unwrap();
+        bytes[central + 46..central + 62].copy_from_slice(b"../evil/SKILL.md");
+        assert!(extract_skill_bundle(&bytes, None).is_err());
+    }
 }

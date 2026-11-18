@@ -254,6 +254,13 @@ impl RunProfileDefinition {
         self
     }
 
+    /// Select context at trusted profile registration, not through caller hints.
+    /// The id is retained in the resolved snapshot and resolution fingerprint.
+    pub fn with_context_profile_id(mut self, context_profile_id: ContextProfileId) -> Self {
+        self.context_profile_id = context_profile_id;
+        self
+    }
+
     /// Override the model profile this run profile binds to.
     ///
     /// Used to route a run family to a different `ModelSlot` (e.g. the

@@ -99,6 +99,60 @@ async fn unauthorized_long_running_profile_request_rejects_before_fallback() {
 }
 
 #[tokio::test]
+async fn delegated_context_is_persisted_fingerprinted_and_keeps_legacy_snapshot() {
+    use ironclaw_turns::InMemoryRunProfileRegistry;
+    use ironclaw_turns::run_profile::{ContextProfileId, RunProfileDefinition};
+
+    let descriptor = AgentLoopDriverDescriptor::new("test:delegated", RunProfileVersion::new(1))
+        .unwrap()
+        .with_checkpoint_schema("test_checkpoint", RunProfileVersion::new(1))
+        .unwrap();
+    let definition = RunProfileDefinition::host_product_driver(
+        RunProfileId::new("test-delegated").unwrap(),
+        descriptor,
+        CapabilitySurfaceProfileId::new("test_tools").unwrap(),
+    )
+    .unwrap();
+    let request = RunProfileResolutionRequest::interactive_default()
+        .with_requested_run_profile(RunProfileRequest::new("test-delegated").unwrap())
+        .with_authority(RunProfileRequestAuthority::ProductSurface);
+    let mut snapshots = Vec::new();
+    for profile in [
+        definition.clone(),
+        definition.with_context_profile_id(ContextProfileId::delegated_task_v1()),
+    ] {
+        let mut registry = InMemoryRunProfileRegistry::with_builtin_profiles();
+        registry.register(profile).unwrap();
+        snapshots.push(
+            InMemoryRunProfileResolver::new(registry)
+                .resolve_run_profile(request.clone())
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        snapshots[0].context_profile_id.as_str(),
+        "interactive_context"
+    );
+    assert_eq!(
+        snapshots[1].context_profile_id,
+        ContextProfileId::delegated_task_v1()
+    );
+    assert_ne!(
+        snapshots[0].resolution_fingerprint,
+        snapshots[1].resolution_fingerprint
+    );
+    for snapshot in snapshots {
+        let persisted = serde_json::to_value(&snapshot).unwrap();
+        let reloaded: ResolvedRunProfile = serde_json::from_value(persisted).unwrap();
+        assert_eq!(
+            reloaded, snapshot,
+            "resume must use the persisted context choice"
+        );
+    }
+}
+
+#[tokio::test]
 async fn host_product_profile_requires_special_driver_authority_and_exact_checkpoint() {
     use ironclaw_turns::{AgentLoopDriverDescriptor, InMemoryRunProfileRegistry};
     use ironclaw_turns::run_profile::{CapabilitySurfaceProfileId, RunProfileDefinition};

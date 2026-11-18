@@ -170,6 +170,31 @@ Kernel-mediated prompt safety rules:
 - prompt read/build failures are explicit turn failures unless a contract marks a missing optional doc as ignorable;
 - custom loops may change assembly strategy, but not scope filtering, write-safety checks, or redaction requirements.
 
+### 5.1 版本化委派任务上下文
+
+受信任的run profile可以选择`context_profile_id=delegated_task_context_v1`。
+Reborn宿主工厂在提示词构建和最终消息引用解析两端使用同一选择：该profile
+不继承环境identity/system文件、已加载技能和技能发现目录；角色及任务材料仍由
+原子角色prompt composer提供。全局prompt安全、hook、权限和预算机制保持有效。
+该策略不会修改共享工厂的sources，也不由用户消息、角色名字或任意“subagent”
+标签决定。普通父run、通用coder/explorer及历史`interactive_context`快照保持原行为。
+
+上下文选择保存在既有ResolvedRunProfile中并进入resolution fingerprint，无数据库
+schema变化；恢复旧run时使用持久化选择，不按最新profile定义重写。当前novelist
+profile为新run选择委派上下文，model和driver路由不变。
+
+验证复用宿主factory调用端，捕获最终模型请求，避免仅检查helper：
+
+```bash
+cargo test -p ironclaw_runner --features filesystem-goal-store --test loop_driver_host delegated_task_context
+cargo test -p ironclaw_turns --test run_profile_contract delegated_context
+```
+
+对应测试为`delegated_task_context_excludes_ambient_instructions_from_final_request`、
+`delegated_task_context_preserves_parent_generic_and_historical_contexts`及
+`delegated_context_is_persisted_fingerprinted_and_keeps_legacy_snapshot`。
+这组测试验证factory/context/composer/model-port装配边界，不宣称真实模型质量通过。
+
 ---
 
 ## 6. Capability/tool effects

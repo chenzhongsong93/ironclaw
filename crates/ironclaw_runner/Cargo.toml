@@ -77,6 +77,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 ironclaw_mcp = { path = "../ironclaw_mcp", version = "0.1.0" }

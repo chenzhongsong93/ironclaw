@@ -30,6 +30,7 @@ pub mod openai_codex_provider;
 pub(crate) mod openai_codex_session;
 mod provider;
 mod provider_policy;
+mod provider_wire_trace;
 mod reasoning;
 pub mod recording;
 pub mod registry;

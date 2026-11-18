@@ -1485,9 +1485,35 @@ impl RebornRuntime {
     }
     /// Trusted startup SDK: uses the existing host stopAt, never a renewed duration/budget.
     pub async fn admit_startup_host_extension_bundle_before(&self,bundle:crate::RebornHostExtensionBundle,original_stop_at:tokio::time::Instant)->Result<Vec<ironclaw_product_workflow::LifecycleProductResponse>,RebornRuntimeError> {
+        self.admit_startup_bundle_with_lifecycle(bundle, original_stop_at, false).await
+    }
+
+    /// Trusted resident bootstrap. The original deadline qualifies admission; service
+    /// shutdown subsequently controls execution.
+    pub async fn admit_startup_host_extension_bundle_for_service_before(
+        &self,
+        bundle: crate::RebornHostExtensionBundle,
+        startup_end: tokio::time::Instant,
+    ) -> Result<Vec<ironclaw_product_workflow::LifecycleProductResponse>, RebornRuntimeError> {
+        self.admit_startup_bundle_with_lifecycle(bundle, startup_end, true).await
+    }
+
+    async fn admit_startup_bundle_with_lifecycle(
+        &self,
+        bundle: crate::RebornHostExtensionBundle,
+        original_stop_at: tokio::time::Instant,
+        resident: bool,
+    ) -> Result<Vec<ironclaw_product_workflow::LifecycleProductResponse>, RebornRuntimeError> {
         if tokio::time::Instant::now()>=original_stop_at {self.request_private_startup_admission_stop();return Err(RebornRuntimeError::InvalidArgument {reason:"startupAdmissionOriginalDeadlineExpired".into()});}
         let responses=self.admit_root_bundle_inner(bundle).await?;
-        if !self.requester_runtime_protocol_snapshot().ready()||self.resident_shutdown_requested.load(std::sync::atomic::Ordering::SeqCst)||!self.startup_execution.release_before(original_stop_at) {
+        let ready = self.requester_runtime_protocol_snapshot().ready()
+            && !self.resident_shutdown_requested.load(std::sync::atomic::Ordering::SeqCst);
+        let released = ready && if resident {
+            self.startup_execution.release_service_before(original_stop_at)
+        } else {
+            self.startup_execution.release_before(original_stop_at)
+        };
+        if !released {
             self.request_private_startup_admission_stop();
             return Err(RebornRuntimeError::InvalidArgument {reason:"startupAdmissionStoppedOrExpired".into()});
         }

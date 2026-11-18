@@ -281,10 +281,16 @@ impl AnthropicOAuthProvider {
         subject_scoped: bool,
         extra_headers: &reqwest::header::HeaderMap,
         sink: Option<&dyn CompletionStreamSink>,
+        trace: Option<&crate::provider_wire_trace::ProviderWireTrace>,
     ) -> Result<AnthropicResponse, LlmError> {
         let url = self.api_url();
         let mut streamed = body.clone();
         streamed.stream = Some(true);
+        let wire = serde_json::to_vec(&streamed).map_err(|_| LlmError::RequestFailed {
+            provider: "anthropic_oauth".to_string(),
+            reason: "request serialization failed".to_string(),
+        })?;
+        let physical_request = trace.map(|trace| trace.observe_anthropic(&wire));
 
         tracing::warn!(
             url = %url,
@@ -299,7 +305,7 @@ impl AnthropicOAuthProvider {
             .header("anthropic-beta", ANTHROPIC_OAUTH_BETA)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
-            .json(&streamed)
+            .body(wire)
             .send()
             .await
             .map_err(|e| LlmError::RequestFailed {
@@ -307,6 +313,9 @@ impl AnthropicOAuthProvider {
                 reason: format!("streaming request failed: {e}"),
             })?;
         let status = response.status();
+        if let (Some(trace), Some(id)) = (trace, physical_request.as_deref()) {
+            trace.observe_response(id, status.as_u16());
+        }
         if status.as_u16() == 403 {
             return Err(policy_response_error(response).await);
         }
@@ -388,10 +397,17 @@ impl AnthropicOAuthProvider {
         bearer_token: &str,
         subject_scoped: bool,
         extra_headers: &reqwest::header::HeaderMap,
+        trace: Option<&crate::provider_wire_trace::ProviderWireTrace>,
     ) -> Result<R, LlmError> {
         let url = self.api_url();
+        let wire = serde_json::to_vec(body).map_err(|_| LlmError::RequestFailed {
+            provider: "anthropic_oauth".to_string(),
+            reason: "request serialization failed".to_string(),
+        })?;
 
         tracing::warn!("Sending request to Anthropic OAuth: {}", url);
+
+        let physical_request = trace.map(|trace| trace.observe_anthropic(&wire));
 
         let response = self
             .client
@@ -401,7 +417,7 @@ impl AnthropicOAuthProvider {
             .header("anthropic-version", ANTHROPIC_API_VERSION)
             .header("anthropic-beta", ANTHROPIC_OAUTH_BETA)
             .header("Content-Type", "application/json")
-            .json(body)
+            .body(wire.clone())
             .send()
             .await
             .map_err(|e| LlmError::RequestFailed {
@@ -410,6 +426,10 @@ impl AnthropicOAuthProvider {
             })?;
 
         let status = response.status();
+
+        if let (Some(trace), Some(id)) = (trace, physical_request.as_deref()) {
+            trace.observe_response(id, status.as_u16());
+        }
 
         if status.as_u16() == 403 {
             return Err(policy_response_error(response).await);
@@ -444,6 +464,7 @@ impl AnthropicOAuthProvider {
                 if let Some(fresh) = self.refresh_token_after_401(&url, &response_url).await {
                     let fresh_token = SecretString::from(fresh);
                     // Retry once with the refreshed token
+                    let retry_request = trace.map(|trace| trace.observe_anthropic(&wire));
                     let retry = self
                         .client
                         .post(&url)
@@ -452,13 +473,16 @@ impl AnthropicOAuthProvider {
                         .header("anthropic-version", ANTHROPIC_API_VERSION)
                         .header("anthropic-beta", ANTHROPIC_OAUTH_BETA)
                         .header("Content-Type", "application/json")
-                        .json(body)
+                        .body(wire.clone())
                         .send()
                         .await
                         .map_err(|e| LlmError::RequestFailed {
                             provider: "anthropic_oauth".to_string(),
                             reason: e.to_string(),
                         })?;
+                    if let (Some(trace), Some(id)) = (trace, retry_request.as_deref()) {
+                        trace.observe_response(id, retry.status().as_u16());
+                    }
                     if retry.status().as_u16() == 403 {
                         return Err(policy_response_error(retry).await);
                     }
@@ -534,6 +558,7 @@ impl AnthropicOAuthProvider {
 #[async_trait]
 impl LlmProvider for AnthropicOAuthProvider {
     async fn complete(&self, mut req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+        let trace = crate::provider_wire_trace::ProviderWireTrace::from_metadata(&req.metadata);
         let headers = self.request_headers.resolve(&req.metadata)?;
         let (bearer_token, subject_scoped) = self.token_for_request(&req.metadata).await?;
         let model = req
@@ -558,7 +583,7 @@ impl LlmProvider for AnthropicOAuthProvider {
         };
 
         let response: AnthropicResponse = self
-            .send_request(&request, &bearer_token, subject_scoped, &headers)
+            .send_request(&request, &bearer_token, subject_scoped, &headers, trace.as_ref())
             .await?;
         let extracted = extract_response_content(&response);
 
@@ -639,6 +664,7 @@ impl AnthropicOAuthProvider {
         mut req: ToolCompletionRequest,
         sink: Option<&dyn CompletionStreamSink>,
     ) -> Result<ToolCompletionResponse, LlmError> {
+        let trace = crate::provider_wire_trace::ProviderWireTrace::from_metadata(&req.metadata);
         let headers = self.request_headers.resolve(&req.metadata)?;
         let (bearer_token, subject_scoped) = self.token_for_request(&req.metadata).await?;
         let model = req
@@ -702,7 +728,7 @@ impl AnthropicOAuthProvider {
         // 2026-08-28 天权补丁:tool-capable 请求走流式聚合(非流式长生成在兼容
         // 网关上慢且空,见 send_request_streaming 注释)。
         let response: AnthropicResponse = self
-            .send_request_streaming(&request, &bearer_token, subject_scoped, &headers, sink)
+            .send_request_streaming(&request, &bearer_token, subject_scoped, &headers, sink, trace.as_ref())
             .await?;
         let extracted = extract_response_content(&response);
 
@@ -1410,7 +1436,7 @@ mod tests {
             tool_choice: None,
         };
         let result = provider
-            .send_request::<serde_json::Value>(&body, "fixture-original-token", subject_scoped, &reqwest::header::HeaderMap::new())
+            .send_request::<serde_json::Value>(&body, "fixture-original-token", subject_scoped, &reqwest::header::HeaderMap::new(), None)
             .await;
         stop.store(true, Ordering::Release);
         server.join().unwrap();

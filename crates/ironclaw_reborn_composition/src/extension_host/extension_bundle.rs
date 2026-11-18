@@ -40,7 +40,12 @@ pub(crate) fn unzip_extension_bundle(
         if !entry.is_file() {
             continue;
         }
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map_err(|_| ProductWorkflowError::InvalidBindingRequest {
+                reason: "uploaded tool bundle has an invalid entry name encoding".to_string(),
+            })?
+            .into_owned();
         ExtensionAssetPath::new(name.clone()).map_err(|error| {
             ProductWorkflowError::InvalidBindingRequest {
                 reason: format!("uploaded tool bundle contains an unsafe path: {name}: {error}"),
@@ -103,6 +108,20 @@ mod tests {
                 .expect("start zip directory");
         }
         writer.finish().expect("finish zip").into_inner()
+    }
+
+    #[test]
+    fn unzip_extension_bundle_rejects_unsafe_central_directory_path() {
+        let mut bundle = zip_bundle(&[("manifest.toml", b"valid".as_slice())]);
+        assert_eq!(unzip_extension_bundle(&bundle).unwrap().len(), 1);
+        // The central-directory path used for materialization must be safe,
+        // even when the local header still contains a benign filename.
+        let central = bundle
+            .windows(4)
+            .position(|bytes| bytes == b"PK\x01\x02")
+            .unwrap();
+        bundle[central + 46..central + 59].copy_from_slice(b"../escape.txt");
+        assert!(unzip_extension_bundle(&bundle).is_err());
     }
 
     /// The path contract rejects backslash separators instead of normalizing

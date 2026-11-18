@@ -18,6 +18,8 @@ const MAX_DECOMPRESSED_TOTAL: u64 = 100 * 1024 * 1024;
 /// Typed errors for ZIP decompression safety checks.
 #[derive(Debug, thiserror::Error)]
 enum ExtractionError {
+    #[error("invalid ZIP entry name encoding")]
+    InvalidEntryName,
     #[error("entry '{name}' decompressed size {size} exceeds per-entry limit {max}")]
     EntryTooLarge { name: String, size: u64, max: u64 },
 
@@ -165,7 +167,10 @@ fn bounded_read_zip_entry_with_limits<R: Read + ?Sized>(
     max_total: u64,
 ) -> Result<String, ExtractionError> {
     let entry_size = file.size();
-    let entry_name = file.name().to_string();
+    let entry_name = file
+        .name()
+        .map_err(|_| ExtractionError::InvalidEntryName)?
+        .into_owned();
 
     // Fast pre-check using declared header size (untrusted, but cheap reject)
     // against per-entry limit.
@@ -259,7 +264,10 @@ fn extract_pptx(data: &[u8]) -> Result<String, String> {
     let mut slide_names: Vec<String> = Vec::new();
     for i in 0..archive.len() {
         if let Ok(file) = archive.by_index(i) {
-            let name = file.name().to_string();
+            let name = file
+                .name()
+                .map_err(|_| "invalid PPTX entry name encoding".to_string())?
+                .into_owned();
             if name.starts_with("ppt/slides/slide") && name.ends_with(".xml") {
                 slide_names.push(name);
             }
@@ -310,7 +318,10 @@ fn extract_xlsx(data: &[u8]) -> Result<String, String> {
     let mut sheet_names: Vec<String> = Vec::new();
     for i in 0..archive.len() {
         if let Ok(file) = archive.by_index(i) {
-            let name = file.name().to_string();
+            let name = file
+                .name()
+                .map_err(|_| "invalid XLSX entry name encoding".to_string())?
+                .into_owned();
             if name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml") {
                 sheet_names.push(name);
             }
@@ -1076,5 +1087,29 @@ mod tests {
             result.is_err(),
             "extract_pptx must fail when only slide is oversized"
         );
+    }
+}
+
+#[cfg(test)]
+mod zip_security_regression {
+    use super::*;
+    use std::io::{Cursor, Write};
+
+    #[test]
+    fn office_extraction_preserves_text_and_requires_recognized_slide_paths() {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        zip.start_file(
+            "ppt/slides/slide1.xml",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all("<a:t>周宁保留交接簿</a:t>".as_bytes())
+            .unwrap();
+        let mut bytes = zip.finish().unwrap().into_inner();
+        let mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+        assert_eq!(extract_text(&bytes, mime, None).unwrap(), "周宁保留交接簿");
+        let central = bytes.windows(4).position(|s| s == b"PK\x01\x02").unwrap();
+        bytes[central + 46] = b'X';
+        assert!(extract_text(&bytes, mime, None).is_err());
     }
 }

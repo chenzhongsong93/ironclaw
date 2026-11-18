@@ -64,6 +64,15 @@ profile_ref!(RunProfileFingerprint, "run_profile_fingerprint");
 profile_ref!(RunProfileSourceLayer, "run_profile_source_layer");
 profile_ref!(RunProfileSourceRef, "run_profile_source_ref");
 
+impl ContextProfileId {
+    /// Task-scoped instructions supplied by the host replace ambient identity
+    /// and skill context. Existing interactive/mission profiles keep inheriting
+    /// those sources; this versioned choice is persisted in the run snapshot.
+    pub fn delegated_task_v1() -> Self {
+        Self::from_trusted_static("delegated_task_context_v1")
+    }
+}
+
 fn validate_profile_ref(kind: &'static str, value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(format!("{kind} must not be empty"));

@@ -17,9 +17,13 @@ extra_args=${CARGO_TEST_ARGS:-"-- --nocapture"}
 run_test() {
   local package="$1"
   local test_name="$2"
+  local feature_args=()
+  if [[ -n "${3:-}" ]]; then
+    feature_args=(--features "$3")
+  fi
   echo "::group::cargo test -p ${package} --test ${test_name}"
   # shellcheck disable=SC2086 # extra_args intentionally expands into cargo's trailing args.
-  cargo test -p "${package}" --test "${test_name}" ${extra_args}
+  cargo test -p "${package}" --test "${test_name}" "${feature_args[@]}" ${extra_args}
   echo "::endgroup::"
 }
 
@@ -28,6 +32,9 @@ run_architecture() {
   # Pins docs/reborn/contracts/telegram-v2.md: retired-taxonomy telegram
   # identifiers stay dead and no v1 pairing routes re-enter the reborn context.
   run_test ironclaw_architecture telegram_extension_gates
+  # Pins turns-agent-loop.md §5.1: delegated context selection and final prompts.
+  run_test ironclaw_turns run_profile_contract
+  run_test ironclaw_runner loop_driver_host filesystem-goal-store
   # Pins docs/reborn/contracts/thread-plans.md: domain, caller and route seams.
   run_test ironclaw_threads thread_plan_contract
   run_test ironclaw_host_runtime first_party_builtin_tools

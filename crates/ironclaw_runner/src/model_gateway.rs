@@ -1329,6 +1329,7 @@ fn trace_model_request_event(
     use ironclaw_common::run_trace::append_trace_event_slim;
     let (run, turn) = parse_provider_turn_scope(provider_turn_scope);
     let all = serde_json::to_value(messages).unwrap_or(serde_json::json!([]));
+    let exchange_id = provider_turn_scope.and_then(|scope| scope.lines().find_map(|line| line.strip_prefix("exchange=")));
     append_trace_event_slim(
         "model_request",
         &run,
@@ -1336,6 +1337,7 @@ fn trace_model_request_event(
         turn.as_deref(),
         serde_json::json!({
             "provider_id": provider_id,
+            "exchange_id": exchange_id,
             "model": model,
             "max_tokens": max_tokens,
             "messages_base_seq": 0,
@@ -1355,6 +1357,7 @@ fn trace_model_response_event(
 ) {
     use ironclaw_common::run_trace::append_trace_event;
     let (run, turn) = parse_provider_turn_scope(provider_turn_scope);
+    let exchange_id = provider_turn_scope.and_then(|scope| scope.lines().find_map(|line| line.strip_prefix("exchange=")));
     append_trace_event(
         "model_response",
         &run,
@@ -1362,6 +1365,7 @@ fn trace_model_response_event(
         turn.as_deref(),
         serde_json::json!({
             "provider_id": provider_id,
+            "exchange_id": exchange_id,
             "finish_reason": finish_reason,
             "content": content,
             "tool_calls": tool_calls,
@@ -1388,7 +1392,7 @@ fn parse_provider_turn_scope(scope: Option<&str>) -> (String, Option<String>) {
 
 async fn complete_model_request<P>(
     provider: &P,
-    completion: CompletionRequest,
+    mut completion: CompletionRequest,
     capabilities: Option<Arc<dyn ironclaw_turns::run_profile::LoopCapabilityPort>>,
     provider_turn_scope: Option<String>,
     stream_sink: Option<Arc<dyn HostManagedModelStreamSink>>,
@@ -1398,6 +1402,15 @@ async fn complete_model_request<P>(
 where
     P: LlmProvider + ?Sized,
 {
+    let exchange_id = uuid::Uuid::new_v4().to_string();
+    completion.metadata.insert("ironclaw_trace_exchange_id".to_string(), exchange_id.clone());
+    let mut trace_scope = provider_turn_scope.unwrap_or_else(|| format!(
+        "run={}\nturn={}",
+        completion.metadata.get("run_id").map(String::as_str).unwrap_or("unknown-run"),
+        completion.metadata.get("turn_id").map(String::as_str).unwrap_or(""),
+    ));
+    trace_scope.push_str(&format!("\nexchange={exchange_id}"));
+    let provider_turn_scope = Some(trace_scope);
     let system_prompt_hash = system_prompt_cache_signature(&completion.messages);
     if let Some(capabilities) = capabilities {
         let tool_definitions = capabilities

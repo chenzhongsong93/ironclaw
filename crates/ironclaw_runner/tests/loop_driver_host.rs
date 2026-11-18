@@ -3546,6 +3546,27 @@ async fn capture_subagent_final_request_with_surface(
     base_capabilities: BTreeSet<CapabilityId>,
     provider: &'static str,
 ) -> (HostManagedModelRequest, Vec<CapabilityId>) {
+    capture_context_profile_final_request(
+        thread_name,
+        profile_id,
+        direction_markdown,
+        role_allowed,
+        base_capabilities,
+        provider,
+        None,
+    )
+    .await
+}
+
+async fn capture_context_profile_final_request(
+    thread_name: &str,
+    profile_id: &str,
+    direction_markdown: String,
+    role_allowed: BTreeSet<CapabilityId>,
+    base_capabilities: BTreeSet<CapabilityId>,
+    provider: &'static str,
+    historical_context: Option<ironclaw_turns::run_profile::ContextProfileId>,
+) -> (HostManagedModelRequest, Vec<CapabilityId>) {
     let fixture = HostFixture::new(thread_name, "parent task").await;
     fixture.gateway.enable_tool_capture();
     let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface(
@@ -3562,8 +3583,20 @@ async fn capture_subagent_final_request_with_surface(
     let surface_resolver = Arc::new(StaticCapabilitySurfaceProfileResolver::new(
         CapabilityAllowSet::allowlist(base_capabilities),
     ));
-    let profile = default_planned_run_profile_resolver()
-        .expect("profile resolver")
+    let resolver = if let Some(context) = historical_context {
+        assert_eq!(profile_id, SUBAGENT_NOVELIST_PROFILE_ID);
+        let mut registry =
+            ironclaw_turns::run_profile::InMemoryRunProfileRegistry::with_builtin_profiles();
+        registry.register(
+            ironclaw_runner::planned_driver_factory::subagent_novelist_planned_profile_definition()
+                .unwrap()
+                .with_context_profile_id(context),
+        ).unwrap();
+        InMemoryRunProfileResolver::new(registry)
+    } else {
+        default_planned_run_profile_resolver().expect("profile resolver")
+    };
+    let profile = resolver
         .resolve_run_profile(
             RunProfileResolutionRequest::interactive_default()
                 .with_requested_run_profile(RunProfileRequest::new(profile_id).unwrap()),
@@ -3580,6 +3613,26 @@ async fn capture_subagent_final_request_with_surface(
     }));
     let host = fixture
         .factory()
+        .with_identity_context_source(Arc::new(StaticIdentityContextSource::new(vec![
+            trusted_identity(
+                "SYSTEM.md",
+                "PARENT_IDENTITY_SENTINEL",
+                IdentityApplicability::Always,
+            ),
+        ])))
+        .with_skill_context_source(Arc::new(StaticSkillContextSource::new(vec![
+            HostSkillContextCandidate::loaded(
+                skill_md("parent-loaded", "parent workflow", "PARENT_SKILL_SENTINEL"),
+                Some(SkillTrust::Trusted),
+                Some(SkillVisibility::Visible),
+            ),
+            HostSkillContextCandidate::discoverable(
+                "parent-discovery",
+                "PARENT_DISCOVERY_SENTINEL",
+                Some(SkillTrust::Trusted),
+                Some(SkillVisibility::Visible),
+            ),
+        ])))
         .with_driver_requirements(driver_requirements_for(
             &claimed.resolved_run_profile.loop_driver,
             DriverRequirements::all_required(),
@@ -3601,7 +3654,10 @@ async fn capture_subagent_final_request_with_surface(
             capability_view: None,
             checkpoint_state_ref: None,
             max_messages: Some(8),
-            inline_messages: Vec::new(),
+            inline_messages: vec![LoopInlineMessage {
+                role: LoopInlineMessageRole::User,
+                safe_body: LoopInlineMessageBody::new("HOST_TASK_MATERIAL_SENTINEL").unwrap(),
+            }],
         })
         .await
         .expect("subagent prompt bundle");
@@ -3622,6 +3678,92 @@ async fn capture_subagent_final_request_with_surface(
         requests.into_iter().next().unwrap(),
         captured_tools.into_iter().next().unwrap(),
     )
+}
+
+#[tokio::test]
+async fn delegated_task_context_excludes_ambient_instructions_from_final_request() {
+    let (request, _) = capture_subagent_final_request_with_surface(
+        "thread-delegated-context-isolation",
+        SUBAGENT_NOVELIST_PROFILE_ID,
+        "DELEGATED_ROLE_SENTINEL".into(),
+        BTreeSet::new(),
+        BTreeSet::new(),
+        "builtin",
+    )
+    .await;
+    let text = request
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for required in [
+        "DELEGATED_ROLE_SENTINEL",
+        "SUBAGENT_GOAL_SENTINEL",
+        "HOST_TASK_MATERIAL_SENTINEL",
+    ] {
+        assert!(
+            text.contains(required),
+            "delegated task material missing: {required}"
+        );
+    }
+    for excluded in [
+        "PARENT_IDENTITY_SENTINEL",
+        "PARENT_SKILL_SENTINEL",
+        "PARENT_DISCOVERY_SENTINEL",
+    ] {
+        assert!(
+            !text.contains(excluded),
+            "ambient instruction leaked: {excluded}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn delegated_task_context_preserves_parent_generic_and_historical_contexts() {
+    for (index, (profile_id, historical)) in [
+        (
+            ironclaw_runner::planned_driver_factory::PLANNED_DEFAULT_PROFILE_ID,
+            None,
+        ),
+        (SUBAGENT_PLANNED_PROFILE_ID, None),
+        (
+            SUBAGENT_NOVELIST_PROFILE_ID,
+            Some(
+                ironclaw_turns::run_profile::ContextProfileId::new("interactive_context").unwrap(),
+            ),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (request, _) = capture_context_profile_final_request(
+            &format!("thread-delegated-context-compat-{index}"),
+            profile_id,
+            "DELEGATED_ROLE_SENTINEL".into(),
+            BTreeSet::new(),
+            BTreeSet::new(),
+            "builtin",
+            historical,
+        )
+        .await;
+        let text = request
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for retained in [
+            "PARENT_IDENTITY_SENTINEL",
+            "PARENT_SKILL_SENTINEL",
+            "PARENT_DISCOVERY_SENTINEL",
+        ] {
+            assert!(
+                text.contains(retained),
+                "{profile_id} lost ambient instruction: {retained}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

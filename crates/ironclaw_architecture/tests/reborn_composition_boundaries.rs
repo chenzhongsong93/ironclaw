@@ -121,7 +121,8 @@ fn composition_public_pub_use_surface_matches_snapshot() {
     let lib = std::fs::read_to_string(composition_src_path().join("lib.rs"))
         .expect("composition lib.rs readable");
     let snapshot = std::fs::read_to_string(root.join("docs/plans/composition-pubuse.snapshot"))
-        .expect("composition pub-use snapshot readable");
+        .expect("composition pub-use snapshot readable")
+        .replace("\r\n", "\n");
 
     let actual = extract_pub_use_surface(&lib);
     assert_eq!(
